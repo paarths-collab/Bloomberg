@@ -1,0 +1,41 @@
+# Core Python
+numpy
+pandas
+
+# Visualization
+matplotlib
+plotly
+seaborn
+
+# Data Fetching (Yahoo Finance, Market Data APIs, etc.)
+yfinance
+finvizfinance
+alpha_vantage
+requests
+
+# Machine Learning / AI
+scikit-learn
+statsmodels
+tensorflow
+torch
+
+# Agents / Automation
+crewai
+openai
+llama-index
+
+# Async + WebSockets (for live data streaming)
+websockets
+aiohttp
+
+# Data Handling
+sqlalchemy
+pydantic
+
+# Notebooks (for research + prototyping)
+jupyter
+ipykernel
+
+# Optional: FastAPI if you want to make it a service
+fastapi
+uvicorn
