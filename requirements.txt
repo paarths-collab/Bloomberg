@@ -39,3 +39,6 @@ ipykernel
 # Optional: FastAPI if you want to make it a service
 fastapi
 uvicorn
+
+pandas_ta
+ta
