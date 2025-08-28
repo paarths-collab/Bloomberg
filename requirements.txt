@@ -42,3 +42,10 @@ uvicorn
 
 pandas_ta
 ta
+fredapi         # Access macroeconomic data from FRED (Federal Reserve)
+praw            # Access Reddit API for posts, comments, and sentiment
+snscrape        # Scrape Twitter/X or other social media posts (no API key needed)
+textblob        # Basic NLP library for sentiment analysis and text processing
+transformers    # Advanced NLP models for sentiment analysis or predictions
+config
+streamlit

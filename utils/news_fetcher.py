@@ -18,6 +18,34 @@ try:
 except LookupError:
     nltk.download("vader_lexicon")
 
+# In utils/news_fetcher.py (add this new function)
+import pandas as pd
+
+def get_insider_transactions(symbol: str, api_key: str) -> pd.DataFrame:
+    """Fetches insider transactions from Finnhub and returns them as a DataFrame."""
+    url = f"{FINNHUB_BASE}/stock/insider-transactions"
+    params = {"symbol": symbol, "token": api_key}
+    try:
+        r = requests.get(url, headers=_headers(), params=params, timeout=15)
+        r.raise_for_status()
+        data = r.json().get('data', [])
+        
+        if not data:
+            return pd.DataFrame({"Message": [f"No recent insider data found for {symbol}"]})
+            
+        # Convert the list of dictionaries to a DataFrame
+        df = pd.DataFrame(data)
+        
+        # Select and rename columns for a cleaner display
+        df = df[['name', 'share', 'change', 'transactionDate', 'transactionPrice']]
+        df.columns = ['Insider Name', 'Shares', 'Change', 'Date', 'Price']
+        
+        # Keep only the top 10 most recent transactions
+        return df.head(10)
+        
+    except Exception as e:
+        print(f"Error fetching insider data for {symbol}: {e}")
+        return pd.DataFrame({"Message": [f"Could not fetch insider data for {symbol}"]})
 FINNHUB_BASE = "https://finnhub.io/api/v1"
 
 def _headers():
