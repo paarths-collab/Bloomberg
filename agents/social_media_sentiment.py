@@ -1,70 +1,124 @@
-# agents/sentiment_agent.py
-import torch
-import praw
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
+import streamlit as st
+import pandas as pd
+import os
+from typing import Dict
 
+# --- Try to import necessary libraries ---
+try:
+    import torch
+    import praw
+    from transformers import AutoTokenizer, AutoModelForSequenceClassification
+    _HAS_DEPS = True
+except ImportError:
+    _HAS_DEPS = False
 
 class SentimentAgent:
     def __init__(self, reddit_client_id: str, reddit_client_secret: str, reddit_user_agent: str):
-        """
-        Sentiment agent that scrapes Reddit discussions and analyzes sentiment
-        using FinBERT.
-        """
-        # Initialize Reddit API
-        self.reddit = praw.Reddit(
-            client_id=reddit_client_id,
-            client_secret=reddit_client_secret,
-            user_agent=reddit_user_agent,
-        )
+        if not _HAS_DEPS:
+            self.reddit = None
+            self.model = None
+            self.tokenizer = None
+            print("❌ SentimentAgent ERROR: Missing dependencies (praw, torch, transformers). Agent is disabled.")
+            return
 
-        # Load FinBERT (financial sentiment model)
-        self.tokenizer = AutoTokenizer.from_pretrained("ProsusAI/finbert")
-        self.model = AutoModelForSequenceClassification.from_pretrained("ProsusAI/finbert")
+        if not all([reddit_client_id, reddit_client_secret, reddit_user_agent]):
+            self.reddit = None
+            print("❌ SentimentAgent WARNING: Reddit credentials missing. Agent is disabled.")
+            return
 
-    def analyze_text(self, text: str) -> str:
+        try:
+            self.reddit = praw.Reddit(
+                client_id=reddit_client_id, client_secret=reddit_client_secret,
+                user_agent=reddit_user_agent, read_only=True
+            )
+            self.tokenizer = AutoTokenizer.from_pretrained("ProsusAI/finbert")
+            self.model = AutoModelForSequenceClassification.from_pretrained("ProsusAI/finbert")
+            print("✅ SentimentAgent: Initialized with Reddit API and FinBERT model.")
+        except Exception as e:
+            self.reddit = None
+            print(f"❌ SentimentAgent ERROR: Initialization failed: {e}")
+
+    def _analyze_text(self, text: str) -> str:
         """Run FinBERT sentiment classification on a text string."""
-        inputs = self.tokenizer(text, return_tensors="pt", truncation=True)
-        outputs = self.model(**inputs)
+        inputs = self.tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
+        with torch.no_grad():
+            outputs = self.model(**inputs)
         scores = torch.softmax(outputs.logits, dim=1)
-        labels = ["Negative", "Neutral", "Positive"]
-        return labels[scores.argmax().item()]
+        return self.model.config.id2label[scores.argmax().item()]
 
     def analyze(self, ticker: str) -> dict:
         """Fetch Reddit posts about the ticker and compute sentiment summary."""
-        mentions = []
-        for submission in self.reddit.subreddit("stocks+wallstreetbets+investing").search(ticker, limit=50):
-            mentions.append(submission.title + " " + submission.selftext)
+        if not self.reddit:
+            return {"Error": "SentimentAgent is not properly initialized."}
+            
+        print(f"SentimentAgent: Searching Reddit for '{ticker}'...")
+        try:
+            mentions = [sub.title for sub in self.reddit.subreddit("stocks+wallstreetbets+investing").search(ticker, limit=25)]
+            if not mentions:
+                return {"Message": f"No recent Reddit mentions found for '{ticker}'."}
 
-        if not mentions:
-            return {"Message": "No Reddit mentions"}
+            sentiments = [self._analyze_text(m) for m in mentions]
+            pos = sentiments.count("positive")
+            neg = sentiments.count("negative")
+            neu = sentiments.count("neutral")
 
-        sentiments = [self.analyze_text(m) for m in mentions]
+            if pos > neg * 1.5: overall = "Bullish"
+            elif neg > pos * 1.5: overall = "Bearish"
+            else: overall = "Neutral"
 
-        pos = sentiments.count("Positive")
-        neg = sentiments.count("Negative")
-        neu = sentiments.count("Neutral")
+            return {
+                "Reddit Mentions Analyzed": len(mentions),
+                "Positive": pos, "Negative": neg, "Neutral": neu,
+                "Overall Social Sentiment": overall,
+            }
+        except Exception as e:
+            return {"Error": f"Failed to analyze Reddit sentiment for {ticker}: {e}"}
 
-        # Interpret results
-        if pos > neg:
-            overall = "Bullish"
-        elif neg > pos:
-            overall = "Bearish"
-        else:
-            overall = "Neutral"
-
-        return {
-            "Reddit Mentions": len(mentions),
-            "Sentiment Breakdown": f"{pos} Positive / {neg} Negative / {neu} Neutral",
-            "Overall": overall,
-        }
-
-
-# Example usage
+# --- Streamlit Visualization ---
 if __name__ == "__main__":
-    # Replace with real creds or inject from Orchestrator
-    agent = SentimentAgent(
-        reddit_client_id="YOUR_ID",
-        reddit_client_secret="YOUR_SECRET",
-        reddit_user_agent="YOUR_APP"
-    )
-    print(agent.analyze("AAPL"))
+    st.set_page_config(page_title="Social Media Sentiment", layout="wide")
+    st.title("💬 Social Media Sentiment Agent (Reddit + FinBERT)")
+    
+    # Load credentials from secrets for standalone testing
+    REDDIT_ID = st.secrets.get("REDDIT_CLIENT_ID", os.getenv("REDDIT_CLIENT_ID"))
+    REDDIT_SECRET = st.secrets.get("REDDIT_CLIENT_SECRET", os.getenv("REDDIT_CLIENT_SECRET"))
+    REDDIT_AGENT = st.secrets.get("REDDIT_USER_AGENT", os.getenv("REDDIT_USER_AGENT"))
+
+    if not all([REDDIT_ID, REDDIT_SECRET, REDDIT_AGENT]):
+        st.error("Reddit API credentials not found! Please set them in your Streamlit secrets.")
+    else:
+        agent = SentimentAgent(
+            reddit_client_id=REDDIT_ID,
+            reddit_client_secret=REDDIT_SECRET,
+            reddit_user_agent=REDDIT_AGENT
+        )
+        with st.sidebar:
+            st.header("⚙️ Configuration")
+            ticker = st.text_input("Ticker Symbol", "NVDA")
+            run_button = st.button("🔬 Analyze Sentiment", use_container_width=True)
+
+        if run_button:
+            st.header(f"Results for {ticker}")
+            with st.spinner(f"Scraping Reddit and running FinBERT analysis for {ticker}..."):
+                results = agent.analyze(ticker)
+                if "Error" in results:
+                    st.error(results["Error"])
+                elif "Message" in results:
+                    st.warning(results["Message"])
+                else:
+                    st.subheader("Sentiment Summary")
+                    cols = st.columns(4)
+                    cols[0].metric("Overall Sentiment", results.get("Overall Social Sentiment", "N/A"))
+                    cols[1].metric("Positive Mentions 👍", results.get("Positive", 0))
+                    cols[2].metric("Negative Mentions 👎", results.get("Negative", 0))
+                    cols[3].metric("Neutral Mentions 😐", results.get("Neutral", 0))
+
+                    # Create a pie chart
+                    sentiment_counts = pd.DataFrame({
+                        "Sentiment": ["Positive", "Negative", "Neutral"],
+                        "Count": [results.get("Positive", 0), results.get("Negative", 0), results.get("Neutral", 0)]
+                    })
+                    fig = pd.pie(sentiment_counts, values='Count', names='Sentiment', 
+                                 title='Breakdown of Reddit Mentions',
+                                 color_discrete_map={'Positive':'green', 'Negative':'red', 'Neutral':'grey'})
+                    st.plotly_chart(fig, use_container_width=True)

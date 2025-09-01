@@ -1,71 +1,90 @@
-# check if news is true (fact-checking layer)
-'''
-Here are 3 strategies you can add:
-
-1.Source Reliability Scoring
-
-Predefine “trusted sources” (Reuters, Bloomberg, Moneycontrol, WSJ, etc.)
-
-Score them higher vs random blogs.
-
-2.Cross-Verification
-
-If the same news appears in multiple trusted outlets → higher reliability.
-
-Example: If Reuters + Bloomberg both publish, assign confidence = 0.9.
-
-3.AI Fact-Check
-
-Use an NLP model (Hugging Face or LangChain’s fact-checking chains) to detect misinformation.
-
-Example: Compare claim against knowledge base (Wikipedia API, DBpedia, or OpenBB news dataset).'''
-# utils/validation.py
 from __future__ import annotations
 import pandas as pd
+from typing import Tuple, Optional
+
+# --- TODO: Future Fact-Checking Layer ---
+'''
+Future enhancement ideas for a news validation/fact-checking layer:
+
+1. Source Reliability Scoring:
+   - Predefine a dictionary of "trusted sources" with scores (e.g., {"Reuters": 0.9, "Bloomberg": 0.9, "WSJ": 0.85}).
+   - Score news items based on their source.
+
+2. Cross-Verification:
+   - If the same news event (using NLP entity extraction) appears in multiple trusted outlets, increase its reliability score.
+
+3. AI Fact-Check Agent:
+   - Create a new agent that uses an LLM (like Gemini) with a specific prompt to evaluate a news claim.
+   - Example Prompt: "Given the following financial news headline and summary, assess its likely veracity on a scale of 0 to 1 and provide a brief justification. Cross-reference with known market events. Headline: '...' Summary: '...'"
+'''
+
+# ===================================================================
+#                      TECHNICAL SIGNAL FUNCTIONS
+# ===================================================================
 
 def sma_crossover_signal(df: pd.DataFrame) -> str:
     """
-    Simple signal:
-      - BUY if SMA50 crosses above SMA200 (golden cross)
-      - SELL if SMA50 crosses below SMA200 (death cross)
-      - HOLD otherwise
+    Calculates a simple SMA crossover signal.
+      - BUY if SMA50 crosses above SMA200 (golden cross).
+      - SELL if SMA50 crosses below SMA200 (death cross).
+      - HOLD otherwise.
     """
-    if df.empty or "SMA50" not in df.columns or "SMA200" not in df.columns:
+    # Ensure required columns and data length
+    required_cols = ['SMA_50', 'SMA_200']
+    if df.empty or not all(col in df.columns for col in required_cols):
         return "HOLD"
-    s50 = df["SMA50"].dropna()
-    s200 = df["SMA200"].dropna()
-    if len(s50) < 2 or len(s200) < 2:
+    if len(df) < 2:
         return "HOLD"
-    prev_cross = (s50.iloc[-2] - s200.iloc[-2])
-    curr_cross = (s50.iloc[-1] - s200.iloc[-1])
-    if prev_cross <= 0 and curr_cross > 0:
+
+    # Use .iloc for safe positional access
+    s50_last = df['SMA_50'].iloc[-1]
+    s50_prev = df['SMA_50'].iloc[-2]
+    s200_last = df['SMA_200'].iloc[-1]
+    s200_prev = df['SMA_200'].iloc[-2]
+
+    # Check for NaN values before comparison
+    if pd.isna(s50_last) or pd.isna(s50_prev) or pd.isna(s200_last) or pd.isna(s200_prev):
+        return "HOLD"
+
+    # Golden Cross (Buy Signal)
+    if s50_prev <= s200_prev and s50_last > s200_last:
         return "BUY"
-    if prev_cross >= 0 and curr_cross < 0:
+    
+    # Death Cross (Sell Signal)
+    if s50_prev >= s200_prev and s50_last < s200_last:
         return "SELL"
+        
     return "HOLD"
 
-def rsi_filter(df: pd.DataFrame, lower=30, upper=70) -> str:
-    """Return 'OK' if RSI is not overbought/oversold; 'OVERSOLD' or 'OVERBOUGHT' otherwise."""
-    if "RSI14" not in df.columns or df["RSI14"].dropna().empty:
+def rsi_filter(df: pd.DataFrame, rsi_col: str = 'momentum_rsi', lower: int = 30, upper: int = 70) -> str:
+    """
+    Returns the state of the RSI indicator (Oversold, Overbought, or OK).
+    """
+    if df.empty or rsi_col not in df.columns or df[rsi_col].dropna().empty:
         return "UNKNOWN"
-    r = df["RSI14"].dropna().iloc[-1]
-    if r < lower:
+    
+    last_rsi = df[rsi_col].dropna().iloc[-1]
+    
+    if last_rsi < lower:
         return "OVERSOLD"
-    if r > upper:
+    if last_rsi > upper:
         return "OVERBOUGHT"
     return "OK"
 
-def atr_stop_levels(df: pd.DataFrame, atr_mult: float = 2.0) -> tuple[float | None, float | None]:
-    """Return (stop_loss, take_profit) using last Close and ATR*mult. TP set symmetric (2R by default)."""
-    if df.empty or "Close" not in df.columns:
-        return None, None
-    close = float(df["Close"].iloc[-1])
-    # pandas_ta names ATR as 'ATR_14' by default
-   # --- NEW, MORE ROBUST LINE ---
-    atr_col = next((c for c in df.columns if "ATR" in c), None)
-    if atr_col is None or df[atr_col].dropna().empty:
-        return None, None
-    atr = float(df[atr_col].dropna().iloc[-1])
-    stop = close - atr_mult * atr
-    take = close + 2 * atr_mult * atr  # 2R target
-    return round(stop, 2), round(take, 2)
+def atr_stop_levels(df: pd.DataFrame, atr_col: str = 'volatility_atr', atr_mult: float = 2.0) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Calculates dynamic stop-loss and take-profit levels based on the Average True Range (ATR).
+    """
+    if df.empty or 'Close' not in df.columns or atr_col not in df.columns:
+        return (None, None)
+        
+    last_close = df["Close"].iloc[-1]
+    last_atr = df[atr_col].iloc[-1]
+
+    if pd.isna(last_close) or pd.isna(last_atr):
+        return (None, None)
+
+    stop_loss = last_close - (atr_mult * last_atr)
+    take_profit = last_close + (2 * atr_mult * last_atr)  # Standard 2:1 Reward:Risk ratio
+    
+    return round(stop_loss, 2), round(take_profit, 2)

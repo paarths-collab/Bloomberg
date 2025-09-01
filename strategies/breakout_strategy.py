@@ -1,121 +1,107 @@
-# breakout.py
-"""
-Breakout Strategy with Plotting
-- Identify horizontal resistance (recent N-day high)
-- Buy when price breaks above resistance with increased volume
-- Exit after fixed holding period or condition
-- Plots candlesticks with signals + equity curve
-"""
-
-import yfinance as yf
 import pandas as pd
-import numpy as np
-import argparse
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
+from utils.data_loader import get_history
+from backtesting import Backtest, Strategy
+import streamlit as st
+import plotly.graph_objects as go
 
-def get_data(ticker, start, end, interval='1d'):
-    df = yf.download(ticker, start=start, end=end, interval=interval, progress=False)
-    return df[['Open','High','Low','Close','Volume']]
+# --- Core Strategy Logic for backtesting.py ---
 
-def generate_signals(df, lookback=20, volume_multiplier=1.2):
-    df = df.copy()
-    df['rolling_high'] = df['High'].rolling(lookback).max().shift(1)
-    df['rolling_vol'] = df['Volume'].rolling(lookback).mean().shift(1)
-    df['signal'] = 0
-    df['trade'] = 0
-    # breakout condition
-    cond = (df['Close'] > df['rolling_high']) & (df['Volume'] > volume_multiplier * df['rolling_vol'])
-    df.loc[cond, 'signal'] = 1
-    df['trade'] = df['signal'].diff().fillna(0)
-    return df
+import pandas as pd
+from utils.data_loader import get_history
+from backtesting import Backtest, Strategy
 
-def backtest_signals(df, signal_col='signal', init_cash=100000, slippage=0, fee=0, hold_period=10):
-    df = df.copy().reset_index()
-    df['portfolio'] = np.nan
-    position = 0
-    cash = init_cash
-    shares = 0
-    trades = []
-    for i in range(len(df)-1):
-        trade = df.loc[i].get('trade',0)
-        next_row = df.loc[i+1]
-        if trade == 1 and position == 0:
-            price = next_row['Open'] * (1 + slippage)
-            shares = cash // price
-            if shares:
-                cash -= shares * price * (1 + fee)
-                position = 1
-                trades.append({'date': next_row['Date'], 'type': 'BUY', 'price': price, 'shares': shares, 'cash': cash})
-        # exit rule
-        if position == 1:
-            entered_date = trades[-1]['date']
-            idx_enter = df[df['Date'] == entered_date].index[0]
-            if (i - idx_enter) >= hold_period:
-                price = next_row['Open'] * (1 - slippage)
-                cash += shares * price * (1 - fee)
-                trades.append({'date': next_row['Date'], 'type': 'SELL', 'price': price, 'shares': shares, 'cash': cash})
-                shares = 0
-                position = 0
-        # portfolio value tracking
-        df.loc[i, 'portfolio'] = cash + shares * df.loc[i]['Close']
+def run(ticker, start_date, end_date, cash=10_000, commission=.002, **kwargs):
+    """
+    Runs a backtest for the Breakout strategy.
+    """
+    class BreakoutStrategy(Strategy):
+        n1 = 20  # Lookback period for the breakout high
 
-    final_price = df.iloc[-1]['Close']
-    df.loc[len(df)-1, 'portfolio'] = cash + shares * final_price
+        def init(self):
+            # Pre-calculate the rolling high to use in the strategy
+            self.highs = self.I(lambda x: pd.Series(x).rolling(self.n1).max(), self.data.High)
 
-    portfolio_value = df['portfolio'].iloc[-1]
-    summary = {
-        'init_cash': init_cash,
-        'final_value': portfolio_value,
-        'returns_pct': (portfolio_value/init_cash - 1)*100,
-        'n_trades': len(trades)
-    }
-    return summary, pd.DataFrame(trades), df
+        def next(self):
+            # Entry signal: Buy if not in a position and the price breaks above the recent high
+            if not self.position and self.data.Close[-1] > self.highs[-2]:
+                self.buy(size=0.2)  # Invest 20% of equity
+            # Exit signal: Sell if in a position and the price falls back below the recent high
+            elif self.position and self.data.Close[-1] < self.highs[-2]:
+                self.position.close()
 
-def plot_results(df, trades, ticker):
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12,8), sharex=True, gridspec_kw={'height_ratios':[3,1]})
+    # 1. Fetch historical data
+    hist_df = get_history(ticker, start_date, end_date)
+    if hist_df.empty:
+        return {"summary": {"Error": "Could not fetch historical data."}, "data": pd.DataFrame()}
     
-    # Price + signals
-    ax1.plot(df['Date'], df['Close'], label="Close Price", color="blue")
-    ax1.plot(df['Date'], df['rolling_high'], label="Rolling High", color="orange", linestyle="--")
-    
-    # Buy/Sell markers
-    for _, row in trades.iterrows():
-        if row['type'] == 'BUY':
-            ax1.scatter(row['date'], row['price'], marker="^", color="green", s=100, label="Buy")
-        else:
-            ax1.scatter(row['date'], row['price'], marker="v", color="red", s=100, label="Sell")
-    
-    ax1.set_title(f"Breakout Strategy on {ticker}")
-    ax1.legend()
+    # 2. Fix DataFrame column names for the backtesting library
+    if isinstance(hist_df.columns, pd.MultiIndex):
+        hist_df.columns = hist_df.columns.get_level_values(0)
+    hist_df.columns = hist_df.columns.str.title()
 
-    # Equity curve
-    ax2.plot(df['Date'], df['portfolio'], color="purple", label="Portfolio Value")
-    ax2.set_ylabel("Portfolio ($)")
-    ax2.legend()
+    # 3. Run the backtest
+    bt = Backtest(hist_df, BreakoutStrategy, cash=cash, commission=commission)
+    stats = bt.run()
     
-    plt.xlabel("Date")
-    plt.tight_layout()
-    plt.show()
+    # 4. Prepare the data for charting by merging price data with the equity curve
+    backtest_data = hist_df.join(stats._equity_curve)
+
+    # 5. Return the results
+    return {"summary": stats.to_dict(), "data": backtest_data}
 
 
+
+# --- Streamlit Visualization (for standalone testing) ---
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Breakout Trading Strategy")
-    parser.add_argument("--ticker", type=str, required=True, help="Stock ticker (e.g., AAPL, TSLA, RELIANCE.NS)")
-    parser.add_argument("--start", type=str, required=True, help="Start date (YYYY-MM-DD)")
-    parser.add_argument("--end", type=str, required=True, help="End date (YYYY-MM-DD)")
-    parser.add_argument("--lookback", type=int, default=20, help="Lookback period for breakout high")
-    parser.add_argument("--volume_mult", type=float, default=1.2, help="Volume multiplier for confirmation")
-    parser.add_argument("--hold", type=int, default=10, help="Holding period in days")
-    args = parser.parse_args()
+    st.set_page_config(page_title="Volume Breakout Strategy", layout="wide")
+    st.title("📈 Volume Breakout Strategy Showcase")
 
-    df = get_data(args.ticker, args.start, args.end)
-    df = generate_signals(df, lookback=args.lookback, volume_multiplier=args.volume_mult)
-    summary, trades, df_bt = backtest_signals(df, hold_period=args.hold)
+    with st.sidebar:
+        st.header("⚙️ Configuration")
+        ticker = st.text_input("Ticker Symbol", "NVDA")
+        start_date = st.date_input("Start Date", pd.to_datetime("2022-01-01"))
+        end_date = st.date_input("End Date", pd.to_datetime("today"))
+        lookback_period = st.slider("Lookback Period (days)", 10, 100, 20)
+        volume_multiplier = st.slider("Volume Multiplier", 1.0, 3.0, 1.5, 0.1)
+        run_button = st.button("🔬 Run Backtest", use_container_width=True)
 
-    print("\n📊 Strategy Summary:")
-    print(summary)
-    print("\n📝 Trades:")
-    print(trades)
+    if run_button:
+        st.header(f"Results for {ticker}")
+        
+        with st.spinner("Running backtest..."):
+            results = run(
+                ticker=ticker,
+                start_date=str(start_date.date()),
+                end_date=str(end_date.date()),
+                lookback_period=lookback_period,
+                volume_multiplier=volume_multiplier
+            )
+            summary = results.get("summary", {})
+            backtest_df = results.get("data", pd.DataFrame())
 
-    plot_results(df_bt, trades, args.ticker)
+        if "Error" in summary:
+            st.error(summary["Error"])
+        elif not backtest_df.empty:
+            st.subheader("Performance Summary")
+            cols = st.columns(4)
+            cols[0].metric("Return [%]", f"{summary.get('Return [%]', 0):.2f}")
+            cols[1].metric("Sharpe Ratio", f"{summary.get('Sharpe Ratio', 0):.2f}")
+            cols[2].metric("Max Drawdown [%]", f"{summary.get('Max. Drawdown [%]', 0):.2f}")
+            cols[3].metric("# Trades", summary.get('# Trades', 0))
+
+            st.subheader("Equity Curve & Price")
+            fig = go.Figure()
+            # Plot the equity curve
+            fig.add_trace(go.Scatter(x=backtest_df.index, y=backtest_df['Equity'], name='Equity Curve', line=dict(color='purple')))
+            # Plot the closing price on a secondary y-axis
+            fig.add_trace(go.Scatter(x=backtest_df.index, y=backtest_df['Close'], name='Close Price', yaxis='y2', line=dict(color='blue', dash='dash')))
+            
+            fig.update_layout(
+                title_text=f"{ticker} Equity Curve and Price",
+                xaxis_title="Date",
+                yaxis=dict(title="Equity ($)"),
+                yaxis2=dict(title="Price ($)", overlaying='y', side='right')
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.warning("Backtest did not produce any results.")

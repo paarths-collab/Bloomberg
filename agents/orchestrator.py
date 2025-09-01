@@ -1,234 +1,188 @@
 from __future__ import annotations
 import yaml
+import pandas as pd
+import importlib.util
+import os
+from pathlib import Path
 from typing import Dict, Any, List
-import pandas as pd # Import pandas for DataFrame creation
 
-#from streamlit.caching import st_cache_data # <-- STEP 1: ADD THIS IMPORT
-# MUST be the very first line of code
+# --- Import all REAL agents ---
+from agents.screener_agent import ScreenerAgent
+from agents.llm_analyst_agent import LLMAnalystAgent as LLMAgent
+from agents.execution_agent import ExecutionAgent
+from agents.macro_agent import MacroAgent
+from agents.insider_agent import InsiderAgent
+from agents.social_media_sentiment import SentimentAgent
 
-# Now, all other imports can follow
+# --- Import all REAL utility modules ---
+from utils.data_loader import get_company_snapshot, get_history, add_technical_indicators
+from utils.news_fetcher import get_live_quote, get_company_news, calculate_headline_sentiment
 
-
-from utils.data_loader import get_company_snapshot, get_history, add_indicators
-from utils.news_fetcher import get_live_quote, get_company_news, sentiment_on_headlines
-from utils.validation import sma_crossover_signal, rsi_filter, atr_stop_levels
-from utils.news_fetcher import get_live_quote, get_company_news, sentiment_on_headlines, get_insider_transactions # Add the new import
+def _load_modules_from_path(path: Path, module_prefix: str):
+    """Dynamically loads all python modules from a given directory path."""
+    modules = {}
+    for file_path in path.glob("*.py"):
+        if file_path.stem == "__init__":
+            continue
+        
+        module_name = f"{module_prefix}.{file_path.stem}"
+        spec = importlib.util.spec_from_file_location(module_name, file_path)
+        if spec and spec.loader:
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            # Use a readable name for the strategy, e.g., "SMA Crossover" from "sma_crossover"
+            strategy_name = file_path.stem.replace('_', ' ').title()
+            modules[strategy_name] = module
+    return modules
 
 class Orchestrator:
     def __init__(self, config: Dict[str, Any]):
+        """
+        Initializes the entire ecosystem of agents based on the central config file.
+        """
         self.cfg = config
         self.keys = self.cfg.get("api_keys", {})
-        self.sets = self.cfg.get("settings", {})
+        self.sets = self.cfg.get("agent_settings", {})
+        self.rapidapi_cfg = self.cfg.get("rapidapi", {})
+        
+        print("Orchestrator: Initializing all agents...")
+        self._initialize_agents()
+        self._register_strategies()
+        print("Orchestrator: Initialization complete.")
 
-    def run_once(self, ticker: str) -> Dict[str, Any] | None:
-        """One-shot analysis pipeline for a ticker. Returns None on failure."""
-        # 1) Fundamentals
-        fundamentals = get_company_snapshot(ticker)
-        if "error" in fundamentals:
-            print(f"Could not retrieve fundamentals for {ticker}. Aborting.")
-            return None
-
-        # 2) History + Indicators (Used ONLY for TA calculations)
-        hist = get_history(
-            ticker,
-            period=self.sets.get("history_period", "1y"),
-            interval=self.sets.get("history_interval", "1d"),
+    def _initialize_agents(self):
+        """Creates instances of all agents the orchestrator can use."""
+        self.screener_agent = ScreenerAgent(rapidapi_config=self.rapidapi_cfg)
+        self.llm_agent = LLMAgent(gemini_api_key=self.keys.get("gemini"))
+        self.execution_agent = ExecutionAgent(
+            api_key=self.keys.get("alpaca_key_id"),
+            api_secret=self.keys.get("alpaca_secret_key"),
+            paper=self.sets.get("paper_trading", True)
         )
-        if hist is None:
-            print(f"Could not retrieve historical data for {ticker}. Aborting analysis.")
-            return None
-        hist = add_indicators(hist)
+        self.macro_agent = MacroAgent(fred_api_key=self.keys.get("fred"))
+        self.insider_agent = InsiderAgent(
+            finnhub_key=self.keys.get("finnhub"),
+            rapidapi_config=self.rapidapi_cfg
+        )
+        self.sentiment_agent = SentimentAgent(
+            reddit_client_id=self.keys.get("reddit_client_id"),
+            reddit_client_secret=self.keys.get("reddit_client_secret"),
+            reddit_user_agent=self.keys.get("reddit_user_agent")
+        )
 
-        # 3) Live quote + news (This is our SINGLE SOURCE OF TRUTH for prices)
-        fn_key = self.keys.get("finnhub")
-        use_nse = ticker.endswith(".NS")
-        quote = get_live_quote(ticker, fn_key, use_nse=use_nse)
-        news = get_company_news(ticker, fn_key, days_back=7, use_nse=use_nse)
-        headlines = [n.get("headline") for n in news if n.get("headline")]
-        avg_sent, _ = sentiment_on_headlines(headlines[:30])
+    def _register_strategies(self):
+        """Dynamically discovers and registers all available strategy modules."""
+        print("Orchestrator: Discovering and registering strategies...")
+        # Assuming the script is run from the root 'Boomerang' directory
+        long_term_path = Path("Long_Term_Strategy")
+        short_term_path = Path("strategies")
+        
+        self.long_term_modules = _load_modules_from_path(long_term_path, "Long_Term_Strategy")
+        self.short_term_modules = _load_modules_from_path(short_term_path, "strategies")
+        
+        print(f"Registered {len(self.long_term_modules)} long-term strategies.")
+        print(f"Registered {len(self.short_term_modules)} short-term strategies.")
 
-        # 4) Signals + Risk (Calculated from yfinance history)
-        signal = sma_crossover_signal(hist)
-        rsi_state = rsi_filter(hist)
-        stop, take = atr_stop_levels(hist, atr_mult=2.0)
+    # --- PRIMARY WORKFLOW METHODS CALLED BY THE FRONTEND ---
 
-        # 5) Pack result (Note: 'last_close' from yfinance is now removed)
-        result = {
-            "ticker": ticker,
-            "fundamentals": fundamentals,
-            "live_quote": quote, # Pass the entire Finnhub quote object
-            "signal": signal,
-            "rsi_state": rsi_state,
-            "stop_loss": stop,
-            "take_profit": take,
-            "sentiment_avg": round(avg_sent, 3),
-            "news_samples": headlines[:10],
+    def run_deep_dive_analysis(self, ticker: str, start_date: str, end_date: str) -> Dict[str, Any]:
+        """Runs a comprehensive, multi-agent analysis on a single stock."""
+        print(f"Orchestrator: Running deep-dive analysis for {ticker}...")
+        hist_df = get_history(ticker, start_date, end_date)
+        if hist_df.empty: return {"error": "Could not fetch historical data."}
+        
+        enriched_df = add_technical_indicators(hist_df)
+        
+        snapshot = get_company_snapshot(ticker)
+        live_quote = get_live_quote(ticker, self.keys.get("finnhub"))
+        news = get_company_news(ticker, self.keys.get("finnhub"))
+        headlines = [item.get("headline", "") for item in news]
+        news_sentiment = calculate_headline_sentiment(headlines)
+        social_sentiment = self.sentiment_agent.analyze(ticker)
+        insider_analysis = self.insider_agent.analyze(ticker)
+
+        return {
+            "snapshot": snapshot,
+            "live_quote": live_quote,
+            "news_sentiment": {"avg_score": news_sentiment, "headlines": headlines[:10]},
+            "social_sentiment": social_sentiment,
+            "insider_analysis": insider_analysis,
+            "technical_data": enriched_df.tail(1).to_dict(orient='records')[0] if not enriched_df.empty else {}
         }
-        return result
+
+    def run_long_term_analysis(self, tickers: List[str]) -> Dict[str, Any]:
+        """Runs the suite of long-term fundamental analyses for the given tickers."""
+        print(f"Orchestrator: Running long-term analysis for {tickers}...")
+        results = {}
+        for ticker in tickers:
+            results[ticker] = {name: module.analyze(ticker) for name, module in self.long_term_modules.items()}
+        return results
+
+    def run_short_term_analysis(self, tickers: List[str], start_date: str, end_date: str) -> pd.DataFrame:
+        """Runs the suite of short-term backtests and returns a summary DataFrame."""
+        print(f"Orchestrator: Running short-term backtests for {tickers}...")
+        all_summaries = []
+        for ticker in tickers:
+            for name, module in self.short_term_modules.items():
+                if name == "Pairs Trading": continue
+                try:
+                    result_dict = module.run(ticker, start_date, end_date)
+                    summary = result_dict.get("summary", {})
+                    summary['Strategy'] = name
+                    summary['Ticker'] = ticker
+                    all_summaries.append(summary)
+                except Exception as e:
+                    print(f"ERROR running strategy '{name}' for ticker '{ticker}': {e}")
+                    # Optionally, append a summary indicating the error
+                    all_summaries.append({'Strategy': name, 'Ticker': ticker, 'Error': str(e)})
 
 
-   # In agents/orchestrator.py
+        if len(tickers) >= 2 and "Pairs Trading" in self.short_term_modules:
+             try:
+                 pair_module = self.short_term_modules["Pairs Trading"]
+                 pair_result = pair_module.run(tickers[:2], start_date, end_date)
+                 pair_summary = pair_result.get("summary", {})
+                 pair_summary['Ticker'] = f"{tickers[0]}/{tickers[1]}"
+                 all_summaries.append(pair_summary)
+             except Exception as e:
+                 print(f"ERROR running strategy 'Pairs Trading' for tickers '{tickers[:2]}': {e}")
+                 all_summaries.append({'Strategy': 'Pairs Trading', 'Ticker': f"{tickers[0]}/{tickers[1]}", 'Error': str(e)})
+             
+        return pd.DataFrame(all_summaries)
 
-    def build_dashboard(self, ticker: str) -> Dict[str, Any]:
+
+    def run_market_overview(self) -> Dict[str, Any]:
+        """Provides a top-down view of the market using the MacroAgent."""
+        print("Orchestrator: Running market overview...")
+        return {
+            "us_indicators": self.macro_agent.analyze_us_market(),
+            "india_indicators": self.macro_agent.analyze_indian_market(),
+            "global_indicators": self.macro_agent.get_global_indicators()
+        }
+        
+    def get_ai_recommendation(self, user_profile: Dict[str, Any], provider: str = 'ollama', model: str = 'llama3') -> str:
+        """Gathers market context and passes it to the LLMAgent for a personalized plan."""
+        print(f"Orchestrator: Gathering context for AI recommendation via {provider}:{model}...")
+        backtest_results = self.run_short_term_analysis(["SPY"], "2024-01-01", "2025-01-01")
+        
+        # Filter out any rows that have error information
+        valid_backtests = backtest_results[backtest_results['Error'].isnull()].to_dict(orient='records')
+
+        market_context = {
+            "market_overview": self.run_market_overview(),
+            "sample_short_term_backtests": valid_backtests
+        }
+        prompt = f"""
+        You are "QuantVest AI," a certified financial advisor...
+        CLIENT PROFILE: {user_profile}
+        MARKET DATA: {market_context}
+        TASK: Create a personalized investment plan...
         """
-        Runs the analysis and structures the data for the Streamlit dashboard.
-        """
-        # Step 1: Get all the raw data from our existing method
-        data = self.run_once(ticker)
+        return self.llm_agent.run(prompt)
 
-        # Step 2: If data fetching failed, return an empty structure
-        if not data:
-            return {
-                "Fundamental Analysis": pd.DataFrame(),
-                "Insider Activity": pd.DataFrame(),
-                "Macro Outlook": pd.DataFrame(),
-                "Social Sentiment": pd.DataFrame(),
-                "Technical Signals": {},
-            }
-
-        # Step 3: Reshape the fundamentals and technicals
-        
-        f = data["fundamentals"]
-        
-        # --- Step 1: Get all the raw values ---
-        raw_values = [
-            f.get('longName'), f.get('sector'), f.get('industry'),
-            f.get('marketCap'), f.get('trailingPE'), f.get('forwardPE'),
-            f.get('returnOnEquity'), f.get('profitMargins')
-        ]
-        
-        # --- Step 2: Convert every value to a string, handling None and formatting ---
-        string_values = []
-        for v in raw_values:
-            if v is None:
-                string_values.append("N/A")
-            elif isinstance(v, int):
-                string_values.append(f"{v:,}") # Add commas to large numbers
-            elif isinstance(v, float):
-                string_values.append(f"{v:.2f}") # Format floats to 2 decimal places
-            else:
-                string_values.append(str(v))
-
-        # --- Step 3: Now create the DataFrame with the all-string list ---
-        fundamentals_df = pd.DataFrame.from_dict({
-            "Metric": ["Company Name", "Sector", "Industry", "Market Cap", "Trailing P/E", "Forward P/E", "ROE", "Profit Margins"],
-            "Value": string_values # Use the clean, all-string list here
-        }).set_index("Metric")
-        
-        # --- THIS IS THE CORRECTED AND VERIFIED BLOCK ---
-        # In build_dashboard method
-        quote_data = data.get('live_quote', {})
-        technicals = {
-            "Previous Close": f"${quote_data.get('pc', 0):.2f}",
-            "Current Price": f"${quote_data.get('c', 0):.2f}",
-    # ... other keys}
-            "SMA Signal": data["signal"],
-            "RSI State": data["rsi_state"],
-            "ATR Stop-Loss": data["stop_loss"],
-            "ATR Take-Profit": data["take_profit"],
-            "Headline Sentiment": data["sentiment_avg"],
-            "Recent Headlines": data["news_samples"]
-        }
-
-        # --- (the rest of the function continues) ---
-        insider_df = get_insider_transactions(ticker, self.keys.get("finnhub"))
-        
-        dashboard_data = {
-            "Fundamental Analysis": fundamentals_df,
-            "Technical Signals": technicals,
-            "Insider Activity": insider_df,
-            # ...
-        }
-        return dashboard_data
-    def pretty_print(self, result: Dict[str, Any]) -> None:
-        # This function remains unchanged and works with the output of run_once
-        if not result:
-            print("No data to print.")
-            return
-        f = result["fundamentals"]
-        print("\n=== QuantInsight Snapshot ===")
-        # ... (the rest of this function is unchanged)
 
     @classmethod
-    def from_file(cls, path: str = "config.yaml") -> "Orchestrator":
+    def from_file(cls, path: str = "quant-company-insights-agent/config.yaml") -> "Orchestrator":
         with open(path, "r", encoding="utf-8") as f:
             cfg = yaml.safe_load(f)
         return cls(cfg)
-
-# In agents/orchestrator.py
-
-    
-# from __future__ import annotations
-# import yaml
-# from typing import Dict, Any, List
-
-# from utils.data_loader import get_company_snapshot, get_history, add_indicators
-# from utils.news_fetcher import get_live_quote, get_company_news, sentiment_on_headlines
-# from utils.validation import sma_crossover_signal, rsi_filter, atr_stop_levels
-
-# class Orchestrator:
-#     def __init__(self, config: Dict[str, Any]):
-#         self.cfg = config
-#         self.keys = self.cfg.get("api_keys", {})
-#         self.sets = self.cfg.get("settings", {})
-
-#     def run_once(self, ticker: str) -> Dict[str, Any]:
-#         """One-shot analysis pipeline for a ticker."""
-#         # 1) Fundamentals
-#         fundamentals = get_company_snapshot(ticker)
-
-#         # 2) History + Indicators
-#         hist = get_history(
-#             ticker,
-#             period=self.sets.get("history_period", "1y"),
-#             interval=self.sets.get("history_interval", "1d"),
-#         )
-#         hist = add_indicators(hist)
-
-#         # 3) Live quote + news
-#         fn_key = self.keys.get("finnhub")
-#         use_nse = ticker.endswith(".NS")  # heuristic: NSE tickers
-#         quote = get_live_quote(ticker, fn_key, use_nse=use_nse)
-#         news = get_company_news(ticker, fn_key, days_back=7, use_nse=use_nse)
-#         headlines = [n.get("headline") for n in news if n.get("headline")]
-#         avg_sent, scored = sentiment_on_headlines(headlines[:30])  # cap to 30 headlines
-
-#         # 4) Signals + Risk
-#         signal = sma_crossover_signal(hist)
-#         rsi_state = rsi_filter(hist)
-#         stop, take = atr_stop_levels(hist, atr_mult=2.0)
-
-#         # 5) Pack result
-#         result = {
-#             "ticker": ticker,
-#             "fundamentals": fundamentals,
-#             "last_close": float(hist["Close"].iloc[-1]),
-#             "live_quote": quote,  # dict with c/h/l/o/pc/t
-#             "signal": signal,
-#             "rsi_state": rsi_state,
-#             "stop_loss": stop,
-#             "take_profit": take,
-#             "sentiment_avg": round(avg_sent, 3),
-#             "news_samples": headlines[:10],
-#         }
-#         return result
-
-#     def pretty_print(self, result: Dict[str, Any]) -> None:
-#         f = result["fundamentals"]
-#         print("\n=== QuantInsight Snapshot ===")
-#         print(f"Ticker: {result['ticker']} | Name: {f.get('longName')} | Sector: {f.get('sector')} / {f.get('industry')}")
-#         print(f"PE (trail/forward): {f.get('trailingPE')} / {f.get('forwardPE')}")
-#         print(f"ROE: {f.get('returnOnEquity')}  | Profit Margins: {f.get('profitMargins')}")
-#         print(f"Last Close: {result['last_close']} | Live Price: {result['live_quote'].get('c')}")
-#         print(f"Signal: {result['signal']} | RSI: {result['rsi_state']}")
-#         print(f"ATR-based Stop: {result['stop_loss']} | Take-Profit: {result['take_profit']}")
-#         print(f"Avg Headline Sentiment (VADER compound): {result['sentiment_avg']}")
-#         print("Recent headlines:")
-#         for h in result["news_samples"]:
-#             print(" -", h)
-
-#     @classmethod
-#     def from_file(cls, path: str = "config.yaml") -> "Orchestrator":
-#         with open(path, "r", encoding="utf-8") as f:
-#             cfg = yaml.safe_load(f)
-#         return cls(cfg)

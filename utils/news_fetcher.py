@@ -1,96 +1,229 @@
-# fetch news headlines
-
-
-# utils/news_fetcher.py
 from __future__ import annotations
 from datetime import date, timedelta
 from typing import List, Dict, Any, Tuple
-import os
-import requests
-
-# Simple local sentiment (no paid API): VADER
-import nltk
-from nltk.sentiment import SentimentIntensityAnalyzer
-
-# Ensure VADER lexicon is available (downloads once)
-try:
-    nltk.data.find("sentiment/vader_lexicon.zip")
-except LookupError:
-    nltk.download("vader_lexicon")
-
-# In utils/news_fetcher.py (add this new function)
 import pandas as pd
+import requests
+import logging
+from functools import lru_cache
+from pathlib import Path
 
-def get_insider_transactions(symbol: str, api_key: str) -> pd.DataFrame:
-    """Fetches insider transactions from Finnhub and returns them as a DataFrame."""
-    url = f"{FINNHUB_BASE}/stock/insider-transactions"
-    params = {"symbol": symbol, "token": api_key}
-    try:
-        r = requests.get(url, headers=_headers(), params=params, timeout=15)
-        r.raise_for_status()
-        data = r.json().get('data', [])
-        
-        if not data:
-            return pd.DataFrame({"Message": [f"No recent insider data found for {symbol}"]})
-            
-        # Convert the list of dictionaries to a DataFrame
-        df = pd.DataFrame(data)
-        
-        # Select and rename columns for a cleaner display
-        df = df[['name', 'share', 'change', 'transactionDate', 'transactionPrice']]
-        df.columns = ['Insider Name', 'Shares', 'Change', 'Date', 'Price']
-        
-        # Keep only the top 10 most recent transactions
-        return df.head(10)
-        
-    except Exception as e:
-        print(f"Error fetching insider data for {symbol}: {e}")
-        return pd.DataFrame({"Message": [f"Could not fetch insider data for {symbol}"]})
+# --- Module Configuration ---
+logger = logging.getLogger(__name__)
+
+# --- NLTK for VADER Sentiment (Local/Free) ---
+try:
+    import nltk
+    from nltk.sentiment import SentimentIntensityAnalyzer
+    nltk.data.find("sentiment/vader_lexicon.zip")
+    _HAS_NLTK = True
+except LookupError:
+    print("Downloading VADER lexicon for sentiment analysis...")
+    nltk.download("vader_lexicon")
+    _HAS_NLTK = True
+except ImportError:
+    _HAS_NLTK = False
+
+# --- Constants ---
 FINNHUB_BASE = "https://finnhub.io/api/v1"
 
-def _headers():
-    return {"accept": "application/json"}
+# --- Helper function to format tickers for API calls ---
 
-def finnhub_symbol(symbol: str, use_nse_prefix: bool = False, nse_prefix: str = "NSE:") -> str:
-    # Finnhub US symbols are plain ("AAPL"); Indian NSE tickers use "NSE:INFY"
-    if use_nse_prefix and ":" not in symbol:
-        return f"{nse_prefix}{symbol.replace('.NS','').upper()}"
-    return symbol
+@lru_cache(maxsize=1) # Cache the symbols so we only read the file once
+def _get_indian_symbols_set():
+    """Loads the set of Indian stock symbols from the EQUITY_L.csv file."""
+    try:
+        equity_file = Path("quant-company-insights-agent/data/EQUITY_L (1).csv")
+        if equity_file.exists():
+            df = pd.read_csv(equity_file)
+            return set(df['SYMBOL'].str.upper())
+        return set()
+    except Exception:
+        return set()
 
-def get_live_quote(symbol: str, api_key: str, use_nse: bool = False, nse_prefix: str = "NSE:") -> Dict[str, Any]:
-    sym = finnhub_symbol(symbol, use_nse, nse_prefix)
+def _format_ticker_for_finnhub(ticker: str) -> str:
+    """Appends .NS to Indian stock tickers for Finnhub API compatibility."""
+    ticker_upper = ticker.upper()
+    indian_symbols = _get_indian_symbols_set()
+    if ticker_upper in indian_symbols and not ticker_upper.endswith((".NS", ".BO")):
+        return f"{ticker_upper}.NS"
+    return ticker_upper
+
+# ===================================================================
+#                       FINNHUB API FUNCTIONS
+# ===================================================================
+
+def get_live_quote(symbol: str, api_key: str) -> Dict[str, Any]:
+    """Fetches a live quote from Finnhub."""
+    formatted_symbol = _format_ticker_for_finnhub(symbol)
     url = f"{FINNHUB_BASE}/quote"
-    params = {"symbol": sym, "token": api_key}
-    r = requests.get(url, headers=_headers(), params=params, timeout=15)
-    r.raise_for_status()
-    return r.json()  # keys: c (current), h, l, o, pc, t
+    params = {"symbol": formatted_symbol, "token": api_key}
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except requests.exceptions.RequestException as e:
+        logger.error(f"API request failed (Finnhub get_live_quote for {formatted_symbol}): {e}")
+        return {"error": str(e)}
 
-def get_company_news(symbol: str, api_key: str, days_back: int = 7,
-                     use_nse: bool = False, nse_prefix: str = "NSE:") -> List[Dict[str, Any]]:
-    sym = finnhub_symbol(symbol, use_nse, nse_prefix)
+def get_company_news(symbol: str, api_key: str, days_back: int = 30) -> List[Dict[str, Any]]:
+    """Fetches company news from Finnhub for the last N days."""
+    formatted_symbol = _format_ticker_for_finnhub(symbol)
     to_dt = date.today()
     from_dt = to_dt - timedelta(days=days_back)
     url = f"{FINNHUB_BASE}/company-news"
-    params = {
-        "symbol": sym,
-        "from": from_dt.isoformat(),
-        "to": to_dt.isoformat(),
-        "token": api_key,
-    }
-    r = requests.get(url, headers=_headers(), params=params, timeout=20)
-    r.raise_for_status()
-    return r.json()  # list of articles
+    params = {"symbol": formatted_symbol, "from": from_dt.isoformat(), "to": to_dt.isoformat(), "token": api_key}
+    try:
+        r = requests.get(url, params=params, timeout=15)
+        r.raise_for_status()
+        return r.json()
+    except requests.exceptions.RequestException as e:
+        logger.error(f"API request failed (Finnhub get_company_news for {formatted_symbol}): {e}")
+        return []
 
-def sentiment_on_headlines(headlines: List[str]) -> Tuple[float, List[Dict[str, Any]]]:
-    """Return average compound sentiment and per-headline scores using VADER."""
-    if not headlines:
-        return 0.0, []
+# ===================================================================
+#                       RAPIDAPI FUNCTIONS
+# ===================================================================
+
+def get_indian_stock_by_scrip_id(scrip_id: str, rapidapi_config: dict) -> dict:
+    """Fetches detailed stock information from the indian-stock-exchange RapidAPI."""
+    api_key = rapidapi_config.get("key")
+    host = rapidapi_config.get("hosts", {}).get("indian_stock_exchange")
+    if not api_key or not host:
+        return {"error": "RapidAPI key or host for indian-stock-exchange not found in config."}
+
+    url = f"https://{host}/index.php"
+    querystring = {"id": scrip_id}
+    headers = {"x-rapidapi-key": api_key, "x-rapidapi-host": host}
+    
+    logger.info(f"Fetching Indian stock details for scrip ID {scrip_id} from RapidAPI...")
+    try:
+        response = requests.get(url, headers=headers, params=querystring, timeout=15)
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        logger.error(f"API request failed (RapidAPI get_indian_stock_by_scrip_id for {scrip_id}): {e}")
+        return {"error": str(e)}
+
+# ===================================================================
+#                       NLP SENTIMENT FUNCTION
+# ===================================================================
+
+def calculate_headline_sentiment(headlines: List[str]) -> float:
+    """
+    Calculates a single average compound sentiment score for a list of headlines.
+    Returns a float between -1 (very negative) and 1 (very positive).
+    """
+    if not _HAS_NLTK or not headlines:
+        return 0.0
+        
     sia = SentimentIntensityAnalyzer()
-    scored = []
-    total = 0.0
+    
+    compound_scores = []
     for h in headlines:
-        s = sia.polarity_scores(h)  # dict with 'compound'
-        total += s["compound"]
-        scored.append({"headline": h, "scores": s})
-    avg = total / len(headlines)
-    return avg, scored
+        if isinstance(h, str):
+            compound_scores.append(sia.polarity_scores(h)["compound"])
+            
+    return sum(compound_scores) / len(compound_scores) if compound_scores else 0.0
+
+
+
+# from __future__ import annotations
+# from datetime import date, timedelta
+# from typing import List, Dict, Any, Tuple
+# import pandas as pd
+# import requests
+# import logging
+
+# # --- Module Configuration ---
+# logger = logging.getLogger(__name__)
+
+# # --- NLTK for VADER Sentiment (Local/Free) ---
+# try:
+#     import nltk
+#     from nltk.sentiment import SentimentIntensityAnalyzer
+#     nltk.data.find("sentiment/vader_lexicon.zip")
+#     _HAS_NLTK = True
+# except LookupError:
+#     print("Downloading VADER lexicon for sentiment analysis...")
+#     nltk.download("vader_lexicon")
+#     _HAS_NLTK = True
+# except ImportError:
+#     _HAS_NLTK = False
+
+# # --- Constants ---
+# FINNHUB_BASE = "https://finnhub.io/api/v1"
+
+# # ===================================================================
+# #                      FINNHUB API FUNCTIONS
+# # ===================================================================
+
+# def get_live_quote(symbol: str, api_key: str) -> Dict[str, Any]:
+#     """Fetches a live quote from Finnhub."""
+#     url = f"{FINNHUB_BASE}/quote"
+#     params = {"symbol": symbol.upper(), "token": api_key}
+#     try:
+#         r = requests.get(url, params=params, timeout=10)
+#         r.raise_for_status()
+#         return r.json()
+#     except requests.exceptions.RequestException as e:
+#         logger.error(f"API request failed (Finnhub get_live_quote for {symbol}): {e}")
+#         return {"error": str(e)}
+
+# def get_company_news(symbol: str, api_key: str, days_back: int = 30) -> List[Dict[str, Any]]:
+#     """Fetches company news from Finnhub for the last N days."""
+#     to_dt = date.today()
+#     from_dt = to_dt - timedelta(days=days_back)
+#     url = f"{FINNHUB_BASE}/company-news"
+#     params = {"symbol": symbol.upper(), "from": from_dt.isoformat(), "to": to_dt.isoformat(), "token": api_key}
+#     try:
+#         r = requests.get(url, params=params, timeout=15)
+#         r.raise_for_status()
+#         return r.json()
+#     except requests.exceptions.RequestException as e:
+#         logger.error(f"API request failed (Finnhub get_company_news for {symbol}): {e}")
+#         return []
+
+# # ===================================================================
+# #                      RAPIDAPI FUNCTIONS
+# # ===================================================================
+
+# def get_indian_stock_by_scrip_id(scrip_id: str, rapidapi_config: dict) -> dict:
+#     """Fetches detailed stock information from the indian-stock-exchange RapidAPI."""
+#     api_key = rapidapi_config.get("key")
+#     host = rapidapi_config.get("hosts", {}).get("indian_stock_exchange")
+#     if not api_key or not host:
+#         return {"error": "RapidAPI key or host for indian-stock-exchange not found in config."}
+
+#     url = f"https://{host}/index.php"
+#     querystring = {"id": scrip_id}
+#     headers = {"x-rapidapi-key": api_key, "x-rapidapi-host": host}
+    
+#     logger.info(f"Fetching Indian stock details for scrip ID {scrip_id} from RapidAPI...")
+#     try:
+#         response = requests.get(url, headers=headers, params=querystring, timeout=15)
+#         response.raise_for_status()
+#         return response.json()
+#     except requests.exceptions.RequestException as e:
+#         logger.error(f"API request failed (RapidAPI get_indian_stock_by_scrip_id for {scrip_id}): {e}")
+#         return {"error": str(e)}
+
+# # ===================================================================
+# #                      NLP SENTIMENT FUNCTION
+# # ===================================================================
+
+# def calculate_headline_sentiment(headlines: List[str]) -> float:
+#     """
+#     Calculates a single average compound sentiment score for a list of headlines.
+#     Returns a float between -1 (very negative) and 1 (very positive).
+#     """
+#     if not _HAS_NLTK or not headlines:
+#         return 0.0
+        
+#     sia = SentimentIntensityAnalyzer()
+    
+#     compound_scores = []
+#     for h in headlines:
+#         if isinstance(h, str):
+#             compound_scores.append(sia.polarity_scores(h)["compound"])
+            
+#     return sum(compound_scores) / len(compound_scores) if compound_scores else 0.0
