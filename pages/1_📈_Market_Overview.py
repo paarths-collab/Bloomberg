@@ -3,6 +3,10 @@ import sys
 import pathlib
 import pandas as pd
 import plotly.express as px
+import alpaca_trade_api
+import alpacalib
+from alpaca.trading.client import TradingClient
+from backtesting import Backtest, Strategy
 
 # Path setup
 sys.path.append(str(pathlib.Path(__file__).parent.parent))
@@ -43,13 +47,48 @@ with st.spinner("Fetching live market and economic data..."):
         cols[2].metric("Unemployment Rate", f"{us_data.get('US Unemployment Rate %', 'N/A')}%")
         cols[3].metric("Fed Funds Rate", f"{us_data.get('US Fed Funds Rate %', 'N/A')}%")
 
-    st.header("🇮🇳 Indian Market Indicators (from NSE)")
-    if "Error" in india_data: st.error(india_data["Error"])
+        # --- Indian Market Snapshot ---
+        # --- Indian Market Snapshot ---
+    st.header("🇮🇳 Indian Market Indicators")
+
+    # The orchestrator will return all Indian data under one key
+    india_data = overview_data.get("india_indicators", {})
+
+    if "Error" in india_data:
+        st.error(f"Could not retrieve Indian market data: {india_data['Error']}")
     else:
+        # --- Display the Timestamp first ---
+        # This will be right-aligned and subtle, providing clear context.
+        timestamp = india_data.get("Data Timestamp", "Not available")
+        st.markdown(f"<p style='text-align: right; color: grey; font-size: 0.9em;'>As of: {timestamp}</p>", unsafe_allow_html=True)
+
+        # --- Row 1: Headline Indices ---
+        st.subheader("Indices")
+        cols = st.columns(2)
+        cols[0].metric(
+            label="Nifty 50",
+            value=india_data.get("Nifty 50", "N/A"),
+            delta=india_data.get("Nifty 50 Change", "N/A")
+        )
+        cols[1].metric(
+            label="BSE Sensex",
+            value=india_data.get("Sensex", "N/A"),
+            delta=india_data.get("Sensex Change", "N/A")
+        )
+
+        st.divider()
+
+        # --- Row 2: Market Internals (Breadth) ---
+        st.subheader("Market Internals (Nifty 500)")
         cols = st.columns(4)
+        
+        # Market Status Display
         market_status = india_data.get("NSE Market Status", "Unknown")
-        status_color = "green" if market_status == "Open" else "red"
-        cols[0].markdown(f"**Market Status:** <span style='color:{status_color};'>**{market_status}**</span>", unsafe_allow_html=True)
-        cols[1].metric("Advances 👍", india_data.get("NSE Advances", "N/A"))
-        cols[2].metric("Declines 👎", india_data.get("NSE Declines", "N/A"))
-        cols[3].metric("Adv/Dec Ratio", india_data.get("NSE Adv/Dec Ratio", "N/A"))
+        status_color = "green" if "open" in market_status.lower() else "red"
+        status_icon = "🟢" if "open" in market_status.lower() else "🔴"
+        cols[0].markdown(f"**Status:** <span style='color:{status_color};'>**{status_icon} {market_status}**</span>", unsafe_allow_html=True)
+        
+        # Advances, Declines, and Ratio
+        cols[1].metric(label="Advances 👍", value=india_data.get("NSE Advances", "N/A"))
+        cols[2].metric(label="Declines 👎", value=india_data.get("NSE Declines", "N/A"))
+        cols[3].metric(label="Adv/Dec Ratio", value=india_data.get("NSE Adv/Dec Ratio", "N/A"))

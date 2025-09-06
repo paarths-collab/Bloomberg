@@ -1,79 +1,48 @@
-# Core Python
-numpy
+# --- Core Application Framework ---
+# Used to build and run the web application interface
+streamlit
+fastapi
+uvicorn[standard]
+
+# --- Data Handling & Analysis ---
+# For data manipulation, numerical operations, and financial analysis
 pandas
-
-# Visualization
-matplotlib
-plotly
-seaborn
-
-# Data Fetching (Yahoo Finance, Market Data APIs, etc.)
+numpy
 yfinance
-finvizfinance
-alpha_vantage
+ta
+scikit-learn
+
+# --- Visualization ---
+# For creating interactive charts and plots
+plotly
+matplotlib
+
+# --- Web Scraping & API Requests ---
+# For fetching data from websites and APIs
 requests
+beautifulsoup4
+lxml
+selenium
+webdriver-manager
 
-# Machine Learning / AI
-scikit-learn>=1.7.1
-statsmodels
-tensorflow
-torch
+# --- NLP & Sentiment Analysis ---
+# For processing natural language and analyzing text sentiment
+nltk
 
-# Agents / Automation
-crewai
-openai
-llama-index
-
-# Async + WebSockets (for live data streaming)
-websockets
-aiohttp
-
-# Data Handling
-sqlalchemy
+# --- Configuration & Utilities ---
+# For handling YAML config files and defining data models
+pyyaml
 pydantic
 
-# Notebooks (for research + prototyping)
-jupyter
-ipykernel
-
-# Optional: FastAPI if you want to make it a service
-fastapi
-uvicorn
-python-jose>=3.5.0 
-passlib>=1.7.4 
-python-multipart>=0.0.20
-
-# Technical Analysis
-pandas_ta
-
-ta
-
-# Macroeconomic + Finance APIs
-fredapi         # Access macroeconomic data from FRED (Federal Reserve)
-nsetools        # NSE India data
-nsepython       # Alternative NSE India data
-
-# Sentiment / NLP
-praw            # Reddit API
-snscrape        # Scrape Twitter/X posts without API
-textblob        # Basic NLP
-transformers    # HuggingFace models
-torch           # Required backend for transformers
-
-# Config Management (replace 'config' with one of these if needed)
-python-decouple
-
-# Frontend
-streamlit
-
-# Backtesting
-backtesting
-
-# AI APIs
-groq
+# --- API Clients & SDKs ---
+# For interacting with third-party services like trading platforms and AI models
+alpaca-trade-api
 google-generativeai
 
-# Extra utils
-gnews
-pyarrow
-nsetools
+# --- Development & Code Quality (Optional but Recommended) ---
+# Tools to format code, check for errors, and manage the environment.
+# These are not strictly required to run the app but improve development workflow.
+# black
+# ruff
+# mypy
+# pre-commit

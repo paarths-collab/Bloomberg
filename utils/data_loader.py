@@ -6,25 +6,38 @@ from typing import Dict, Any
 from functools import lru_cache
 from pathlib import Path
 
-# --- Module Configuration ---
+# --- Module Configuration (This defines the 'logger' object) ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# --- Helper function for Indian Stocks ---
+
+# --- Helper function for Indian Stocks (This defines '_format_ticker_for_yf') ---
+# In utils/data_loader.py
+
 @lru_cache(maxsize=1)
 def _get_indian_symbols_set():
-    """Loads the set of Indian stock symbols from the EQUITY_L.csv file."""
+    """
+    Loads the set of Indian stock symbols using a robust, absolute path.
+    """
     try:
-        equity_file = Path("quant-company-insights-agent/data/EQUITY_L (1).csv")
+        # --- THIS IS THE FIX ---
+        # Get the directory of the current script (utils/)
+        current_script_dir = Path(__file__).parent
+        # Go up one level to the project root (Boomerang/)
+        project_root = current_script_dir.parent
+        # Construct the full, absolute path to the CSV file
+        equity_file = project_root / "data" / "nifty500.csv"
+        
         if equity_file.exists():
             df = pd.read_csv(equity_file)
-            logger.info(f"Successfully loaded {len(df)} Indian stock symbols.")
-            return set(df['SYMBOL'].str.upper())
-        return set()
+            logger.info(f"Successfully loaded {len(df)} Indian stock symbols from {equity_file}")
+            return set(df['Symbol'].str.upper())
+        else:
+            logger.warning(f"Indian symbols file not found at '{equity_file}'.")
+            return set()
     except Exception as e:
         logger.error(f"Could not load Indian symbols file: {e}")
         return set()
-
 def _format_ticker_for_yf(ticker: str) -> str:
     """Appends .NS to Indian stock tickers for Yahoo Finance compatibility."""
     ticker_upper = ticker.upper().replace(".NS", "")
@@ -32,6 +45,7 @@ def _format_ticker_for_yf(ticker: str) -> str:
     if ticker_upper in indian_symbols:
         return f"{ticker_upper}.NS"
     return ticker_upper
+
 
 # ===================================================================
 #                       CORE DATA FETCHING
@@ -45,14 +59,9 @@ def get_company_snapshot(ticker: str) -> Dict[str, Any]:
     try:
         stock = yf.Ticker(yf_ticker)
         info = stock.info
-        
         currency = info.get("currency", "USD")
         currency_symbol = "₹" if currency == "INR" else "$"
-        
-        return {
-            "currencySymbol": currency_symbol,
-            **info
-        }
+        return {"currencySymbol": currency_symbol, **info}
     except Exception as e:
         logger.error(f"Failed to retrieve snapshot for {yf_ticker}: {e}")
         return {"symbol": ticker, "error": str(e)}
@@ -70,46 +79,142 @@ def get_history(ticker: str, start: str, end: str, interval: str = "1d") -> pd.D
         logger.error(f"An error occurred while fetching history for {yf_ticker}: {e}")
         return pd.DataFrame()
 
+
 # ===================================================================
 #                       DATA ENRICHMENT
 # ===================================================================
 
 def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Appends a curated set of key technical indicators to an OHLCV DataFrame.
-    This is a more robust approach than `add_all_ta_features`.
-    """
-    if df.empty:
+    """Appends a curated set of key technical indicators to an OHLCV DataFrame."""
+    if df.empty or 'Close' not in df.columns or 'Volume' not in df.columns:
+        logger.warning("DataFrame is empty or missing 'Close'/'Volume' columns. Skipping TA.")
         return df
     
     logger.info(f"Adding technical indicators to DataFrame with {len(df)} rows...")
     try:
-        # Volume Indicators
-        df['volume_obv'] = ta.volume.on_balance_volume(df['Close'], df['Volume'], fillna=True)
+        df['volume_obv'] = ta.volume.on_balance_volume(close=df['Close'], volume=df['Volume'], fillna=True)
+        df['volatility_bbh'] = ta.volatility.bollinger_hband(close=df['Close'], window=20, window_dev=2, fillna=True)
+        df['volatility_bbl'] = ta.volatility.bollinger_lband(close=df['Close'], window=20, window_dev=2, fillna=True)
+        df['trend_sma_fast'] = ta.trend.sma_indicator(close=df['Close'], window=50, fillna=True)
+        df['trend_sma_slow'] = ta.trend.sma_indicator(close=df['Close'], window=200, fillna=True)
+        df['trend_macd'] = ta.trend.macd(close=df['Close'], window_slow=26, window_fast=12, fillna=True)
+        df['trend_macd_signal'] = ta.trend.macd_signal(close=df['Close'], window_slow=26, window_fast=12, window_sign=9, fillna=True)
+        df['momentum_rsi'] = ta.momentum.rsi(close=df['Close'], window=14, fillna=True)
         
-        # Volatility Indicators
-        df['volatility_bbh'] = ta.volatility.bollinger_hband(df['Close'], window=20, window_dev=2, fillna=True)
-        df['volatility_bbl'] = ta.volatility.bollinger_lband(df['Close'], window=20, window_dev=2, fillna=True)
-        
-        # Trend Indicators
-        df['trend_sma_fast'] = ta.trend.sma_indicator(df['Close'], window=50, fillna=True)
-        df['trend_sma_slow'] = ta.trend.sma_indicator(df['Close'], window=200, fillna=True)
-        df['trend_macd'] = ta.trend.macd(df['Close'], window_slow=26, window_fast=12, fillna=True)
-        df['trend_macd_signal'] = ta.trend.macd_signal(df['Close'], window_slow=26, window_fast=12, window_sign=9, fillna=True)
-        
-        # Momentum Indicators
-        df['momentum_rsi'] = ta.momentum.rsi(df['Close'], window=14, fillna=True)
-        
-        logger.info(f"Successfully added indicators. DataFrame now has {len(df.columns)} columns.")
+        logger.info(f"Successfully added indicators.")
         return df
     except Exception as e:
         logger.error(f"Error adding technical indicators: {e}")
-        return df # Return original dataframe on failure
+        return df
 
- 
+# import pandas as pd
+# import yfinance as yf
+# import ta
+# import logging
+# from typing import Dict, Any
+# from functools import lru_cache
+# from pathlib import Path
 
+# # --- Module Configuration ---
+# logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+# logger = logging.getLogger(__name__)
 
+# # --- Helper function for Indian Stocks ---
+# @lru_cache(maxsize=1)
+# def _get_indian_symbols_set():
+#     """Loads the set of Indian stock symbols from the EQUITY_L.csv file."""
+#     try:
+#         # Assumes the script is run from the project root where the 'data' folder exists.
+#         # This path is more robust: it starts from this file's location and goes up two levels to the project root.
+#         project_root = Path(__file__).parent.parent
+#         equity_file = project_root / "data" / "EQUITY_L (1).csv"
+        
+#         if equity_file.exists():
+#             df = pd.read_csv(equity_file)
+#             logger.info(f"Successfully loaded {len(df)} Indian stock symbols from {equity_file}")
+#             return set(df['SYMBOL'].str.upper())
+#         else:
+#             logger.warning(f"Indian symbols file not found at '{equity_file}'. Indian tickers may not be formatted correctly.")
+#             return set()
+#     except Exception as e:
+#         logger.error(f"Could not load Indian symbols file: {e}")
+#         return set()
 
+# def _format_ticker_for_yf(ticker: str) -> str:
+#     """Appends .NS to Indian stock tickers for Yahoo Finance compatibility."""
+#     ticker_upper = ticker.upper().replace(".NS", "")
+#     indian_symbols = _get_indian_symbols_set()
+#     if ticker_upper in indian_symbols:
+#         return f"{ticker_upper}.NS"
+#     return ticker_upper
+
+# # ===================================================================
+# #                       CORE DATA FETCHING
+# # ===================================================================
+
+# @lru_cache(maxsize=128)
+# def get_company_snapshot(ticker: str) -> Dict[str, Any]:
+#     """Returns a comprehensive snapshot of a company's key fundamentals."""
+#     yf_ticker = _format_ticker_for_yf(ticker)
+#     logger.info(f"Fetching snapshot for {yf_ticker}...")
+#     try:
+#         stock = yf.Ticker(yf_ticker)
+#         info = stock.info
+        
+#         currency = info.get("currency", "USD")
+#         currency_symbol = "₹" if currency == "INR" else "$"
+        
+#         return {
+#             "currencySymbol": currency_symbol,
+#             **info
+#         }
+#     except Exception as e:
+#         logger.error(f"Failed to retrieve snapshot for {yf_ticker}: {e}")
+#         return {"symbol": ticker, "error": str(e)}
+
+# def get_history(ticker: str, start: str, end: str, interval: str = "1d") -> pd.DataFrame:
+#     """Fetches historical market data for a given ticker."""
+#     yf_ticker = _format_ticker_for_yf(ticker)
+#     logger.info(f"Fetching history for {yf_ticker} from {start} to {end}.")
+#     try:
+#         df = yf.download(yf_ticker, start=start, end=end, interval=interval, progress=False, auto_adjust=True)
+#         if df.empty:
+#             logger.warning(f"No data found for {yf_ticker} from {start} to {end}.")
+#         return df
+#     except Exception as e:
+#         logger.error(f"An error occurred while fetching history for {yf_ticker}: {e}")
+#         return pd.DataFrame()
+
+# # ===================================================================
+# #                       DATA ENRICHMENT
+# # ===================================================================
+
+# def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
+#     """
+#     Appends a curated set of key technical indicators to an OHLCV DataFrame.
+#     This version is corrected to pass specific columns (Series) to the ta library.
+#     """
+#     if df.empty or 'Close' not in df.columns or 'Volume' not in df.columns:
+#         logger.warning("DataFrame is empty or missing 'Close'/'Volume' columns. Skipping technical indicators.")
+#         return df
+    
+#     logger.info(f"Adding technical indicators to DataFrame with {len(df)} rows...")
+#     try:
+#         # Pass specific pandas Series (df['ColumnName']) to each function
+#         df['volume_obv'] = ta.volume.on_balance_volume(close=df['Close'], volume=df['Volume'], fillna=True)
+#         df['volatility_bbh'] = ta.volatility.bollinger_hband(close=df['Close'], window=20, window_dev=2, fillna=True)
+#         df['volatility_bbl'] = ta.volatility.bollinger_lband(close=df['Close'], window=20, window_dev=2, fillna=True)
+#         df['trend_sma_fast'] = ta.trend.sma_indicator(close=df['Close'], window=50, fillna=True)
+#         df['trend_sma_slow'] = ta.trend.sma_indicator(close=df['Close'], window=200, fillna=True)
+#         df['trend_macd'] = ta.trend.macd(close=df['Close'], window_slow=26, window_fast=12, fillna=True)
+#         df['trend_macd_signal'] = ta.trend.macd_signal(close=df['Close'], window_slow=26, window_fast=12, window_sign=9, fillna=True)
+#         df['momentum_rsi'] = ta.momentum.rsi(close=df['Close'], window=14, fillna=True)
+        
+#         logger.info(f"Successfully added indicators. DataFrame now has {len(df.columns)} columns.")
+#         return df
+#     except Exception as e:
+#         logger.error(f"Error adding technical indicators: {e}")
+#         return df # Return original dataframe on failure
 # import pandas as pd
 # import yfinance as yf
 # import ta

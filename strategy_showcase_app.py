@@ -93,13 +93,15 @@ if run_button:
             st.pyplot(fig)
             results = None # Mark as handled
         elif selected_strategy_name == "Index/ETF Analysis":
-            # This one prints to console, we can't capture it easily.
-            # A future refactor would make it return data.
-            st.info("Index/ETF Analysis results are printed to the console where Streamlit was launched.")
-            selected_strategy_func(ticker_input)
-            results = None # Mark as handled
-        elif selected_strategy_name in ["Value Investing", "Growth Investing", "Dividend Investing"]:
-            results = selected_strategy_func(ticker_input)
+    # Refactor the function to return data
+            results = selected_strategy_func(ticker_input) 
+            if results:
+                st.subheader("Index/ETF Analysis Results")
+        # Display the results in the UI
+                st.json(results) 
+            else:
+                st.error("Could not retrieve Index/ETF Analysis data.")
+
         else: # All other short-term strategies
             results = selected_strategy_func(ticker_input, str(start_date), str(end_date))
 

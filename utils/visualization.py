@@ -8,14 +8,11 @@ from typing import Dict, Any, List
 #               STREAMLIT VISUALIZATION UTILITIES
 # ===================================================================
 
-def plot_backtest_comparison(results_df: pd.DataFrame) -> go.Figure:
-    """
-    Plots an interactive bar chart comparing the total returns of different backtesting strategies.
-    """
-    if results_df.empty or 'Return [%]' not in results_df.columns:
-        return go.Figure()
-
-    results_df['Return [%]'] = pd.to_numeric(results_df['Return [%]'], errors='coerce')
+def plot_backtest_comparison(results_df: pd.DataFrame, return_col: str = 'Return [%]') -> go.Figure:
+    if results_df.empty or return_col not in results_df.columns:
+        # ...
+        results_df[return_col] = pd.to_numeric(results_df[return_col], errors='coerce')
+    # ... use return_col throughout the function ..
     results_df.dropna(subset=['Return [%]'], inplace=True)
     
     results_df = results_df.sort_values('Return [%]', ascending=True)

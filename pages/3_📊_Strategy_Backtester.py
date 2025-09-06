@@ -1,3 +1,140 @@
+# import streamlit as st
+# import sys
+# import pathlib
+# import pandas as pd
+
+# # --- Path setup ---
+# sys.path.append(str(pathlib.Path(__file__).parent.parent))
+# from agents.orchestrator import Orchestrator
+# from utils.visualization import plot_backtest_comparison
+
+# # --- Page Configuration ---
+# st.set_page_config(page_title="Strategy Backtester", layout="wide")
+# st.title("📊 Institutional Strategy Portfolio Backtester")
+
+# # --- Load Orchestrator ---
+# @st.cache_resource
+# def load_orchestrator():
+#     config_path = "../config.yaml"
+#     return Orchestrator.from_file(config_path)
+
+# orchestrator = load_orchestrator()
+
+# # --- Professional Strategy Combination Mapping & Metadata ---
+# STRATEGY_COMBINATIONS = {
+#     "Balanced Alpha Generator": {
+#         "modules": ["Momentum Strategy", "Rsi Strategy", "Pairs Trading", "Dca Investing"],
+#         "type": "short_and_long",
+#         "users": "Institutional Investors, Fund Managers",
+#         "benefits": "Aims for risk-adjusted returns through diversification across different market dynamics."
+#     },
+#     "Trend & Reversion Hybrid": {
+#         "modules": ["Ema Crossover", "Sma Crossover", "Reversal Strategy", "Support Resistance"],
+#         "type": "short",
+#         "users": "Professional Traders, Hedge Funds",
+#         "benefits": "Designed to capture profits in both trending and range-bound market conditions."
+#     },
+#     "Trend Following Suite": {
+#         "modules": ["Momentum Strategy", "Ema Crossover", "Breakout Strategy", "Channel Trading"],
+#         "type": "short",
+#         "users": "Active Traders, Momentum Funds",
+#         "benefits": "Focuses on capitalizing on strong, sustained market trends for high return potential."
+#     },
+#     "Contrarian Value Hunter": {
+#         "modules": ["Mean Inversion", "Rsi Strategy", "Pullback Fibonacci", "Value Investing"],
+#         "type": "short_and_long",
+#         "users": "Value Investors, Contrarian Funds",
+#         "benefits": "Seeks to find undervalued assets by buying into oversold conditions and dips."
+#     },
+#     "Institutional Core Holdings": {
+#         "modules": ["Index Etf Investing", "Dca Investing", "Dividend Investing", "Value Investing"],
+#         "type": "long",
+#         "users": "Pension Funds, Endowments, Family Offices",
+#         "benefits": "A conservative portfolio focused on steady growth, income, and low volatility."
+#     },
+#     "Growth & Income Blend": {
+#         "modules": ["Growth Investing", "Dividend Investing", "Dca Investing", "Value Investing"],
+#         "type": "long",
+#         "users": "Mutual Fund Managers, Retail Advisory",
+#         "benefits": "A balanced approach aiming for both capital appreciation and income generation."
+#     },
+# }
+
+# # --- Sidebar ---
+# with st.sidebar:
+#     st.header("⚙️ Configuration")
+#     selected_combination = st.selectbox("Select a Strategy Portfolio", options=list(STRATEGY_COMBINATIONS.keys()))
+    
+#     tickers_input = st.text_input("Enter Tickers (comma-separated)", "AAPL,MSFT")
+#     start_date = st.date_input("Start Date", pd.to_datetime("2023-01-01"))
+#     end_date = st.date_input("End Date", pd.to_datetime("today"))
+
+#     run_button = st.button("🔬 Run Portfolio Backtest", use_container_width=True)
+
+# # --- Main Panel ---
+# if run_button:
+#     tickers = [t.strip().upper() for t in tickers_input.split(",")]
+#     portfolio = STRATEGY_COMBINATIONS[selected_combination]
+    
+#     st.header(f"🏆 Analysis Results for: *{selected_combination}*")
+#     st.info(f"**Target Users:** {portfolio['users']}\n\n**Benefits:** {portfolio['benefits']}")
+    
+#     all_summaries = []
+
+#     with st.spinner(f"Running portfolio strategies on {tickers}..."):
+#         # --- THIS IS THE FIX: We now loop through the specific modules ---
+        
+#         # Run short-term strategies if applicable
+#         if portfolio['type'] in ["short", "short_and_long"]:
+#             short_term_modules_to_run = {
+#                 name: module for name, module in orchestrator.short_term_modules.items()
+#                 if name in portfolio['modules']
+#             }
+#             for ticker in tickers:
+#                 for name, module in short_term_modules_to_run.items():
+#                     try:
+#                         results = module.run(ticker, str(start_date.date()), str(end_date.date()))
+#                         summary = results.get("summary", {})
+#                         summary['Strategy'], summary['Ticker'] = name, ticker
+#                         all_summaries.append(summary)
+#                     except Exception as e:
+#                         all_summaries.append({'Strategy': name, 'Ticker': ticker, 'Error': str(e)})
+
+#         # Run long-term strategies if applicable
+#         if portfolio['type'] in ["long", "short_and_long"]:
+#             long_term_modules_to_run = {
+#                 name: module for name, module in orchestrator.long_term_modules.items()
+#                 if name in portfolio['modules']
+#             }
+#             for ticker in tickers:
+#                 for name, module in long_term_modules_to_run.items():
+#                     try:
+#                         results = module.analyze(ticker)
+#                         summary = results.get("summary", {})
+#                         summary['Strategy'], summary['Ticker'] = name, ticker
+#                         all_summaries.append(summary)
+#                     except Exception as e:
+#                         all_summaries.append({'Strategy': name, 'Ticker': ticker, 'Error': str(e)})
+
+#     # Consolidate all results into a single DataFrame
+#     summary_df = pd.DataFrame(all_summaries)
+
+#     st.subheader("Performance Summary Table")
+#     # Display a cleaned-up version of the results
+#     display_cols = ['Strategy', 'Ticker', 'Return [%]', 'Sharpe Ratio', 'Max. Drawdown [%]', 'Win Rate [%]', '# Trades', 'Error']
+#     # Filter for columns that actually exist in the dataframe
+#     final_cols = [col for col in display_cols if col in summary_df.columns]
+#     st.dataframe(summary_df[final_cols])
+
+#     # Only show the performance chart for strategies that have a numeric return
+#     chart_df = summary_df.copy()
+#     if 'Return [%]' in chart_df.columns:
+#         chart_df['Return [%]'] = pd.to_numeric(chart_df['Return [%]'], errors='coerce').fillna(0)
+#         st.subheader("Total Return Comparison Chart")
+#         fig = plot_backtest_comparison(chart_df)
+#         st.plotly_chart(fig, use_container_width=True)
+
+
 import streamlit as st
 import sys
 import pathlib
