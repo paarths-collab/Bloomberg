@@ -7,67 +7,89 @@ import os
 
 class StockPickerAgent:
     def __init__(self, 
-                 data_path: str = "quant-company-insights-agent/data",
-                 cache_path: str = "quant-company-insights-agent/data/stock_universe.parquet"):
+                 data_path: str = "data",
+                 cache_path_india: str = "data/indian_stock_universe.parquet",
+                 cache_path_us: str = "data/us_stock_universe.parquet"):
         """
-        Initializes the StockPickerAgent by loading a dynamic, cached universe of stocks.
+        Initializes the StockPickerAgent by loading dynamic, cached universes for both US and Indian stocks.
         """
         self.data_path = data_path
-        self.cache_path = cache_path
-        self.stock_universe = self._load_or_build_universe_cache()
+        self.cache_path_india = cache_path_india
+        self.cache_path_us = cache_path_us
         
-        if self.stock_universe.empty:
-            print("❌ StockPickerAgent WARNING: Stock universe is empty. Agent will not function.")
-        else:
-            print(f"✅ StockPickerAgent: Loaded {len(self.stock_universe)} stocks with sector data.")
+        # Load both universes into memory upon initialization
+        self.indian_stock_universe = self._load_or_build_indian_universe_cache()
+        self.us_stock_universe = self._load_or_build_us_universe_cache()
+        
+        print("✅ StockPickerAgent: Initialization complete.")
 
-    def _load_or_build_universe_cache(self) -> pd.DataFrame:
-        """Loads the stock universe from a cache file or builds it if it doesn't exist."""
-        if os.path.exists(self.cache_path):
-            print(f"StockPickerAgent: Loading stock universe from cache: {self.cache_path}")
-            return pd.read_parquet(self.cache_path)
-        else:
-            return self._build_universe_cache()
-
-    def _build_universe_cache(self) -> pd.DataFrame:
-        """
-        Slow, one-time process to load all Indian stocks from CSVs, fetch their sectors
-        using yfinance, and build a cache file.
-        """
-        print("StockPickerAgent: Building stock universe cache... This will take a VERY long time and only runs once.")
+    def _build_indian_universe_cache(self) -> pd.DataFrame:
+        """Builds the cache for Indian stocks from nifty500.csv."""
+        print("StockPickerAgent: Building INDIAN stock universe cache... This may take time and only runs once.")
         try:
-            main_path = os.path.join(self.data_path, "EQUITY_L.csv")
-            sme_path = os.path.join(self.data_path, "SME_EQUITY_L.csv")
-            df_main = pd.read_csv(main_path)
-            df_sme = pd.read_csv(sme_path)
-            
-            # Clean and combine
-            df_main.rename(columns=lambda x: x.strip().upper().replace(" ", "_"), inplace=True)
-            df_sme.rename(columns=lambda x: x.strip().upper().replace(" ", "_"), inplace=True)
-            universe_df = pd.concat([df_main[['SYMBOL', 'NAME_OF_COMPANY']], df_sme[['SYMBOL', 'NAME_OF_COMPANY']]], ignore_index=True)
+            india_path = os.path.join(self.data_path, "nifty500.csv")
+            universe_df = pd.read_csv(india_path)
+            universe_df.rename(columns={'Company Name': 'NAME_OF_COMPANY', 'Symbol': 'SYMBOL'}, inplace=True)
             universe_df['YF_TICKER'] = universe_df['SYMBOL'] + '.NS'
         except FileNotFoundError as e:
-            print(f"❌ StockPickerAgent ERROR: Could not find stock data file: {e}")
+            print(f"❌ StockPickerAgent ERROR: Could not find Indian stock data file: {e}")
             return pd.DataFrame()
 
         sectors = []
         total = len(universe_df)
         for i, row in universe_df.iterrows():
-            # Add a progress printout
-            print(f"  Fetching sector for {row['YF_TICKER']} ({i+1}/{total})...")
+            print(f"  Fetching Indian sector for {row['YF_TICKER']} ({i+1}/{total})...")
             try:
-                # Use the fast 'info' fetch
                 sector = yf.Ticker(row['YF_TICKER']).info.get('sector', 'Unknown')
                 sectors.append(sector)
             except Exception:
-                sectors.append('Unknown') # Append 'Unknown' on any error
+                sectors.append('Unknown')
         
         universe_df['Sector'] = sectors
-        
-        # Save the enriched dataframe to a fast parquet file for future runs
-        universe_df.to_parquet(self.cache_path)
-        print(f"✅ StockPickerAgent: Universe cache built and saved to {self.cache_path}")
+        universe_df.to_parquet(self.cache_path_india)
+        print(f"✅ StockPickerAgent: Indian universe cache built and saved to {self.cache_path_india}")
         return universe_df
+
+    def _load_or_build_indian_universe_cache(self) -> pd.DataFrame:
+        """Loads the Indian stock universe from cache or builds it."""
+        if os.path.exists(self.cache_path_india):
+            print(f"StockPickerAgent: Loading Indian stock universe from cache: {self.cache_path_india}")
+            return pd.read_parquet(self.cache_path_india)
+        return self._build_indian_universe_cache()
+
+    def _build_us_universe_cache(self) -> pd.DataFrame:
+        """Builds the cache for US stocks from us_stocks.csv."""
+        print("StockPickerAgent: Building US stock universe cache... This may take time and only runs once.")
+        try:
+            us_path = os.path.join(self.data_path, "us_stocks.csv")
+            universe_df = pd.read_csv(us_path)
+            universe_df.rename(columns={'Company Name': 'NAME_OF_COMPANY', 'Symbol': 'SYMBOL'}, inplace=True)
+            universe_df['YF_TICKER'] = universe_df['SYMBOL']
+        except FileNotFoundError as e:
+            print(f"❌ StockPickerAgent ERROR: Could not find US stock data file: {e}")
+            return pd.DataFrame()
+
+        sectors = []
+        total = len(universe_df)
+        for i, row in universe_df.iterrows():
+            print(f"  Fetching US sector for {row['YF_TICKER']} ({i+1}/{total})...")
+            try:
+                sector = yf.Ticker(row['YF_TICKER']).info.get('sector', 'Unknown')
+                sectors.append(sector)
+            except Exception:
+                sectors.append('Unknown')
+        
+        universe_df['Sector'] = sectors
+        universe_df.to_parquet(self.cache_path_us)
+        print(f"✅ StockPickerAgent: US universe cache built and saved to {self.cache_path_us}")
+        return universe_df
+
+    def _load_or_build_us_universe_cache(self) -> pd.DataFrame:
+        """Loads the US stock universe from cache or builds it."""
+        if os.path.exists(self.cache_path_us):
+            print(f"StockPickerAgent: Loading US stock universe from cache: {self.cache_path_us}")
+            return pd.read_parquet(self.cache_path_us)
+        return self._build_us_universe_cache()
 
     def _get_stock_data(self, tickers: List[str]) -> Dict[str, yf.Ticker]:
         """Fetches and caches yfinance Ticker objects."""
@@ -87,14 +109,14 @@ class StockPickerAgent:
                 pe = info.get('trailingPE')
                 value_score = 1 / pe if pe and pe > 0 else 0
                 roe = info.get('returnOnEquity')
-                quality_score = roe if roe else 0
+                quality_score = roe * 100 if roe else 0
 
                 all_metrics.append({
                     "Ticker": ticker, "Momentum": momentum_score,
-                    "Value": value_score * 100, "Quality (ROE)": quality_score * 100 if quality_score else 0
+                    "Value": value_score * 100, "Quality (ROE)": quality_score
                 })
             except Exception:
-                continue # Skip stocks with data fetching errors
+                continue
         return pd.DataFrame(all_metrics).dropna()
 
     def rank_stocks(self, scores_df: pd.DataFrame, weights: Dict[str, float]) -> pd.DataFrame:
@@ -109,24 +131,26 @@ class StockPickerAgent:
         )
         return scores_df.sort_values('Final Score', ascending=False).reset_index(drop=True)
 
-    def run(self, sector: str, weights: Dict[str, float], top_n: int = 5) -> List[str]:
+    def run(self, market: str, sector: str, weights: Dict[str, float], top_n: int = 5) -> pd.DataFrame:
         """
-        Runs the full stock picking pipeline for a given sector from the dynamic universe.
+        Runs the full stock picking pipeline for a given market and sector.
         """
-        print(f"StockPickerAgent: Running discovery for '{sector}' sector...")
+        print(f"StockPickerAgent: Running discovery for '{sector}' sector in market '{market}'...")
         
-        # --- THIS IS THE DYNAMIC PART ---
-        # Filter the full universe to get tickers for the selected sector
-        tickers_to_analyze = self.stock_universe[self.stock_universe['Sector'] == sector]['YF_TICKER'].tolist()
+        universe_to_scan = self.indian_stock_universe if market.lower() == 'india' else self.us_stock_universe
+
+        if universe_to_scan.empty:
+            return pd.DataFrame([{"Error": f"Stock universe for market '{market}' is empty."}])
+            
+        tickers_to_analyze = universe_to_scan[universe_to_scan['Sector'] == sector]['YF_TICKER'].tolist()
         
         if not tickers_to_analyze:
-            return [f"Error: No stocks found for sector '{sector}' in the loaded universe."]
-            
+            return pd.DataFrame([{"Error": f"No stocks found for sector '{sector}' in the {market} universe."}])
+                
         stock_data = self._get_stock_data(tickers_to_analyze)
         scores_df = self.calculate_scores(stock_data)
         ranked_df = self.rank_stocks(scores_df, weights)
         
-        # Return the DataFrame for the Streamlit showcase to use
         return ranked_df.head(top_n)
 
 # --- Streamlit Visualization ---
@@ -139,8 +163,11 @@ if __name__ == "__main__":
     with st.sidebar:
         st.header("⚙️ Configuration")
         
-        # Get the list of available sectors dynamically from the loaded data
-        available_sectors = sorted(agent.stock_universe['Sector'].unique().tolist())
+        market = st.radio("Select Market", ["USA", "India"], horizontal=True)
+        
+        universe = agent.us_stock_universe if market == "USA" else agent.indian_stock_universe
+        available_sectors = sorted(universe['Sector'].unique().tolist())
+        
         sector = st.selectbox("Select a Sector to Analyze", options=available_sectors)
         
         st.subheader("Factor Weights")
@@ -160,8 +187,7 @@ if __name__ == "__main__":
             }
             st.header(f"Top Stock Picks for: *{sector}*")
             with st.spinner(f"Fetching data and ranking stocks in the {sector} sector..."):
-                # The agent's run method now returns a DataFrame
-                ranked_df = agent.run(sector, weights, top_n=10)
+                ranked_df = agent.run(market, sector, weights, top_n=10)
 
                 if ranked_df.empty or "Error" in ranked_df.iloc[0]:
                     st.error("Could not generate rankings. The sector might be empty or data could not be fetched.")
@@ -174,3 +200,4 @@ if __name__ == "__main__":
                                  title=f"Factor Ranks for Top 10 Stocks in {sector}",
                                  labels={'value': 'Normalized Rank (0-100)', 'variable': 'Factor'})
                     st.plotly_chart(fig, use_container_width=True)
+

@@ -7,22 +7,34 @@ from typing import Dict, Any, List
 # ===================================================================
 #               STREAMLIT VISUALIZATION UTILITIES
 # ===================================================================
-
+def create_price_chart(df, stock_name, currency_symbol="$"):
+    """Creates a candlestick price chart with fast and slow SMAs."""
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='Price'))
+    
+    # Safely add indicators if they exist
+    if 'trend_sma_fast' in df.columns: 
+        fig.add_trace(go.Scatter(x=df.index, y=df['trend_sma_fast'], name='Fast SMA', line=dict(color='orange', width=1.5)))
+    if 'trend_sma_slow' in df.columns: 
+        fig.add_trace(go.Scatter(x=df.index, y=df['trend_sma_slow'], name='Slow SMA', line=dict(color='purple', width=1.5)))
+        
+    fig.update_layout(title_text=f'<b>{stock_name} Price Chart & Indicators</b>', yaxis_title=f'Price ({currency_symbol})', xaxis_rangeslider_visible=False, legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+    return fig
 def plot_backtest_comparison(results_df: pd.DataFrame, return_col: str = 'Return [%]') -> go.Figure:
     if results_df.empty or return_col not in results_df.columns:
         # ...
         results_df[return_col] = pd.to_numeric(results_df[return_col], errors='coerce')
     # ... use return_col throughout the function ..
-    results_df.dropna(subset=['Return [%]'], inplace=True)
+    results_df.dropna(subset=['Total Return %'], inplace=True)
     
-    results_df = results_df.sort_values('Return [%]', ascending=True)
+    results_df = results_df.sort_values('Total Return %', ascending=True)
     
-    colors = ['#059669' if x > 0 else '#f43f5e' for x in results_df['Return [%]']]
+    colors = ['#059669' if x > 0 else '#f43f5e' for x in results_df['Total Return %']]
     
     fig = px.bar(
-        results_df, 
-        x='Return [%]', 
-        y='Strategy', 
+        results_df,
+        x='Total Return %',
+        y='Strategy',
         color='Ticker',
         barmode='group',
         orientation='h',

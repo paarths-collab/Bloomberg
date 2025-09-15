@@ -2,7 +2,7 @@ import os
 from typing import Dict,List,Tuple,Any
 import pandas as pd
 import streamlit as st
-
+import plotly.express as px 
 # --- Attempt to import optional dependencies ---
 try:
     import torch
@@ -147,7 +147,7 @@ if __name__ == "__main__":
                         "Sentiment": ["Positive", "Negative", "Neutral"],
                         "Count": [results.get("Positive", 0), results.get("Negative", 0), results.get("Neutral", 0)]
                     })
-                    fig = pd.pie(df_counts, names="Sentiment", values="Count",
+                    fig = px.pie(df_counts, names="Sentiment", values="Count",
                                  color="Sentiment",
                                  color_discrete_map={"Positive":"green", "Negative":"red", "Neutral":"grey"},
                                  title="Breakdown of Reddit Mentions")

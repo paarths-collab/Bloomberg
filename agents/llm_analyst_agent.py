@@ -40,19 +40,31 @@ class LLMAnalystAgent:
             return ""
 
 
-    def run_ollama(self, prompt: str) -> str:
-        url = "http://localhost:11434/api/generate"
-        payload = {"model": self.model, "prompt": prompt}
-        resp = requests.post(url, json=payload, stream=True)
-        output = ""
-        for line in resp.iter_lines():
-            if line:
-                part = line.decode("utf-8")
-                # Corrected the line below to safely parse JSON
-                if "response" in part:
-                    output += json.loads(part)["response"]
-        return output.strip()
+    # In Bloomberg/agents/llm_analyst_agent.py
 
+    def run_ollama(self, prompt: str, model_name: str) -> str:
+        """Runs a prompt against a specific Ollama model."""
+        url = "http://localhost:11434/api/generate"
+        # Use stream=False for simpler, more robust response handling
+        payload = {"model": model_name, "prompt": prompt, "stream": False}
+        try:
+            # Add a timeout to prevent the request from hanging
+            resp = requests.post(url, json=payload, timeout=120) # 120 seconds
+            # Raise an exception for bad status codes (like 404 Not Found)
+            resp.raise_for_status()
+            
+            # The full response is a single JSON object when stream is False
+            response_json = resp.json()
+            return response_json.get("response", "").strip()
+
+        except requests.exceptions.HTTPError as http_err:
+            error_msg = f"HTTP error occurred for model '{model_name}': {http_err} - Check if the model is installed and running."
+            print(f"ERROR: {error_msg}")
+            return error_msg
+        except Exception as e:
+            error_msg = f"An error occurred contacting Ollama model '{model_name}': {e}"
+            print(f"ERROR: {error_msg}")
+            return error_msg
     def run_gemini(self, prompt: str) -> str:
         if not _HAS_GEMINI:
             return "Error: The 'google-generativeai' library is required. Please install it using 'pip install google-generativeai'."
