@@ -16,6 +16,12 @@ scikit-learn
 # For creating interactive charts and plots
 plotly
 matplotlib
+mplfinance
+
+# --- Financial Analysis & Performance Metrics ---
+# For calculating performance metrics and risk analysis
+quantstats
+empyrical-reloaded
 
 # --- Web Scraping & API Requests ---
 # For fetching data from websites and APIs
@@ -28,7 +34,7 @@ webdriver-manager
 # --- NLP & Sentiment Analysis ---
 # For processing natural language and analyzing text sentiment
 nltk
-
+openai
 # --- Configuration & Utilities ---
 # For handling YAML config files and defining data models
 pyyaml

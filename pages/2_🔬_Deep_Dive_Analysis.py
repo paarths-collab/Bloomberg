@@ -21,6 +21,32 @@ def load_orchestrator():
     return Orchestrator.from_file(config_path)
 
 @st.cache_data
+def load_us_stock_list():
+    """
+    Loads and prepares the US stock list from us_stocks.csv
+    for the searchable selectbox.
+    """
+    try:
+        project_root = Path(__file__).parent.parent
+        us_file_path = project_root / "data" / "us_stocks.csv"
+        df = pd.read_csv(us_file_path)
+
+        company_col = 'Company Name'
+        symbol_col = 'Symbol'
+
+        if company_col not in df.columns or symbol_col not in df.columns:
+            st.error(f"CRITICAL ERROR: '{company_col}' or '{symbol_col}' not found in us_stocks.csv.")
+            return None
+
+        df['Display'] = df[company_col] + " (" + df[symbol_col] + ")"
+        
+        return df[[symbol_col, 'Display']].sort_values("Display")
+
+    except FileNotFoundError:
+        st.error("CRITICAL ERROR: 'us_stocks.csv' not found. Please ensure it is in the 'data/' folder.")
+        return None
+
+@st.cache_data
 def load_nse_stock_list():
     """
     Loads and prepares the Nifty 500 stock list from nifty500.csv
@@ -51,6 +77,7 @@ def load_nse_stock_list():
 
 # --- Load necessary resources ---
 orchestrator = load_orchestrator()
+us_stocks_df = load_us_stock_list()
 nse_stocks_df = load_nse_stock_list()
 
 # --- Helper Functions for Display ---
@@ -77,13 +104,26 @@ def create_price_chart(df, stock_name, currency_symbol="$"):
 # --- Sidebar for User Input ---
 with st.sidebar:
     st.header("⚙️ Configuration")
-    analysis_market = st.radio("Select Market", ["USA", "India"], horizontal=True)
+    analysis_market = st.radio("Select Market", ["🇺🇸 US", "🇮🇳 India"], horizontal=True)
     
     ticker = None
-    if analysis_market == "India" and nse_stocks_df is not None:
+    if analysis_market == "🇮🇳 India" and nse_stocks_df is not None:
         selected_display = st.selectbox("Search for an NSE Stock", options=nse_stocks_df['Display'])
         if selected_display:
             ticker = nse_stocks_df[nse_stocks_df['Display'] == selected_display]['Symbol'].iloc[0]
+    elif analysis_market == "🇺🇸 US" and us_stocks_df is not None:
+        try:
+            # Find the default index for AAPL
+            default_index = int(us_stocks_df[us_stocks_df['Symbol'] == 'AAPL'].index[0])
+        except (IndexError, TypeError):
+            default_index = 0  # fallback to first row if AAPL missing
+        selected_display = st.selectbox(
+            "Search for a US Stock",
+            options=us_stocks_df['Display'],
+            index=default_index
+        )
+        if selected_display:
+            ticker = us_stocks_df[us_stocks_df['Display'] == selected_display]['Symbol'].iloc[0]
     else:
         ticker = st.text_input("Enter a US Ticker Symbol", "AAPL")
         
@@ -94,12 +134,15 @@ with st.sidebar:
 # --- Main Page Display Logic ---
 # --- Main Page Display Logic ---
 if run_button and ticker:
+    # Convert the emoji-based market to text for the orchestrator
+    market_for_orchestrator = "India" if analysis_market == "🇮🇳 India" else "USA"
+    
     with st.spinner(f"Running full multi-agent analysis for {ticker}..."):
         results = orchestrator.run_deep_dive_analysis(
             ticker=ticker, 
             start_date=str(start_date), 
             end_date=str(end_date),
-            market=analysis_market
+            market=market_for_orchestrator
         )
 
     snapshot = results.get("snapshot", {})

@@ -1,113 +1,129 @@
 import os
 import json
-import streamlit as st
 from typing import Dict, Any
+import streamlit as st
+from openai import OpenAI
 
-# --- Graceful Dependency Imports ---
-try:
-    import google.generativeai as genai
-    _HAS_GEMINI = True
-except ImportError:
-    genai, _HAS_GEMINI = None, False
+class LLMEngine:
+    """
+    A dedicated wrapper for the OpenRouter API.
+    """
+    def __init__(self, api_key: str, model_name: str = "openai/gpt-oss-20b:free"):
+        """
+        Initializes the OpenRouter client.
 
-# --- Master Analyst Agent ---
-import requests
+        Args:
+            api_key (str): The OpenRouter API key.
+            model_name (str): The default model to use for requests.
+        """
+        self.api_key = api_key
+        self.model_name = model_name
+        
+        if not self.api_key:
+            raise ValueError("An OpenRouter API key must be provided.")
+
+        try:
+            self.client = OpenAI(
+                base_url="https://openrouter.ai/api/v1",
+                api_key=self.api_key,
+            )
+            print(f"[SUCCESS] LLMEngine: OpenRouter client initialized with default model: {self.model_name}")
+        except Exception as e:
+            print(f"[ERROR] LLMEngine: Failed to initialize OpenRouter client: {e}")
+            raise
+
+    def run(self, prompt: str, model_name: str = None) -> str:
+        """
+        Runs the LLM with a given prompt and returns the text response.
+
+        Args:
+            prompt (str): The prompt to send to the language model.
+            model_name (str, optional): A specific OpenRouter model to use for this request.
+
+        Returns:
+            str: The content of the LLM's response.
+        """
+        if not self.client:
+            return "Error: OpenRouter client is not initialized."
+
+        effective_model_name = model_name if model_name else self.model_name
+
+        try:
+            completion = self.client.chat.completions.create(
+                model=effective_model_name,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            return completion.choices[0].message.content
+        except Exception as e:
+            print(f"Error during OpenRouter LLM execution with model {effective_model_name}: {e}")
+            return f"An error occurred while contacting the OpenRouter API: {e}"
 
 class LLMAnalystAgent:
-    def __init__(self, model="mistral", gemini_api_key: str = None):
-        self.model = model
-        self.gemini_api_key = gemini_api_key
-        self.ollama_available = self.check_ollama()
-
-        if self.gemini_api_key and _HAS_GEMINI:
-            genai.configure(api_key=self.gemini_api_key)
-
-    def check_ollama(self) -> bool:
-        """Check if Ollama server is running on localhost:11434"""
-        try:
-            resp = requests.get("http://localhost:11434/api/tags", timeout=2)
-            return resp.status_code == 200
-        except Exception:
-            return False
-
-    def run(self, prompt: str) -> str:
-        if self.ollama_available:
-            return self.run_ollama(prompt)
-        elif self.gemini_api_key:
-            return self.run_gemini(prompt)
-        else:
-            st.error("No LLM provider is available. Please run the Ollama server or provide a Gemini API key.")
-            return ""
-
-
-    # In Bloomberg/agents/llm_analyst_agent.py
-
-    def run_ollama(self, prompt: str, model_name: str) -> str:
-        """Runs a prompt against a specific Ollama model."""
-        url = "http://localhost:11434/api/generate"
-        # Use stream=False for simpler, more robust response handling
-        payload = {"model": model_name, "prompt": prompt, "stream": False}
-        try:
-            # Add a timeout to prevent the request from hanging
-            resp = requests.post(url, json=payload, timeout=120) # 120 seconds
-            # Raise an exception for bad status codes (like 404 Not Found)
-            resp.raise_for_status()
-            
-            # The full response is a single JSON object when stream is False
-            response_json = resp.json()
-            return response_json.get("response", "").strip()
-
-        except requests.exceptions.HTTPError as http_err:
-            error_msg = f"HTTP error occurred for model '{model_name}': {http_err} - Check if the model is installed and running."
-            print(f"ERROR: {error_msg}")
-            return error_msg
-        except Exception as e:
-            error_msg = f"An error occurred contacting Ollama model '{model_name}': {e}"
-            print(f"ERROR: {error_msg}")
-            return error_msg
-    def run_gemini(self, prompt: str) -> str:
-        if not _HAS_GEMINI:
-            return "Error: The 'google-generativeai' library is required. Please install it using 'pip install google-generativeai'."
-        try:
-            model = genai.GenerativeModel('gemini-pro')
-            response = model.generate_content(prompt)
-            return response.text
-        except Exception as e:
-            st.error(f"An error occurred while contacting the Gemini API: {e}")
-            return ""
-
-    def generate_brokerage_report(self, context: Dict[str, Any], user_query: str) -> str:
+    """
+    An agent that uses a dedicated OpenRouter LLM engine to perform financial analysis.
+    """
+    def __init__(self, openrouter_api_key: str):
         """
-        Generates a professional brokerage report based on the provided context and user query.
+        Initializes the agent and its underlying OpenRouter engine.
+
+        Args:
+            openrouter_api_key (str): The API key for OpenRouter.
         """
-        prompt = f"""
-        As a senior financial analyst, generate a professional brokerage report.
+        if not openrouter_api_key:
+            raise ValueError("An OpenRouter API key is required to initialize the LLMAnalystAgent.")
+        
+        self.llm = LLMEngine(api_key=openrouter_api_key)
 
-        **Client Query:** "{user_query}"
-
-        **Available Data Context:**
-        {json.dumps(context, indent=2)}
-
-        Based on the data, provide a comprehensive investment analysis and a final recommendation.
-        Structure the report with clear headings, such as 'Market Overview', 'Fundamental Analysis',
-        'Technical Outlook', 'Sentiment Analysis', and 'Final Recommendation'.
+    def run(self, prompt: str, model_name: str = None) -> str:
         """
-        return self.run(prompt)
+        Runs the LLM with a given prompt, allowing for a model override.
 
+        Args:
+            prompt (str): The input prompt for the language model.
+            model_name (str, optional): A specific OpenRouter model to use for this request.
+        
+        Returns:
+            str: The response from the language model.
+        """
+        return self.llm.run(prompt, model_name=model_name)
 
-# --- Streamlit Showcase ---
+# --- Streamlit Showcase (for standalone testing) ---
 if __name__ == "__main__":
-    st.set_page_config(page_title="Master AI Analyst", layout="wide")
-    st.title("🤖 Master AI Financial Analyst (Gemini 1.5 Pro)")
+    st.set_page_config(page_title="OpenRouter AI Analyst", layout="wide")
+    st.title("🤖 OpenRouter Financial Analyst")
 
-    GEMINI_KEY = st.secrets.get("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY"))
+    OPENROUTER_KEY = st.secrets.get("OPENROUTER_API_KEY", os.getenv("OPENROUTER_API_KEY"))
 
-    if not GEMINI_KEY:
-        st.error("GEMINI_API_KEY not found! This agent requires a Gemini API key.")
+    if not OPENROUTER_KEY:
+        st.error("OPENROUTER_API_KEY not found! Please set it in your Streamlit secrets or environment variables.")
     else:
-        # Correctly pass the API key to the agent
-        agent = LLMAnalystAgent(gemini_api_key=GEMINI_KEY)
+        agent = LLMAnalystAgent(openrouter_api_key=OPENROUTER_KEY)
 
-        st.info("This showcase simulates the final step of the AI workflow. The Orchestrator would gather all the data below and pass it to this agent.")
+        sample_context = {
+            "stock_symbol": "NVDA",
+            "current_price": 950.00,
+            "52_week_high": 974.00,
+            "market_cap": "2.37T",
+            "recent_news": "Nvidia's earnings report surpassed all expectations, fueled by demand for their AI chips."
+        }
+        user_query = "Given the strong earnings, is Nvidia still a good buy?"
 
-        # ... (The rest of your Streamlit showcase code remains the same)
+        st.info("Generating a brokerage report using a model from OpenRouter...")
+
+        test_model = "openai/gpt-3.5-turbo" 
+
+        with st.spinner(f"Analyzing with {test_model}..."):
+            prompt = f"""
+            As a senior financial analyst, generate a professional brokerage report.
+            **Client Query:** "{user_query}"
+            
+            **Available Data Context:**
+            {json.dumps(sample_context, indent=2)}
+            
+            Based on the data, provide a comprehensive investment analysis and a final recommendation.
+            Structure the report with clear headings.
+            """
+            
+            report = agent.run(prompt, model_name=test_model)
+            st.markdown(report)
+

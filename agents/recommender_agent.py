@@ -21,11 +21,11 @@ class RecommenderAgent:
                 genai.configure(api_key=gemini_api_key)
                 # Use a powerful model for nuanced, personalized advice
                 self.gemini_client = genai.GenerativeModel("gemini-1.5-pro-latest")
-                print("✅ RecommenderAgent initialized with Gemini 1.5 Pro.")
+                print("[SUCCESS] RecommenderAgent: Initialized with Gemini 1.5 Pro.")
             except Exception as e:
-                print(f"❌ WARNING: Gemini client (Recommender) initialization failed: {e}")
+                print(f"[WARNING] RecommenderAgent: Gemini client initialization failed: {e}")
         else:
-            print("❌ WARNING: Gemini API key not provided or google.generativeai not installed.")
+            print("[WARNING] RecommenderAgent: Gemini API key not provided or google.generativeai not installed.")
 
     def generate_recommendation(self, user_profile: Dict[str, Any], market_context: Dict[str, Any]) -> str:
         """

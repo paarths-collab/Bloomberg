@@ -17,7 +17,7 @@ class ScreenerAgent:
         self.data_path = data_path
         self.cache_path = cache_path
         self.indian_fundamentals_df = self._load_or_build_indian_fundamentals_cache()
-        print("✅ ScreenerAgent: Initialization complete.")
+        print("[SUCCESS] ScreenerAgent: Initialization complete.")
 
     def _load_indian_stock_universe(self) -> pd.DataFrame:
         try:
@@ -38,7 +38,7 @@ class ScreenerAgent:
         for i, row in stock_list_df.head(200).iterrows():
             ticker = row['YF_TICKER']
             print(f"  Fetching fundamentals for {ticker} ({i+1}/{len(stock_list_df.head(200))})...")
-            snapshot = get_company_snapshot(ticker)
+            snapshot = get_company_snapshot(ticker, "India")
             metrics = {
                 "YF_TICKER": ticker, "marketCap": snapshot.get("marketCap"),
                 "trailingPE": snapshot.get("trailingPE"), "priceToBook": snapshot.get("priceToBook"),

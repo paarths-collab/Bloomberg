@@ -65,7 +65,7 @@ def _load_universe_csv(path: str) -> list[str]:
         # Append '.NS' to each symbol for Yahoo Finance to recognize it as an NSE stock
         formatted_symbols = [s + ".NS" for s in symbols]
         
-        print(f"✅ Loaded {len(formatted_symbols)} symbols from {path}.")
+        print(f"[SUCCESS] Loaded {len(formatted_symbols)} symbols from {path}.")
         return formatted_symbols
 
     except FileNotFoundError:
@@ -173,7 +173,7 @@ def safe_download(symbols, retries=3, delay=5):
         try:
             return yf.download(symbols, period="2d", interval="1d", group_by="ticker", progress=False)
         except Exception as e:
-            print(f"⚠️ Attempt {attempt+1} failed: {e}")
+            print(f"[WARNING] Attempt {attempt+1} failed: {e}")
             time.sleep(delay)
     return None
 
@@ -213,28 +213,48 @@ class MacroAgent:
         self.nse_client = None
         
   
-        self.nse = Nse()
+        # Initialize NSE client using nsetools with error handling
+        try:
+            self.nse = Nse()
+            print("[SUCCESS] MacroAgent: NSE client initialized.")
+        except Exception as e:
+            print(f"[WARNING] MacroAgent: NSE client initialization failed: {e}. Indian market data features may be limited.")
+            self.nse = None
+        
         # Initialize FRED client
         if _HAS_FRED and fred_api_key:
             try:
                 self.fred_client = Fred(api_key=fred_api_key)
-                print("✅ MacroAgent: FRED client initialized.")
+                print("[SUCCESS] MacroAgent: FRED client initialized.")
             except Exception as e:
-                print(f"❌ WARNING: FRED client initialization failed: {e}")
+                print(f"[ERROR] WARNING: FRED client initialization failed: {e}")
         else:
-            print("❌ WARNING: FRED API key not provided or fredapi not installed.")
-
-        # Initialize NSE client using nsetools
+            print("[ERROR] WARNING: FRED API key not provided or fredapi not installed.")
         
 
     def get_global_indicators(self) -> dict:
         """Fetches key global risk indicators using yfinance."""
         print("MacroAgent: Fetching global indicators...")
         try:
-            vix = yf.Ticker("^VIX").history(period="5d")['Close'].iloc[-1]
-            tnx = yf.Ticker("^TNX").history(period="5d")['Close'].iloc[-1]
-            gold = yf.Ticker("GC=F").history(period="5d")['Close'].iloc[-1]
-            oil = yf.Ticker("CL=F").history(period="5d")['Close'].iloc[-1]
+            vix_data = yf.Ticker("^VIX").history(period="5d")
+            tnx_data = yf.Ticker("^TNX").history(period="5d")
+            gold_data = yf.Ticker("GC=F").history(period="5d")
+            oil_data = yf.Ticker("CL=F").history(period="5d")
+            
+            # Check if data is available and 'Close' column exists
+            if vix_data.empty or 'Close' not in vix_data.columns or len(vix_data) < 1:
+                return {"Error": "Could not fetch VIX data"}
+            if tnx_data.empty or 'Close' not in tnx_data.columns or len(tnx_data) < 1:
+                return {"Error": "Could not fetch US 10Y Yield data"}
+            if gold_data.empty or 'Close' not in gold_data.columns or len(gold_data) < 1:
+                return {"Error": "Could not fetch Gold data"}
+            if oil_data.empty or 'Close' not in oil_data.columns or len(oil_data) < 1:
+                return {"Error": "Could not fetch Crude Oil data"}
+            
+            vix = vix_data['Close'].iloc[-1]
+            tnx = tnx_data['Close'].iloc[-1]
+            gold = gold_data['Close'].iloc[-1]
+            oil = oil_data['Close'].iloc[-1]
             return {
                 "VIX (Fear Index)": f"{vix:.2f}",
                 "US 10Y Yield %": f"{tnx:.2f}",
@@ -283,8 +303,8 @@ class MacroAgent:
         try:
             nifty_ticker = yf.Ticker("^NSEI")
             nifty_hist = nifty_ticker.history(period="2d")
-            # CRITICAL CHECK: Ensure we have at least 2 days of data
-            if not nifty_hist.empty and len(nifty_hist) >= 2:
+            # CRITICAL CHECK: Ensure we have at least 2 days of data and 'Close' column exists
+            if not nifty_hist.empty and 'Close' in nifty_hist.columns and len(nifty_hist) >= 2:
                 nifty_close = nifty_hist['Close'].iloc[-1]
                 nifty_prev = nifty_hist['Close'].iloc[-2]
                 final_data["Nifty 50"] = f"{nifty_close:,.2f}"
@@ -294,7 +314,7 @@ class MacroAgent:
                 final_data["Nifty 50"] = "Data unavailable"
                 final_data["Nifty 50 Change"] = "N/A"
         except Exception as e:
-            print(f"❌ yfinance failed for Nifty 50 (^NSEI): {e}")
+            print(f"[ERROR] yfinance failed for Nifty 50 (^NSEI): {e}")
             final_data["Nifty 50"] = "Error"
             final_data["Nifty 50 Change"] = "N/A"
 
@@ -302,8 +322,8 @@ class MacroAgent:
         try:
             sensex_ticker = yf.Ticker("^BSESN")
             sensex_hist = sensex_ticker.history(period="2d")
-            # CRITICAL CHECK: Ensure we have at least 2 days of data
-            if not sensex_hist.empty and len(sensex_hist) >= 2:
+            # CRITICAL CHECK: Ensure we have at least 2 days of data and 'Close' column exists
+            if not sensex_hist.empty and 'Close' in sensex_hist.columns and len(sensex_hist) >= 2:
                 sensex_close = sensex_hist['Close'].iloc[-1]
                 sensex_prev = sensex_hist['Close'].iloc[-2]
                 final_data["Sensex"] = f"{sensex_close:,.2f}"
@@ -312,7 +332,7 @@ class MacroAgent:
                 final_data["Sensex"] = "Data unavailable"
                 final_data["Sensex Change"] = "N/A"
         except Exception as e:
-            print(f"❌ yfinance failed for BSE Sensex (^BSESN): {e}")
+            print(f"[ERROR] yfinance failed for BSE Sensex (^BSESN): {e}")
             final_data["Sensex"] = "Error"
             final_data["Sensex Change"] = "N/A"
 
@@ -322,7 +342,7 @@ class MacroAgent:
 
         # (The rest of your live-first fallback logic for breadth remains unchanged)
         # Method 1: nsetools
-        if not breadth_success:
+        if not breadth_success and self.nse is not None:
             try:
                 print("--> [Breadth] Trying live source 1: nsetools...")
                 adv_dec = self.nse.get_advances_declines()
@@ -336,9 +356,9 @@ class MacroAgent:
                     "Source": "nsetools (Live)"
                 }
                 breadth_success = True
-                print("✅ Fetched live breadth using nsetools.")
+                print("[SUCCESS] Fetched live breadth using nsetools.")
             except Exception as e:
-                print(f"❌ nsetools failed: {e}")
+                print(f"[ERROR] nsetools failed: {e}")
 
         # Method 2: Moneycontrol
         if not breadth_success:
@@ -354,20 +374,20 @@ class MacroAgent:
                     breadth_success = True
                     print("✅ Fetched live breadth using Moneycontrol.")
                 else:
-                     print("❌ Moneycontrol scrape returned no data.")
+                     print("[ERROR] Moneycontrol scrape returned no data.")
             except Exception as e:
-                print(f"❌ Moneycontrol failed: {e}")
+                print(f"[ERROR] Moneycontrol failed: {e}")
 
         # Method 3 (Last Resort): yfinance calculation
         if not breadth_success:
             try:
-                print("⚠️ Live data sources failed. Falling back to yfinance calculation...")
+                print("[WARNING] Live data sources failed. Falling back to yfinance calculation...")
                 universe_symbols = _load_universe_csv("data/nifty500.csv")
                 adv, dec, unch = _breadth_from_yfinance(universe_symbols)
                 breadth_data = { "NSE Market Status": _market_status_ist(), "NSE Advances": adv, "NSE Declines": dec, "NSE Adv/Dec Ratio": round(adv / max(dec, 1), 2), "Source": "yfinance (Fallback)"}
                 print("✅ Calculated breadth using yfinance fallback.")
             except Exception as e:
-                print(f"❌ All breadth methods failed, including yfinance: {e}")
+                print(f"[ERROR] All breadth methods failed, including yfinance: {e}")
                 breadth_data["Error"] = "All breadth data sources failed."
 
         # --- 4. Combine and Return ---

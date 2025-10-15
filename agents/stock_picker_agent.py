@@ -21,7 +21,7 @@ class StockPickerAgent:
         self.indian_stock_universe = self._load_or_build_indian_universe_cache()
         self.us_stock_universe = self._load_or_build_us_universe_cache()
         
-        print("✅ StockPickerAgent: Initialization complete.")
+        print("StockPickerAgent: Initialization complete.")
 
     def _build_indian_universe_cache(self) -> pd.DataFrame:
         """Builds the cache for Indian stocks from nifty500.csv."""
@@ -32,7 +32,7 @@ class StockPickerAgent:
             universe_df.rename(columns={'Company Name': 'NAME_OF_COMPANY', 'Symbol': 'SYMBOL'}, inplace=True)
             universe_df['YF_TICKER'] = universe_df['SYMBOL'] + '.NS'
         except FileNotFoundError as e:
-            print(f"❌ StockPickerAgent ERROR: Could not find Indian stock data file: {e}")
+            print(f"StockPickerAgent ERROR: Could not find Indian stock data file: {e}")
             return pd.DataFrame()
 
         sectors = []
@@ -47,7 +47,7 @@ class StockPickerAgent:
         
         universe_df['Sector'] = sectors
         universe_df.to_parquet(self.cache_path_india)
-        print(f"✅ StockPickerAgent: Indian universe cache built and saved to {self.cache_path_india}")
+        print(f"StockPickerAgent: Indian universe cache built and saved to {self.cache_path_india}")
         return universe_df
 
     def _load_or_build_indian_universe_cache(self) -> pd.DataFrame:
@@ -103,7 +103,7 @@ class StockPickerAgent:
             try:
                 info = stock_obj.info
                 hist = stock_obj.history(period="1y")
-                if hist.empty: continue
+                if hist.empty or 'Close' not in hist.columns or len(hist) < 2: continue
                 
                 momentum_score = (hist['Close'].iloc[-1] / hist['Close'].iloc[0] - 1) * 100
                 pe = info.get('trailingPE')

@@ -18,7 +18,7 @@ class ReportAgent:
         # We only accept and pass the gemini_key now.
         self.llm_analyst = LLMAnalystAgent(gemini_api_key=gemini_key)
         # --- END OF FIX ---
-        print("✅ ReportAgent initialized with LLM Analyst engine.")
+        print("[SUCCESS] ReportAgent: Initialized with LLM Analyst engine.")
 
     def generate_investment_report(self, analysis_context: Dict[str, Any], user_query: str) -> str:
         """

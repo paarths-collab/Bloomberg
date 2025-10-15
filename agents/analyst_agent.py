@@ -8,7 +8,7 @@ class AnalystAgent:
         self.api_key = api_key
         self.metrics_url = "https://finnhub.io/api/v1/stock/metric"
         if not self.api_key:
-            print("❌ AnalystAgent WARNING: Finnhub API Key is missing.")
+            print("[WARNING] AnalystAgent: Finnhub API Key is missing.")
 
     def _safe_request(self, url, params):
         try:

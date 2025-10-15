@@ -10,17 +10,17 @@ class ExecutionAgent:
         """Initializes the trading client for Alpaca."""
         self.api = None
         if not api_key or not api_secret:
-            print("❌ ExecutionAgent WARNING: Alpaca API Key or Secret is missing.")
+            print("[WARNING] ExecutionAgent: Alpaca API Key or Secret is missing.")
             return
         try:
             self.api = TradingClient(api_key, api_secret, paper=paper)
             account_status = self.api.get_account().status
             if account_status != 'ACTIVE':
-                 print(f"❌ ExecutionAgent WARNING: Alpaca account is not active. Status: {account_status}")
+                 print(f"[WARNING] ExecutionAgent: Alpaca account is not active. Status: {account_status}")
             else:
-                 print(f"✅ ExecutionAgent: Alpaca client initialized successfully. Paper Trading: {paper}. Status: {account_status}")
+                 print(f"[SUCCESS] ExecutionAgent: Alpaca client initialized successfully. Paper Trading: {paper}. Status: {account_status}")
         except Exception as e:
-            print(f"❌ ExecutionAgent ERROR: Could not initialize Alpaca TradingClient: {e}")
+            print(f"[ERROR] ExecutionAgent: Could not initialize Alpaca TradingClient: {e}")
 
     def get_account_info(self) -> dict:
         """Retrieves key information about the trading account."""

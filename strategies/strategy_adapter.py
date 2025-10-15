@@ -31,7 +31,7 @@ STRATEGY_CLASS_MAPPING = {
 }
 
 # --- This is the MASTER RUN FUNCTION that the portfolio engine will call ---
-def run_strategy(strategy_name: str, ticker: str, start_date: str, end_date: str, initial_capital=100000, **kwargs) -> dict:
+def run_strategy(strategy_name: str, ticker: str, start_date: str, end_date: str, market, initial_capital=100000, **kwargs) -> dict:
     """
     A single, standardized function to run any backtesting.py-based strategy.
     It ensures the correct, robust data is used for every backtest.
@@ -42,7 +42,7 @@ def run_strategy(strategy_name: str, ticker: str, start_date: str, end_date: str
         return {"summary": {"Error": f"Strategy '{strategy_name}' not found in adapter."}, "data": pd.DataFrame()}
 
     # 2. Use the central, robust get_data function
-    hist_df = get_data(ticker, start_date, end_date)
+    hist_df = get_data(ticker, start_date, end_date, market)
     if hist_df.empty:
         return {"summary": {"Error": "Could not fetch valid data for backtest."}, "data": pd.DataFrame()}
 

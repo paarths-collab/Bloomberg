@@ -45,14 +45,14 @@ if not portfolio_df.empty:
     fig.add_trace(go.Scatter(x=portfolio_df.index, y=portfolio_df['Equity_Curve'], name='Portfolio', line=dict(color='purple', width=3)))
     fig.add_trace(go.Scatter(x=benchmark_df.index, y=benchmark_df['Equity_Curve'], name='Benchmark (SPY)', line=dict(color='grey', dash='dot')))
     fig.update_layout(title_text="Portfolio vs. Benchmark (SPY)", yaxis_title="Portfolio Value ($)")
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch', key="equity_curve_chart")
 
     st.header("Allocation")
     labels = [f"{s['name']} ({s['ticker']})" for s in config['selections'].values()]
     values = [s['weight'] * 100 for s in config['selections'].values()]
     pie_fig = go.Figure(data=[go.Pie(labels=labels, values=values, hole=.4)])
     pie_fig.update_layout(title_text="Strategy & Ticker Allocation")
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(pie_fig, width='stretch', key="allocation_pie_chart")
 else:
     st.error("The portfolio backtest failed to produce any valid results.")
 # File: pages/3_📈_Results.py

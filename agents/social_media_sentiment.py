@@ -23,13 +23,13 @@ class SentimentAgent:
             self.reddit = None
             self.tokenizer = None
             self.model = None
-            print("❌ SentimentAgent ERROR: Missing dependencies (praw, torch, transformers).")
+            print("[ERROR] SentimentAgent: Missing dependencies (praw, torch, transformers).")
             return
 
         # --- Check credentials ---
         if not all([reddit_client_id, reddit_client_secret, reddit_user_agent]):
             self.reddit = None
-            print("❌ SentimentAgent WARNING: Reddit credentials missing. Agent disabled.")
+            print("[WARNING] SentimentAgent: Reddit credentials missing. Agent disabled.")
             return
 
         # --- Initialize Reddit client & FinBERT model ---
@@ -42,10 +42,10 @@ class SentimentAgent:
             )
             self.tokenizer = AutoTokenizer.from_pretrained("ProsusAI/finbert")
             self.model = AutoModelForSequenceClassification.from_pretrained("ProsusAI/finbert")
-            print("✅ SentimentAgent initialized successfully.")
+            print("[SUCCESS] SentimentAgent: Initialized successfully.")
         except Exception as e:
             self.reddit = None
-            print(f"❌ SentimentAgent ERROR: Initialization failed: {e}")
+            print(f"[ERROR] SentimentAgent: Initialization failed: {e}")
 
     def _analyze_text(self, text: str) -> str:
         """

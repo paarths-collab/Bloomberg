@@ -26,10 +26,10 @@ class SectorAgent:
         
         if _HAS_TRANSFORMERS:
             self.sentiment_model = pipeline("sentiment-analysis", model="ProsusAI/finbert")
-            print("✅ SectorAgent: FinBERT sentiment model loaded.")
+            print("[SUCCESS] SectorAgent: FinBERT sentiment model loaded.")
         else:
             self.sentiment_model = None
-            print("❌ SectorAgent WARNING: 'transformers' not installed. Sentiment analysis is disabled.")
+            print("[WARNING] SectorAgent: 'transformers' not installed. Sentiment analysis is disabled.")
 
     def _fetch_performance(self, ticker, start, end):
         """
@@ -37,7 +37,10 @@ class SectorAgent:
         """
         try:
             df = yf.download(ticker, start=start, end=end, progress=False)
-            if df.empty or len(df) < 2: 
+            
+            # Check if data is available and 'Close' column exists
+            if df.empty or 'Close' not in df.columns or len(df) < 2:
+                print(f"No data or 'Close' column for {ticker}. Skipping.")
                 return 0.0
             
             if isinstance(df.columns, pd.MultiIndex):

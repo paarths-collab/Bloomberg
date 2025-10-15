@@ -1,4 +1,3 @@
-# # # In Bloomberg/agents/orchestrator.py
 from __future__ import annotations
 import yaml
 import pandas as pd
@@ -25,8 +24,12 @@ from utils.data_loader import format_ticker
 
 def _load_modules_from_path(path: Path, module_prefix: str):
     modules = {}
+    non_strategy_files = {"strategy_adapter", "custom_strategy", "__init__"}
+    
     for file_path in path.glob("*.py"):
-        if file_path.stem == "__init__": continue
+        if file_path.stem in non_strategy_files or file_path.stem == "__init__":
+            continue
+        
         module_name = f"{module_prefix}.{file_path.stem}"
         spec = importlib.util.spec_from_file_location(module_name, file_path)
         if spec and spec.loader:
@@ -49,20 +52,17 @@ class Orchestrator:
 
     def _initialize_agents(self):
         self.yfinance_agent = YFinanceAgent()
-        self.llm_agent = LLMAgent(gemini_api_key=self.keys.get("gemini"))
+        
+        # --- CORRECTED INITIALIZATION FOR OPENROUTER ---
+        self.llm_agent = LLMAgent(openrouter_api_key=self.keys.get("openrouter"))
+        
         self.macro_agent = MacroAgent(fred_api_key=self.keys.get("fred"))
-        
-        # --- THIS IS THE FIX: Initialize StockPickerAgent FIRST ---
         self.stock_picker_agent = StockPickerAgent()
-        
-        # Now, pass the loaded universes from the picker to the SectorAgent
         self.sector_agent = SectorAgent(
             news_api_key=self.keys.get("newsapi"),
             us_universe=self.stock_picker_agent.us_stock_universe,
             indian_universe=self.stock_picker_agent.indian_stock_universe
         )
-        # --- END OF FIX ---
-
         self.screener_agent = ScreenerAgent(rapidapi_config=self.rapidapi_cfg)
         self.execution_agent = ExecutionAgent(api_key=self.keys.get("alpaca_key_id"), api_secret=self.keys.get("alpaca_secret_key"), paper=self.sets.get("paper_trading", True))
         self.insider_agent = InsiderAgent(finnhub_key=self.keys.get("finnhub"), rapidapi_config=self.rapidapi_cfg)
@@ -139,7 +139,7 @@ class Orchestrator:
         print(f"--> Step 2: Running stock picker for the '{top_sector_name}' sector...")
         picker_weights = {"momentum": 0.4, "value": 0.3, "quality": 0.3}
         top_stocks_df = self.stock_picker_agent.run(market, top_sector_name, picker_weights, top_n=1)
-        if top_stocks_df.empty: return "Error: The Stock Picker could not identify a top stock in the best-performing sector."
+        if top_stocks_df.empty: return "Error: The Stock Picker could not identify a top stock."
         top_stock_ticker = top_stocks_df.iloc[0]['Ticker']
         print(f"--> Top stock identified: {top_stock_ticker}")
         
@@ -162,43 +162,48 @@ class Orchestrator:
         }
 
         initial_prompt = f"""
-        You are a junior financial analyst. Your task is to create a personalized investment plan for a client based on their profile and a comprehensive, automatically generated data package.
-        **CLIENT PROFILE (Natural Language):**
-        "{user_profile_text}"
-        **AUTOMATED ANALYSIS & DISCOVERY DATA PACKAGE:**
+        You are a junior financial analyst. Create a personalized investment plan based on the client's profile and the provided data package.
+        **CLIENT PROFILE:** "{user_profile_text}"
+        **DATA PACKAGE:**
         ```json
         {json.dumps(full_context, indent=2, default=str)}
         ```
-        **YOUR TASK:**
-        Based on ALL the provided data, write a detailed investment plan for the client. The plan should recommend the discovered stock ({top_stock_ticker}) and suggest a strategy based on the backtest results. Justify everything with data from the context.
+        **TASK:** Write a detailed investment plan recommending the stock ({top_stock_ticker}) and a strategy from the backtest results. Justify your recommendations with data from the context.
         """
-        print("--> Step 4: Querying Junior Analyst 'Llama3'...")
-        llama_report = self.llm_agent.run(prompt=initial_prompt, model='deepseek-r1:latest')
-        print("--> Step 5: Querying Junior Analyst 'Mistral'...")
-        mistral_report = self.llm_agent.run(prompt=initial_prompt, model='qwen3:8b')
+        
+        # --- MODEL NAME UPDATED ---
+        open_router_model = "mistralai/mistral-7b-instruct:free"
+        
+        print(f"--> Step 4: Querying Junior Analyst A ({open_router_model})...")
+        report_a = self.llm_agent.run(prompt=initial_prompt, model_name=open_router_model)
+        
+        print(f"--> Step 5: Querying Junior Analyst B ({open_router_model})...")
+        report_b = self.llm_agent.run(prompt=initial_prompt, model_name=open_router_model)
 
         synthesis_prompt = f"""
-        You are a senior portfolio manager. Synthesize the two reports from your junior analysts (Llama3 and Mistral) into a single, cohesive, and definitive investment plan. Identify the strongest points from each, resolve contradictions, and provide the final authoritative recommendation based on the client's profile.
-        **CLIENT PROFILE (Natural Language):**
-        "{user_profile_text}"
+        You are a senior portfolio manager. Synthesize the two reports from your junior analysts into a single, cohesive investment plan.
+        **CLIENT PROFILE:** "{user_profile_text}"
         ---
-        **REPORT FROM JUNIOR ANALYST A (LLAMA3):**
-        {llama_report}
+        **ANALYST A REPORT:**
+        {report_a}
         ---
-        **REPORT FROM JUNIOR ANALYST B (MISTRAL):**
-        {mistral_report}
+        **ANALYST B REPORT:**
+        {report_b}
         ---
-        **YOUR TASK:**
-        Produce the final, unified investment plan in clear Markdown. Do not refer to the junior analysts; present the final plan as your own expert recommendation.
+        **TASK:** Produce the final, unified investment plan in clear Markdown. Present it as your own expert recommendation.
         """
         print("--> Step 6: Synthesizing reports...")
-        final_report = self.llm_agent.run(prompt=synthesis_prompt, model='llama3')
+        final_report = self.llm_agent.run(prompt=synthesis_prompt, model_name=open_router_model)
         print("Orchestrator: Automated AI discovery and plan complete.")
         return final_report
 
     @classmethod
     def from_file(cls, path: str = "config.yaml") -> "Orchestrator":
-        with open(path, "r", encoding="utf-8") as f:
+        # --- Corrected to look for the right config file ---
+        config_path = Path("quant-company-insights-agent") / path
+        if not config_path.exists():
+             config_path = path # Fallback to root if not found
+        with open(config_path, "r", encoding="utf-8") as f:
             cfg = yaml.safe_load(f)
         return cls(cfg)
 
