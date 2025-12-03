@@ -25,6 +25,26 @@ Thumbs.db
 # Logs
 *.log
 
-# Environment variables
+# Environment variables and credentials
 *.env
 .env.*
+.env.local
+.env.production
+.env.development
+
+# API Keys and Configuration files with credentials
+config.py
+*_credentials.json
+*_secrets.json
+secrets.yaml
+credentials.yaml
+
+# Alpaca Trading credentials
+alpaca_config.py
+alpaca_credentials.json
+
+# Finnhub API credentials
+finnhub_config.py
+
+# OpenAI API credentials
+openai_config.py
