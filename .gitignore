@@ -34,6 +34,7 @@ Thumbs.db
 
 # API Keys and Configuration files with credentials
 config.py
+config.yaml
 *_credentials.json
 *_secrets.json
 secrets.yaml
