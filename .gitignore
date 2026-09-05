@@ -10,7 +10,8 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
+# Do not globally ignore lib/: application source may live in */lib.
+# Virtualenv library directories are already covered by .venv/ and venv/.
 lib64/
 parts/
 sdist/
@@ -23,47 +24,43 @@ share/python-wheels/
 MANIFEST
 *.manifest
 *.spec
-pip-log.txt
-pip-delete-this-directory.txt
 
-# Virtual Environments
+# Virtual environments
 .venv/
 venv/
 ENV/
 env/
-.env.local
-.env.*.local
 
-# Environment Variables
+# Environment variables
 .env
-.env.production
-.env.development
+.env.*
 *.env
+!**/.env.example
 
-# IDEs
+# IDE / OS
 .vscode/
 .idea/
+.DS_Store
+Thumbs.db
 *.swp
 *.swo
 *~
-.DS_Store
 
 # Node.js
 node_modules/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
-lerna-debug.log*
 .pnpm-debug.log*
 
 # Build outputs
+.next/
+out/
 dist/
 build/
 *.tsbuildinfo
-.next/
-out/
 
-# Testing
+# Testing / coverage
 .coverage
 .pytest_cache/
 .hypothesis/
@@ -74,127 +71,37 @@ coverage/
 *.cover
 *.log
 
-# Jupyter Notebook
+# Notebooks
 .ipynb_checkpoints
 *.ipynb
 
-# Database
+# Databases / caches
 *.db
 *.sqlite
 *.sqlite3
-
-# Logs
-logs/
-*.log
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-
-# Cache directories
 cache/
 .cache/
-__pycache__/
-
-# Python site-packages (if installed locally)
-annotated_types/
-anyio/
-beautifulsoup4*/
-bs4/
-certifi/
-cffi/
-charset_normalizer/
-click/
-colorama/
-curl_cffi/
-dateutil/
-distro/
-dotenv/
-duckduckgo_search/
-frozendict/
-google/
-groq/
-h11/
-httpcore/
-httpx/
-idna/
-lxml/
-multitasking/
-numpy/
-numpy.libs/
-pandas/
-pandas.libs/
-peewee/
-peewee-*/
-platformdirs/
-playhouse/
-primp/
-protobuf*/
-pycparser/
-pydantic/
-pydantic_core/
-pydantic-*/
-python_dateutil*/
-python_dotenv*/
-pytz/
-requests/
-six/
-six-*/
-sniffio/
-soupsieve/
-typing_extensions.py
-typing_extensions-*/
-typing_inspection/
-tzdata/
-urllib3/
-websockets/
-yfinance/
-yfinance-*/
-*.dist-info/
-bin/
 chroma_db/
 
-# OS
-.DS_Store
-Thumbs.db
-*.swp
-*.swo
+# Secrets
+**/config.yaml
+**/.env
+**/.env.*
+!**/.env.example
+**/secrets.json
+**/credentials.json
 
-# Temporary files
+# Generated reports / data
+backend/reports/
+backend/backtest/reports/
+backend/data/*.parquet
+backend/data/*.csv
+
+# Temporary diagnostics
 *.tmp
 *.temp
 tmp/
 temp/
-
-# API Keys and Secrets (CRITICAL)
-**/config.yaml
-**/.env
-**/.env.*
-**/secrets.json
-**/credentials.json
-
-# Test outputs
-test_wealth_result.json
-wealth_test_response.json
-test_request.json
-debug_output.txt
-
-# Generated Reports
-backend/reports/
-backend/backtest/reports/
-
-# Data Files
-backend/data/*.parquet
-backend/data/*.csv
-
-# Logs
-*.log
-
-# Package manager lock files (optional - uncomment if needed)
-# package-lock.json
-# yarn.lock
-# pnpm-lock.yaml
-
-# Visual Terminal Diagnostic/Temp Files
 *.bak
 original_*.txt
 instruction.md
