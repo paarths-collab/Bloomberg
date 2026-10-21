@@ -211,3 +211,73 @@ class SectorScore(Base):
     __table_args__ = (
         Index("idx_sector_score_market_sector_asof", "market", "sector", "as_of"),
     )
+
+
+# =====================================================
+# EXPERIMENT TRIALS (reproducible backtest runs)
+# =====================================================
+
+class DatasetVersion(Base):
+    """
+    Immutable, content-addressed snapshot of the OHLCV bars a trial ran on.
+    The primary key is the sha256 of the canonical rows, so the same data is stored once and a
+    trial can be reopened (and its ledger reproduced) offline.
+    """
+    __tablename__ = "dataset_versions"
+
+    content_hash = Column(String(64), primary_key=True, nullable=False)
+
+    source = Column(String(80), nullable=False)          # "synthetic:<name>" | "provider:yfinance"
+    symbol = Column(String(40), nullable=True)
+    interval = Column(String(10), nullable=False)
+    timezone = Column(String(60), nullable=False)
+    start = Column(String(32), nullable=True)            # first / last bar timestamp as stored
+    end = Column(String(32), nullable=True)
+    row_count = Column(Integer, nullable=False)
+    missing_rows = Column(Integer, nullable=False, default=0)  # rows with NaN/None in OHLC
+    adjustment = Column(String(40), nullable=False)
+    rights_note = Column(String(200), nullable=False)
+    rows_json = Column(Text, nullable=False)             # [[date, open, high, low, close, volume], ...]
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class ExperimentTrial(Base):
+    """
+    One recorded run of (spec, dataset version, engine version). Failed trials are kept and carry
+    status="failed" + an error_code, so they never look like a zero-return completed run.
+    Rows are never updated after insert.
+    """
+    __tablename__ = "experiment_trials"
+
+    id = Column(String(32), primary_key=True, nullable=False)           # uuid4 hex
+    user_id = Column(String(128), nullable=False)
+    label = Column(String(200), nullable=True)
+    parent_trial_id = Column(String(32), nullable=True)
+
+    spec_json = Column(Text, nullable=False)                            # canonical normalised spec
+    spec_hash = Column(String(64), nullable=False)
+    dataset_hash = Column(String(64), nullable=True)                    # NULL if dataset resolution failed
+    dataset_request_json = Column(Text, nullable=True)                  # what the client asked for
+    engine_version = Column(String(20), nullable=False)
+    environment_json = Column(Text, nullable=True)                      # python / pandas / numpy versions
+    seed = Column(Integer, nullable=False)
+
+    status = Column(String(12), nullable=False)                         # completed | failed
+    error_code = Column(String(40), nullable=True)
+    error_message = Column(String(300), nullable=True)                  # generic, client-safe
+
+    started_at = Column(DateTime(timezone=True), nullable=False)
+    finished_at = Column(DateTime(timezone=True), nullable=True)
+
+    result_json = Column(Text, nullable=True)                           # completed only
+    headline_json = Column(Text, nullable=True)                         # list-view metrics
+    ledger_hash = Column(String(64), nullable=True)
+    result_hash = Column(String(64), nullable=True)                     # trades/equity/metrics/assumptions/ledger
+    monte_carlo_hash = Column(String(64), nullable=True)
+
+    __table_args__ = (
+        Index("idx_experiment_trials_user_started", "user_id", "started_at"),
+        Index("idx_experiment_trials_parent", "parent_trial_id"),
+        CheckConstraint("status IN ('completed', 'failed')", name="ck_experiment_trials_status"),
+    )

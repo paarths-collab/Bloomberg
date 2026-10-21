@@ -25,13 +25,13 @@ import re
 from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from fastapi.routing import APIRoute
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
 from backend.auth.security import require_user
+from backend.common.json_routes import StrictJSONRoute
 from backend.database.connection import get_db
 from backend.portfolio.core.risk_metrics import compute_portfolio_risk, load_price_history
 from backend.services.market_data import market_service
@@ -49,45 +49,7 @@ MAX_HOLDINGS_JSON_CHARS = 200_000
 RISK_PERIODS = ("6mo", "1y", "2y", "5y")
 
 
-def _reject_json_constant(name: str):
-    raise ValueError(f"{name} is not a valid JSON number")
-
-
-def _parse_json_float(literal: str) -> float:
-    value = float(literal)
-    if not math.isfinite(value):  # e.g. 1e999 overflows to inf
-        raise ValueError(f"{literal} is out of range for a JSON number")
-    return value
-
-
-class _StrictJSONRequest(Request):
-    """Request whose JSON body rejects NaN/Infinity/-Infinity literals and overflowing numbers
-    such as 1e999 (Python's parser accepts all of them)."""
-
-    async def json(self):
-        if not hasattr(self, "_json"):
-            self._json = json.loads(
-                await self.body(),
-                parse_constant=_reject_json_constant,
-                parse_float=_parse_json_float,
-            )
-        return self._json
-
-
-class _StrictJSONRoute(APIRoute):
-    """Route class giving handlers a non-finite-rejecting JSON body (FastAPI then answers 400, not a
-    500 from trying to echo a non-finite float back in its own validation error)."""
-
-    def get_route_handler(self):
-        original = super().get_route_handler()
-
-        async def handler(request: Request):
-            return await original(_StrictJSONRequest(request.scope, request.receive))
-
-        return handler
-
-
-shared_router = APIRouter(tags=["Investor Profile"], route_class=_StrictJSONRoute)
+shared_router = APIRouter(tags=["Investor Profile"], route_class=StrictJSONRoute)
 router = APIRouter(prefix="/api/investor-profile", tags=["Investor Profile"])
 
 

@@ -494,10 +494,10 @@ def test_run_spec_rejects_unknown_spec_fields_and_bad_strategies(long_candles):
 
 
 def test_engine_version_is_reported(long_candles):
-    assert service.ENGINE_VERSION == "2.0.0"
+    assert service.ENGINE_VERSION == "2.1.0"
     out = service.run_spec(service.prepare_candles_df(long_candles), {"strategy": "macd"})
     a = out["assumptions"]
-    assert a["engineVersion"] == "2.0.0" and a["fee_per_fill"] == 0 and a["fill_timing"] == "next_open"
+    assert a["engineVersion"] == "2.1.0" and a["fee_per_fill"] == 0 and a["fill_timing"] == "next_open"
     assert a["sizing"] == "100% of equity, fractional shares"
 
 

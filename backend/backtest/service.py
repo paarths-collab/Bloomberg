@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 INTERNAL_ERROR_MESSAGE = "Backtest failed due to an internal error."
 
 # Bump when the execution semantics or the result schema change (reported as assumptions.engineVersion).
-ENGINE_VERSION = "2.0.0"
+ENGINE_VERSION = "2.1.0"
 
 
 class BacktestInputError(ValueError):

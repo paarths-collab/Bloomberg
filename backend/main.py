@@ -26,6 +26,7 @@ from backend.technical.main import router as technical_app
 from backend.chat.main import router as chat_app
 from backend.portfolio.main import router as portfolio_app
 from backend.backtest.main import router as backtest_app
+from backend.experiments.routes import router as experiments_router
 
 # --- New Isolated Modules ---
 from backend.peers.main import router as peers_app
@@ -124,6 +125,7 @@ app.include_router(news_app,      prefix="/api/news",      tags=["News"])
 app.include_router(screener_app,  prefix="/api/screener",  tags=["Screener"])
 app.include_router(profile_app,   prefix="/api/profile",   tags=["Profile"])
 app.include_router(auth_app)
+app.include_router(experiments_router)  # carries its own /api/experiments prefix
 # FRED at top-level /api so frontend /api/fred/* calls resolve correctly
 app.include_router(fred_router,   prefix="/api",            tags=["FRED Data"])
 
