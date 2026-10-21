@@ -5,7 +5,7 @@ from datetime import datetime
 import logging
 
 # --- Configuration (Local duplication for isolation) ---
-FMP_API_KEY = os.getenv("FMP_API_KEY", "78b77a7605d81aa4f107f90f230cc00d")
+FMP_API_KEY = os.getenv("FMP_API_KEY", "")
 logger = logging.getLogger(__name__)
 
 def fetch_stock_peers(symbol: str) -> List[Dict]:

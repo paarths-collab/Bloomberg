@@ -8,7 +8,7 @@ class EIAService:
     """
     BASE_URL = "https://api.eia.gov/v2"
     # Using the key provided by the user. In production, this should be in os.environ
-    API_KEY = "jvRlsfoBFBGHMhkspheJBvQoyz1noatXLcUmndto"
+    API_KEY = os.getenv("EIA_API_KEY", "")
 
     def __init__(self):
         self.api_key = self.API_KEY

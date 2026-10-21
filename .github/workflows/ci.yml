@@ -23,10 +23,12 @@ jobs:
       - name: Install dependencies
         run: python -m pip install -r backend/requirements-ci.txt
 
+      - name: Generate a throwaway auth secret
+        run: echo "AUTH_SECRET_KEY=$(python -c 'import secrets; print(secrets.token_hex(24))')" >> "$GITHUB_ENV"
+
       - name: Run pytest with network disabled
         env:
           DATABASE_URL: sqlite:///./ci_test.db
-          AUTH_SECRET_KEY: ci-secret-ci-secret-ci-secret-ci-secret
           # Route all outbound HTTP(S) to a closed local port so tests cannot reach the internet.
           HTTP_PROXY: http://127.0.0.1:9
           HTTPS_PROXY: http://127.0.0.1:9
