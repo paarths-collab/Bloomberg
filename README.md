@@ -98,6 +98,44 @@ Context and narrative pages for platform storytelling, exploration, and updates.
 - Strategy-driven users who test before deployment
 - Learners who want institutional-style thinking in an accessible format
 
+## Running Locally and Tests
+
+Backend (run from the repository root; the app is imported as `backend.main:app`):
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r backend/requirements.txt   # Windows: .venv\Scripts\python.exe -m pip install -r backend\requirements.txt
+./start.sh                                                    # or: .venv/bin/python run_server.py
+python -m uvicorn backend.main:app --host 0.0.0.0 --port 8001  # backend only
+```
+
+Windows: `start.bat` (backend and frontend), `start_backend.bat` or `go.bat` (backend only). The backend listens on port 8001 by default; set `PORT` to change it. API docs are at `/docs`, health at `/health`.
+
+Backend tests (offline; outbound HTTP is routed to a closed port):
+
+```bash
+DATABASE_URL=sqlite:///./ci_test.db AUTH_SECRET_KEY=<at-least-32-characters> \
+HTTP_PROXY=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9 \
+python -m pytest backend/tests -q -p no:cacheprovider
+```
+
+Frontend (in `frontend/`, Node 22 LTS):
+
+```bash
+npm ci
+npm run dev      # development server
+npm run build    # production build
+```
+
+Environment variables a deploy needs (set in the hosting dashboard, not in the repo):
+
+- `DATABASE_URL`: persistent database connection string.
+- `AUTH_SECRET_KEY`: signing key for guest tokens, at least 32 characters.
+- `CORS_ORIGINS`: comma-separated frontend origins.
+- `DB_FALLBACK_TO_SQLITE`: keep `false` in production.
+
+See DEPLOY_VERCEL_RENDER.md for the full list and deployment steps.
+
 ## Deployment
 
 Production deployment instructions are available in DEPLOY_VERCEL_RENDER.md.
