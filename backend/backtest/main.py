@@ -12,9 +12,15 @@ from .service import (
     validate_initial_capital,
     validate_bps,
     validate_seed,
+    validate_sizing,
+    validate_fee_per_fill,
+    validate_fill_timing,
     strip_run_options,
     validate_strategy_params,
+    validate_range,
     BacktestInputError,
+    MarketDataError,
+    DEFAULT_FILL_TIMING,
     DEFAULT_INITIAL_CAPITAL,
     DEFAULT_MONTE_CARLO_SEED,
 )
@@ -42,6 +48,23 @@ def _internal_error(context: str) -> HTTPException:
     """Log the active exception and return a client-safe 500 (no internal exception text)."""
     logger.exception("Backtest %s failed", context)
     return HTTPException(status_code=500, detail=f"Internal error while {context}.")
+
+
+MARKET_DATA_UNAVAILABLE = "Market data unavailable"
+
+
+def _validated_range(range_period: Any) -> str:
+    """400 for an unsupported lookback range (checked up front, so fetch_candles' own errors are never
+    mistaken for a bad request)."""
+    try:
+        return validate_range(range_period)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+def _market_data_unavailable() -> HTTPException:
+    """Provider failure (logged where it happened): a generic 502, distinct from the no-data 400."""
+    return HTTPException(status_code=502, detail=MARKET_DATA_UNAVAILABLE)
 
 
 def _normalize_strategy_name(strategy: Any) -> str:
@@ -110,7 +133,8 @@ def _normalize_strategy_params(strategy: str, params: Dict[str, Any]) -> Dict[st
 def _resolve_run_options(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     Single normalisation of the run-level options used by /run, /heatmap, /quantstats-report
-    and the WebSocket path: initial capital, trading costs and the Monte Carlo seed.
+    and the WebSocket path: initial capital, trading costs (commission_bps, slippage_bps,
+    fee_per_fill), sizing, fill_timing and the Monte Carlo seed.
 
     Lookup order: top-level payload (initial_capital, then the initialCapital alias), then
     `params` (flat), then any per-strategy dict inside `params` (backward compatible).
@@ -133,12 +157,18 @@ def _resolve_run_options(payload: Dict[str, Any]) -> Dict[str, Any]:
     commission = pick("commission_bps")
     slippage = pick("slippage_bps")
     seed = pick("seed")
+    fee_per_fill = pick("fee_per_fill")
+    fill_timing = pick("fill_timing")
+    sizing = pick("sizing")
     try:
         return {
             "initial_capital": validate_initial_capital(DEFAULT_INITIAL_CAPITAL if capital is None else capital),
             "commission_bps": validate_bps(0.0 if commission is None else commission, "commission_bps"),
             "slippage_bps": validate_bps(0.0 if slippage is None else slippage, "slippage_bps"),
             "seed": validate_seed(DEFAULT_MONTE_CARLO_SEED if seed is None else seed),
+            "fee_per_fill": validate_fee_per_fill(0.0 if fee_per_fill is None else fee_per_fill),
+            "fill_timing": validate_fill_timing(DEFAULT_FILL_TIMING if fill_timing is None else fill_timing),
+            "sizing": validate_sizing(sizing),
         }
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -500,6 +530,8 @@ async def backtest_websocket(websocket: WebSocket):
                     
             except HTTPException as http_err:
                 await websocket.send_json({"status": "error", "error": http_err.detail})
+            except MarketDataError:
+                await websocket.send_json({"status": "error", "error": MARKET_DATA_UNAVAILABLE})
             except Exception:
                 logger.exception("Backtest websocket run failed")
                 await websocket.send_json({
@@ -554,6 +586,11 @@ def run_simulation(
 ):
     """
     Runs a backtest simulation with single or multiple strategies.
+
+    Optional run options (top level or in `params`): initial_capital, commission_bps, slippage_bps,
+    fee_per_fill, seed, sizing ({"mode": "percent_equity", "value": 1.0} or
+    {"mode": "fixed_quantity", "value": shares}) and fill_timing ("next_open" | "next_close").
+    The result includes the trade `ledger`; a market-data provider failure is a 502.
     
     Single strategy payload:
     {
@@ -648,6 +685,8 @@ def run_simulation(
         
     except HTTPException:
         raise
+    except MarketDataError:
+        raise _market_data_unavailable()
     except Exception:
         raise _internal_error("running the backtest")
 
@@ -766,10 +805,11 @@ def run_heatmap(payload: Dict[str, Any] = Body(...)):
         x_values = payload.get("x_values", config["x_values"])
         y_values = payload.get("y_values", config["y_values"])
 
+        _validated_range(range_period)
         try:
             candles = fetch_candles(symbol, "1d", range_period)
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e))
+        except MarketDataError:
+            raise _market_data_unavailable()
         if not candles:
             raise HTTPException(status_code=400, detail="No data found for heatmap")
 
@@ -914,10 +954,11 @@ def generate_quantstats_report(payload: Dict[str, Any] = Body(...)):
 
     try:
         # 1. Fetch candles and prepare DataFrame
+        _validated_range(range_period)
         try:
             candles = fetch_candles(symbol, "1d", range_period)
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e))
+        except MarketDataError:
+            raise _market_data_unavailable()
         if not candles:
             raise HTTPException(status_code=400, detail="No market data found")
 

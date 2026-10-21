@@ -118,18 +118,29 @@ def test_hand_computed_sma_2_3_reversals(small_candles, run_small):
 
 
 def test_hand_computed_costs_on_first_trade(run_small):
-    """20 bps slippage + 10 bps commission on every fill (zero-cost numbers are in the test above)."""
+    """
+    20 bps slippage + 10 bps commission on every fill (zero-cost numbers are in the test above).
+
+    Sizing spends 100% of cash INCLUDING the entry commission (deliberate change in engine 2.0.0: the
+    account is never overdrawn by the fee), i.e. shares * fill * (1 + 0.001) == 100000.
+    """
     out = run_small(commission=10.0, slippage=20.0)
     t1 = out["trades"][0]
     entry_fill = 11.5 * (1 + 0.002)                        # buy at open 11.5, slippage worsens it: 11.523
-    shares = 100000 / entry_fill                           # sized on the fill price
-    entry_commission = shares * entry_fill * 0.001         # 100.0 (0.1% of 100000 notional)
+    unit_cost = entry_fill * (1 + 0.001)                   # price plus 10 bps commission per share: 11.534523
+    shares = 100000 / unit_cost                            # 8669.625956790758 shares; cash left after buying: 0
+    entry_notional = shares * entry_fill                   # 99900.0999...; commission = 99.9000999... (0.1%)
+    entry_commission = entry_notional * 0.001
+    assert entry_notional + entry_commission == pytest.approx(100000.0)   # whole account spent, none overdrawn
     exit_fill = 10.5 * (1 - 0.002)                         # sell at open 10.5, worse by 20 bps: 10.479
-    gross = shares * (exit_fill - entry_fill)
-    exit_commission = shares * exit_fill * 0.001
-    pnl = gross - entry_commission - exit_commission
+    proceeds = shares * exit_fill                          # 90850.4...
+    exit_commission = proceeds * 0.001                     # 90.85...
+    # account: 100000 -> 0 after the buy -> proceeds - exit commission after the sell
+    pnl = (proceeds - exit_commission) - 100000            # = -9241.838609190861
+    assert pnl == pytest.approx(-9241.838609190861)
     assert t1["entryPrice"] == pytest.approx(entry_fill)
     assert t1["exitPrice"] == pytest.approx(exit_fill)
+    assert t1["shares"] == pytest.approx(8669.625956790758)
     assert t1["pnl"] == pytest.approx(pnl)
     assert t1["pnlPct"] == pytest.approx(pnl / 100000 * 100)
     # costs make the whole run strictly worse than the gross run

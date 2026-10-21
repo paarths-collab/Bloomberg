@@ -4,16 +4,25 @@ import math
 import pandas as pd
 import numpy as np
 from typing import Dict, Any, List, Optional, Tuple
+from backend.core.safe_yfinance import safe_fetch_history
 from .core.strategy_adapter import get_strategy, STRATEGY_REGISTRY
-from .core.data_loader import get_history, format_ticker
+from .core.data_loader import format_ticker
+from .ledger import LedgerBook, replay, round_trips
 
 logger = logging.getLogger(__name__)
 
 INTERNAL_ERROR_MESSAGE = "Backtest failed due to an internal error."
 
+# Bump when the execution semantics or the result schema change (reported as assumptions.engineVersion).
+ENGINE_VERSION = "2.0.0"
+
 
 class BacktestInputError(ValueError):
     """A problem with the request itself (bad strategy name/params); safe to show to the client."""
+
+
+class MarketDataError(Exception):
+    """The market-data provider failed (as opposed to returning no data). Details are logged, never shown."""
 
 
 def validate_strategy_params(strategy_name: Any, params: Optional[Dict[str, Any]]) -> None:
@@ -73,7 +82,20 @@ STATEFUL_STRATEGIES = {
 }
 
 # Keys that configure the run rather than the strategy; never forwarded to get_strategy().
-RUN_OPTION_KEYS = ("initial_capital", "initialCapital", "commission_bps", "slippage_bps", "seed")
+RUN_OPTION_KEYS = (
+    "initial_capital", "initialCapital", "commission_bps", "slippage_bps", "seed",
+    "sizing", "fee_per_fill", "fill_timing",
+)
+
+SIZING_MODES = ("percent_equity", "fixed_quantity")
+FILL_TIMINGS = ("next_open", "next_close")
+DEFAULT_SIZING = {"mode": "percent_equity", "value": 1.0}
+DEFAULT_FILL_TIMING = "next_open"
+_ZERO_TOL = 1e-9  # currency tolerance for "the exit left the account at zero" versus "below zero"
+SPEC_KEYS = (
+    "strategy", "params", "initial_capital", "sizing", "commission_bps", "slippage_bps",
+    "fee_per_fill", "fill_timing", "interval", "seed", "symbol",
+)
 
 
 def validate_range(range_period: Any) -> str:
@@ -133,8 +155,65 @@ def validate_seed(value: Any) -> int:
     return int(number)
 
 
+def validate_fee_per_fill(value: Any) -> float:
+    fee = _coerce_number(value, "fee_per_fill")
+    if fee < 0:
+        raise ValueError("fee_per_fill must be >= 0")
+    return fee
+
+
+def validate_fill_timing(value: Any) -> str:
+    if not isinstance(value, str) or value.strip().lower() not in FILL_TIMINGS:
+        raise ValueError(f"Unsupported fill_timing '{value}'. Supported values: {', '.join(FILL_TIMINGS)}.")
+    return value.strip().lower()
+
+
+def validate_sizing(value: Any) -> Dict[str, Any]:
+    """
+    {"mode": "percent_equity", "value": 0 < v <= 1} (default 1.0 = 100% of equity, fractional shares) or
+    {"mode": "fixed_quantity", "value": shares > 0}. None -> the default.
+    """
+    if value is None:
+        return dict(DEFAULT_SIZING)
+    if not isinstance(value, dict):
+        raise ValueError('sizing must be an object like {"mode": "percent_equity", "value": 1.0}')
+    unknown = sorted(str(k) for k in value if k not in ("mode", "value"))
+    if unknown:
+        raise ValueError(f"Unknown sizing field(s): {', '.join(unknown)}. Supported: mode, value")
+    mode = value.get("mode", "percent_equity")
+    if not isinstance(mode, str) or mode.strip().lower() not in SIZING_MODES:
+        raise ValueError(f"Unsupported sizing mode '{mode}'. Supported values: {', '.join(SIZING_MODES)}.")
+    mode = mode.strip().lower()
+    if mode == "percent_equity":
+        number = _coerce_number(1.0 if value.get("value") is None else value["value"], "sizing.value")
+        if not 0 < number <= 1:
+            raise ValueError("sizing.value must be in (0, 1] for percent_equity (1.0 = 100% of equity)")
+    else:
+        if value.get("value") is None:
+            raise ValueError("sizing.value (shares) is required for fixed_quantity")
+        number = _coerce_number(value["value"], "sizing.value")
+        if number <= 0:
+            raise ValueError("sizing.value must be greater than 0 for fixed_quantity")
+    return {"mode": mode, "value": number}
+
+
 def strip_run_options(params: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     return {k: v for k, v in (params or {}).items() if k not in RUN_OPTION_KEYS}
+
+
+def _load_history(ticker: str, start: str, end: str, interval: str) -> Optional[pd.DataFrame]:
+    """
+    Provider history lookup that keeps "the provider failed" apart from "there is no data".
+    (core.data_loader / MarketDataService collapse both into an empty frame, so go to the provider
+    wrapper directly.) Raises MarketDataError on a provider failure, returns None/empty for no data.
+    """
+    res = safe_fetch_history(ticker, interval=interval, start=start, end=end)
+    status = res.get("status") if isinstance(res, dict) else None
+    if status == "ok":
+        return res.get("data")
+    if status == "no_data":
+        return None
+    raise MarketDataError(f"history lookup failed for {ticker}: {res.get('error') if isinstance(res, dict) else res!r}")
 
 
 def fetch_candles(
@@ -145,37 +224,47 @@ def fetch_candles(
     end: Optional[str] = None,
     market: str = "us",
 ) -> List[Dict[str, Any]]:
-    """Backtest-local candle fetcher to keep this module self-contained."""
+    """
+    Backtest-local candle fetcher to keep this module self-contained.
+
+    Returns [] when the provider answered but has no data for the symbol. Raises MarketDataError when
+    the provider/fetch itself failed, so callers never mistake an outage for "no data".
+    """
     if not (start and end):
         period = validate_range(period)  # raises ValueError for unknown ranges
 
+    ticker = format_ticker(symbol, market)
+    if not (start and end):
+        end_ts = pd.Timestamp.now(tz="UTC").normalize()
+        start_ts = end_ts - _PERIOD_OFFSETS[period]
+        start = start_ts.strftime("%Y-%m-%d")
+        end = end_ts.strftime("%Y-%m-%d")
+
+    # Only the provider call maps to MarketDataError; a bug in the candle building below is a
+    # genuine internal error and must surface as one (generic 500), not as "market data unavailable".
     try:
-        ticker = format_ticker(symbol, market)
-
-        if not (start and end):
-            end_ts = pd.Timestamp.now(tz="UTC").normalize()
-            start_ts = end_ts - _PERIOD_OFFSETS[period]
-            start = start_ts.strftime("%Y-%m-%d")
-            end = end_ts.strftime("%Y-%m-%d")
-
-        df = get_history(ticker=ticker, start=start, end=end, market=market, interval=interval)
-        if df is None or df.empty:
-            return []
-
-        date_fmt = "%Y-%m-%d" if str(interval).lower() in _DAILY_OR_SLOWER else "%Y-%m-%d %H:%M"
-        candles: List[Dict[str, Any]] = []
-        for idx, row in df.iterrows():
-            candles.append({
-                "date": idx.strftime(date_fmt) if hasattr(idx, "strftime") else str(idx),
-                "open": float(row.get("Open", 0)),
-                "high": float(row.get("High", 0)),
-                "low": float(row.get("Low", 0)),
-                "close": float(row.get("Close", 0)),
-                "volume": int(row.get("Volume", 0)),
-            })
-        return candles
-    except Exception:
+        df = _load_history(ticker, start, end, interval)
+    except MarketDataError:
+        logger.exception("Market data fetch failed for %s (%s, %s)", symbol, market, interval)
+        raise
+    except Exception as e:
+        logger.exception("Market data fetch failed for %s (%s, %s)", symbol, market, interval)
+        raise MarketDataError(f"fetch failed for {symbol}") from e
+    if df is None or df.empty:
         return []
+
+    date_fmt = "%Y-%m-%d" if str(interval).lower() in _DAILY_OR_SLOWER else "%Y-%m-%d %H:%M"
+    candles: List[Dict[str, Any]] = []
+    for idx, row in df.iterrows():
+        candles.append({
+            "date": idx.strftime(date_fmt) if hasattr(idx, "strftime") else str(idx),
+            "open": float(row.get("Open", 0)),
+            "high": float(row.get("High", 0)),
+            "low": float(row.get("Low", 0)),
+            "close": float(row.get("Close", 0)),
+            "volume": int(row.get("Volume", 0)),
+        })
+    return candles
 
 
 def _safe_number(value: Any) -> Optional[float]:
@@ -214,16 +303,21 @@ def _fetch_candles_with_fallback(
     if candles:
         return candles
 
-    # If market was likely wrong, retry once with the alternate market.
+    # If market was likely wrong, retry once with the alternate market. The first lookup succeeded
+    # (it simply had no data), so a failure of this guess is treated as "no data", not an outage.
     alternate = "india" if effective_market == "us" else "us"
-    return fetch_candles(
-        symbol,
-        interval,
-        range_period,
-        start=start_date,
-        end=end_date,
-        market=alternate,
-    )
+    try:
+        return fetch_candles(
+            symbol,
+            interval,
+            range_period,
+            start=start_date,
+            end=end_date,
+            market=alternate,
+        )
+    except MarketDataError:
+        logger.warning("Alternate-market lookup for %s (%s) failed; reporting no data", symbol, alternate)
+        return []
 
 
 def prepare_candles_df(candles: List[Dict]) -> pd.DataFrame:
@@ -250,12 +344,22 @@ def prepare_candles_df(candles: List[Dict]) -> pd.DataFrame:
 #   * the target position for bar t is derived from the strategy signal on bar t's close
 #     (stateful strategies: signal as-is; others: 0 = hold previous; long/flat strategies:
 #     -1 = go flat);
-#   * it is executed at the OPEN of bar t+1 (never on the signal bar, no look-ahead); if that
-#     bar has no usable Open the fill is at its Close and the trade is annotated;
-#   * 100% of current equity, fractional shares; a reversal closes and re-opens at the same open;
-#   * equity is marked to market at every close; costs (slippage worsens the fill price,
-#     commission is a fraction of traded notional) are charged on every fill;
-#   * a position still open on the last bar is closed at that bar's Close ("end_of_data").
+#   * it is executed on bar t+1, never on the signal bar (no look-ahead): at that bar's OPEN
+#     (fill_timing "next_open", default; if the bar has no usable Open the fill is at its Close and
+#     the order is annotated) or at its CLOSE (fill_timing "next_close");
+#   * sizing "percent_equity" (default 100% of current equity, fractional shares, sized so that
+#     shares * price + commission + fee_per_fill equals that share of cash: cash never goes negative) or
+#     "fixed_quantity" (N shares; a long buy that cash cannot cover is REJECTED, never resized, and not
+#     retried while the same target persists; shorts have no margin check);
+#     a reversal closes and re-opens on the same bar;
+#   * costs: slippage worsens the fill price, commission is a fraction of traded notional, plus an
+#     optional fixed fee per fill;
+#   * a position still open on the last bar is closed at that bar's Close ("end of data"); a short
+#     whose equity reaches zero is liquidated and the account stays flat.
+#
+# The simulation loop below only DECIDES orders and posts them to a ledger. Equity, drawdown,
+# round-trip trades, metrics and Monte Carlo input are all derived by replaying that ledger
+# (see ledger.py); there is no other equity formula.
 # ---------------------------------------------------------------------------
 
 def _target_positions(signal: pd.Series, stateful: bool, long_only: bool) -> pd.Series:
@@ -276,8 +380,16 @@ def _simulate_execution(
     strategy_name: str,
     commission_bps: float = 0.0,
     slippage_bps: float = 0.0,
-) -> Tuple[np.ndarray, np.ndarray, List[Dict[str, Any]]]:
-    """Returns (equity[n], position_held_at_close[n], trades)."""
+    fee_per_fill: float = 0.0,
+    fill_timing: str = DEFAULT_FILL_TIMING,
+    sizing: Optional[Dict[str, Any]] = None,
+    symbol: str = "",
+) -> List[Any]:
+    """
+    Decide orders from the target series and post them to a ledger. Returns the list of LedgerEvents.
+    An order is placed on bar i when the target decided on bar i-1 differs from the target decided
+    on bar i-2 and from the position held; a rejected order is not retried while the target persists.
+    """
     n = len(df)
     close = pd.to_numeric(df["Close"], errors="coerce").to_numpy(dtype=float)
     if "Open" in df.columns:
@@ -288,95 +400,258 @@ def _simulate_execution(
     tgt = target.to_numpy(dtype=float)
     comm = commission_bps / 10000.0
     slip = slippage_bps / 10000.0
+    sizing = sizing or DEFAULT_SIZING
+    fixed_qty = sizing["mode"] == "fixed_quantity"
+    sizing_value = float(sizing["value"])
 
-    equity = np.full(n, float(initial_capital))
-    position = np.zeros(n)
-    trades: List[Dict[str, Any]] = []
+    book = LedgerBook(initial_capital, instrument=symbol or "UNKNOWN", dates=dates)
+    dead = False  # account wiped out: nothing trades afterwards
+    next_trade_id = 1
+    open_trade_id: Optional[int] = None
 
-    realized = float(initial_capital)  # account value while flat
-    side = 0
-    shares = 0.0
-    entry_fill = 0.0
-    entry_base = 0.0  # equity right after the entry commission
-    equity_at_entry = 0.0
-    entry_idx = 0
-    entry_signal_idx: Optional[int] = None
-    entry_notes: List[str] = []
+    def _fee(qty: float, price: float) -> float:
+        return abs(qty) * price * comm + fee_per_fill
 
-    def _close_position(i: int, raw_price: float, reason: str, signal_idx: Optional[int],
-                        notes: List[str], open_at_end: bool = False, liquidated: bool = False) -> float:
-        nonlocal side, shares
-        closing_side = side
-        # Selling a long / covering a short: slippage always worsens the price.
-        fill = raw_price * (1 - slip) if closing_side > 0 else raw_price * (1 + slip)
-        proceeds = entry_base + closing_side * shares * (fill - entry_fill)
-        new_equity = proceeds - shares * fill * comm
-        if new_equity <= 0 or liquidated:
-            # Short gapped through zero equity (or squeezed intrabar): the account is wiped out.
-            new_equity = 0.0
-            if reason != "end_of_data":
-                reason = "liquidated"
-        pnl = new_equity - equity_at_entry
-        trades.append({
-            "side": "long" if closing_side > 0 else "short",
-            "entryDate": dates[entry_idx],
-            "entryPrice": _safe_number(entry_fill),
-            "entryReason": _trade_reason(strategy_name, "entry_" + ("long" if closing_side > 0 else "short")),
-            "exitDate": dates[i],
-            "exitPrice": _safe_number(fill),
-            "exitReason": reason or _trade_reason(strategy_name, "exit_" + ("long" if closing_side > 0 else "short")),
-            "pnl": _safe_number(pnl),
-            "pnlPct": _safe_number(pnl / equity_at_entry * 100) if equity_at_entry else None,
-            "duration": int(i - entry_idx),
-            "shares": _safe_number(shares),
-            "entrySignalDate": dates[entry_signal_idx] if entry_signal_idx is not None else None,
-            "exitSignalDate": dates[signal_idx] if signal_idx is not None else None,
-            "openAtEnd": bool(open_at_end),
-            "notes": list(entry_notes) + list(notes),
-        })
-        side = 0
-        shares = 0.0
-        return new_equity
+    def _slipped(raw: float, qty: float) -> float:
+        # Buying worsens the price upwards, selling downwards.
+        return raw * (1 + slip) if qty > 0 else raw * (1 - slip)
+
+    def _wipe_note(natural_cash_after: float) -> str:
+        shortfall = max(0.0, -natural_cash_after)
+        return f"account wiped out; loss beyond the account balance is not charged (shortfall {shortfall:.2f})"
+
+    def _close_position(i: int, raw: float, reason: str, kind: str, signal_idx: Optional[int],
+                        notes: List[str]) -> None:
+        nonlocal dead, open_trade_id
+        qty = -book.position
+        price = _slipped(raw, qty)
+        fee = _fee(qty, price)
+        natural_after = book.cash + (-(qty * price) - fee)
+        # Genuinely negative (beyond float noise) = the account cannot cover the exit. Landing exactly
+        # on zero is an ordinary exit that happens to leave nothing, not a liquidation.
+        wiped = natural_after < -_ZERO_TOL
+        if wiped:
+            dead = True
+            notes = list(notes) + [_wipe_note(natural_after)]
+            if kind == "fill":
+                kind, reason = "liquidation", "liquidated (account equity exhausted)"
+        book.post(
+            bar_index=i, date=dates[i], kind=kind, quantity=qty, price=price, fee=fee, reason=reason,
+            signal_bar_index=signal_idx, trade_id=open_trade_id, notes=notes, sweep_account=wiped,
+        )
+        open_trade_id = None
 
     for i in range(n):
-        if i > 0 and (realized > 0 or side != 0):
+        if i > 0 and not dead:
             desired = int(tgt[i - 1])
-            if desired != side:
-                fill_notes: List[str] = []
-                raw = open_[i]
-                if not (math.isfinite(raw) and raw > 0):
+            previous = int(tgt[i - 2]) if i >= 2 else 0
+            held_side = int(np.sign(book.position))
+            if desired != held_side and desired != previous:
+                notes: List[str] = []
+                if fill_timing == "next_close":
                     raw = close[i]
-                    fill_notes.append(f"Open unavailable on {dates[i]}; filled at Close")
-                if side != 0:
-                    realized = _close_position(i, raw, "", i - 1, fill_notes)
-                if desired != 0 and realized > 0:
-                    # Buying (long) / selling short: slippage worsens the price.
-                    fill = raw * (1 + slip) if desired > 0 else raw * (1 - slip)
-                    shares = realized / fill
-                    entry_base = realized - shares * fill * comm
-                    equity_at_entry = realized
-                    entry_fill = fill
-                    side = desired
-                    entry_idx = i
-                    entry_signal_idx = i - 1
-                    entry_notes = list(fill_notes)
+                else:
+                    raw = open_[i]
+                    if not (math.isfinite(raw) and raw > 0):
+                        raw = close[i]
+                        notes.append(f"Open unavailable on {dates[i]}; filled at Close")
+                reversing = held_side != 0
+                if reversing:
+                    _close_position(i, raw, "exit long" if held_side > 0 else "exit short", "fill", i - 1, notes)
+                if desired != 0 and not dead:
+                    price = _slipped(raw, float(desired))
+                    if price <= 0 or not math.isfinite(price):
+                        qty = 0.0
+                    elif fixed_qty:
+                        qty = sizing_value
+                    else:
+                        # Spend value * cash INCLUDING fees: qty*price*(1+commission) + fee_per_fill == value*cash,
+                        # so a 100% entry leaves cash at zero instead of overdrawing it by the fee.
+                        qty = (book.cash * sizing_value - fee_per_fill) / (price * (1 + comm))
+                    if math.isfinite(qty):
+                        word = "long" if desired > 0 else "short"
+                        reason = ("reverse to " if reversing else "enter ") + word
+                        fee = _fee(max(qty, 0.0), price)
+                        unaffordable = (
+                            qty <= 0
+                            or (fixed_qty and desired > 0 and qty * price + fee > book.cash)
+                        )
+                        if unaffordable:
+                            # Never silently resized; not retried while the same target persists.
+                            book.post(
+                                bar_index=i, date=dates[i], kind="rejected", quantity=0.0, price=price,
+                                fee=0.0, reason="insufficient cash", signal_bar_index=i - 1, trade_id=None,
+                                side="buy" if desired > 0 else "sell",
+                                notes=notes + [
+                                    f"requested {max(qty, 0.0):g} shares at {price:.6g}: needs "
+                                    f"{max(qty, 0.0) * price + fee:.2f}, cash {book.cash:.2f}"
+                                ],
+                            )
+                        else:
+                            open_trade_id = next_trade_id
+                            next_trade_id += 1
+                            book.post(
+                                bar_index=i, date=dates[i], kind="fill", quantity=desired * qty, price=price,
+                                fee=fee, reason=reason, signal_bar_index=i - 1, trade_id=open_trade_id,
+                                notes=notes,
+                            )
 
-        if side != 0:
-            marked = entry_base + side * shares * (close[i] - entry_fill)
-            position[i] = side
-            if marked <= 0:
-                # Short squeezed through zero equity: account is wiped out.
-                realized = _close_position(i, close[i], "liquidated", None, [], liquidated=True)
-                equity[i] = 0.0
-            else:
-                equity[i] = marked
-                if i == n - 1:
-                    realized = _close_position(i, close[i], "end_of_data", None, [], open_at_end=True)
-                    equity[i] = realized
-        else:
-            equity[i] = realized
+        if book.position != 0:
+            if book.equity(close[i]) <= 0:
+                # Equity reached zero at this close (a squeezed short): the account is wiped out.
+                dead = True
+                qty = -book.position
+                price = _slipped(close[i], qty)
+                fee = _fee(qty, price)
+                book.post(
+                    bar_index=i, date=dates[i], kind="liquidation", quantity=qty, price=price,
+                    fee=fee, reason="liquidated (equity <= 0)", signal_bar_index=None,
+                    trade_id=open_trade_id, sweep_account=True,
+                    notes=[_wipe_note(book.cash + (-(qty * price) - fee))],
+                )
+                open_trade_id = None
+            elif i == n - 1:
+                _close_position(i, close[i], "end of data", "close_at_end", None, [])
 
-    return equity, position, trades
+    return book.events
+
+
+def _buy_and_hold_equity(res_df: pd.DataFrame, initial_capital: float, symbol: str = "") -> np.ndarray:
+    """Benchmark curve: a one-event ledger (buy at the first close, fractional shares, no costs) replayed
+    with the same replay() as the strategy, so every curve in a result comes from a ledger."""
+    first_close = float(res_df["Close"].iloc[0])
+    if not first_close > 0:
+        return np.full(len(res_df), np.nan)
+    book = LedgerBook(initial_capital, instrument=symbol or "UNKNOWN", dates=[str(d) for d in res_df["Date"]])
+    book.post(
+        bar_index=0, date=str(res_df["Date"].iloc[0]), kind="fill", quantity=initial_capital / first_close,
+        price=first_close, fee=0.0, reason="buy and hold", trade_id=1,
+    )
+    return replay(book.events, res_df, initial_cash=initial_capital).equity
+
+
+class SpecResult(dict):
+    """run_spec's result: a plain JSON-ready dict plus the per-bar frame as an attribute."""
+    frame: pd.DataFrame = None
+
+
+def run_spec(df: pd.DataFrame, spec: Dict[str, Any], *, full: bool = True) -> SpecResult:
+    """
+    THE engine entry point (pure and deterministic for a given df + spec: no I/O, seeded randomness).
+
+    spec keys (all but `strategy` optional):
+        strategy        registry id, e.g. "sma_crossover"
+        params          strategy constructor params (run options are stripped)
+        initial_capital default 100000
+        sizing          {"mode": "percent_equity", "value": 1.0} | {"mode": "fixed_quantity", "value": shares}
+        commission_bps, slippage_bps, fee_per_fill   default 0
+        fill_timing     "next_open" (default) | "next_close"
+        interval        candle interval used to annualise metrics, default "1d"
+        seed            Monte Carlo seed, default 42
+        symbol          label for the ledger / result
+
+    Returns a SpecResult: a JSON-ready dict (symbol, strategy, initialCapital, metrics, chartData, trades,
+    equity_curve, monteCarlo, assumptions, ledger, spec) whose `.frame` attribute is the per-bar frame.
+    With full=False the chart/Monte Carlo parts are skipped (used by the heatmap and QuantStats paths).
+    Raises BacktestInputError for a bad strategy/params and ValueError for invalid settings.
+    """
+    s = normalize_spec(spec)
+    ppy = get_periods_per_year(s["interval"])
+    validate_strategy_params(s["strategy"], s["params"])
+    name = s["strategy"]
+    try:
+        strategy = get_strategy(name, **s["params"])
+    except (ValueError, TypeError) as e:
+        raise BacktestInputError(f"Invalid parameters for strategy '{name}': {e}")
+    if df is None or len(df) == 0:
+        raise ValueError("No price data to backtest")
+
+    initial_capital = s["initial_capital"]
+    res_df = strategy.generate_signals(df.copy()).reset_index(drop=True)
+    long_only = bool(getattr(strategy, "long_only", False))
+    target = _target_positions(res_df["signal"], name in STATEFUL_STRATEGIES, long_only)
+
+    # 1) the loop decides orders and emits ledger events ...
+    events = _simulate_execution(
+        res_df, target, initial_capital, name, s["commission_bps"], s["slippage_bps"],
+        s["fee_per_fill"], s["fill_timing"], s["sizing"], s["symbol"],
+    )
+    # 2) ... and everything below is derived by replaying them.
+    rp = replay(events, res_df, initial_cash=initial_capital)
+    trades = round_trips(events, lambda side: _trade_reason(name, side))
+
+    res_df["target"] = target.to_numpy()
+    res_df["position"] = np.sign(rp.held)
+    res_df["equity"] = rp.equity
+    res_df["strategy_returns"] = pd.Series(rp.equity).pct_change().replace([np.inf, -np.inf], np.nan).fillna(0).to_numpy()
+    res_df["pct_change"] = res_df["Close"].pct_change().fillna(0)
+    res_df["peak"] = res_df["equity"].cummax()
+    res_df["drawdown"] = ((res_df["equity"] - res_df["peak"]) / res_df["peak"]).fillna(0)
+    res_df["benchmark"] = _buy_and_hold_equity(res_df, initial_capital, s["symbol"])
+
+    metrics = _compute_metrics(res_df, trades, initial_capital, ppy)
+    # A run whose only activity was rejected orders looks like a zero-return run; say so explicitly.
+    metrics["rejectedOrders"] = sum(1 for e in events if e.kind == "rejected")
+    result = SpecResult({
+        "symbol": s["symbol"],
+        "strategy": name,
+        "initialCapital": initial_capital,
+        "metrics": metrics,
+        "trades": trades,
+        "assumptions": _build_assumptions(
+            s["commission_bps"], s["slippage_bps"], ppy, s["seed"],
+            sizing=s["sizing"], fee_per_fill=s["fee_per_fill"], fill_timing=s["fill_timing"],
+        ),
+        "ledger": [e.to_dict() for e in events],
+        "spec": s,
+    })
+    if full:
+        chart_data = _build_chart_data(res_df)
+        result["chartData"] = chart_data
+        # value = strategy equity, benchmark = buy-and-hold, both in account currency
+        result["equity_curve"] = [{**d, "value": d["equity"], "benchmark": d["benchmark"]} for d in chart_data]
+        result["monteCarlo"] = _run_monte_carlo(
+            res_df["strategy_returns"], initial_capital=initial_capital, seed=s["seed"]
+        )
+    # Set last: DataFrame.attrs are deep-copied on every column access, which would slow all the above.
+    res_df.attrs["trades"] = trades
+    res_df.attrs["ledger"] = events
+    result.frame = res_df
+    return result
+
+
+def normalize_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate a spec and fill in defaults. Idempotent. Raises ValueError (BacktestInputError for the strategy)."""
+    if not isinstance(spec, dict):
+        raise BacktestInputError("spec must be an object")
+    unknown = sorted(str(k) for k in spec if k not in SPEC_KEYS)
+    if unknown:
+        raise ValueError(f"Unknown spec field(s): {', '.join(unknown)}. Supported: {', '.join(SPEC_KEYS)}")
+    strategy = spec.get("strategy")
+    if not isinstance(strategy, str):
+        raise BacktestInputError("strategy must be a string")
+    params = spec.get("params") or {}
+    if not isinstance(params, dict):
+        raise BacktestInputError("params must be an object")
+
+    def opt(key, default):
+        return default if spec.get(key) is None else spec[key]
+
+    interval = str(opt("interval", "1d")).strip().lower()
+    get_periods_per_year(interval)
+    return {
+        "strategy": strategy.lower().strip(),
+        "params": dict(strip_run_options(params)),
+        "initial_capital": validate_initial_capital(opt("initial_capital", DEFAULT_INITIAL_CAPITAL)),
+        "sizing": validate_sizing(spec.get("sizing")),
+        "commission_bps": validate_bps(opt("commission_bps", 0.0), "commission_bps"),
+        "slippage_bps": validate_bps(opt("slippage_bps", 0.0), "slippage_bps"),
+        "fee_per_fill": validate_fee_per_fill(opt("fee_per_fill", 0.0)),
+        "fill_timing": validate_fill_timing(opt("fill_timing", DEFAULT_FILL_TIMING)),
+        "interval": interval,
+        "seed": validate_seed(opt("seed", DEFAULT_MONTE_CARLO_SEED)),
+        "symbol": str(opt("symbol", "")).strip(),
+    }
 
 
 def run_strategy_on_df(
@@ -386,34 +661,17 @@ def run_strategy_on_df(
     initial_capital: float = DEFAULT_INITIAL_CAPITAL,
     commission_bps: float = 0.0,
     slippage_bps: float = 0.0,
+    fee_per_fill: float = 0.0,
+    fill_timing: str = DEFAULT_FILL_TIMING,
+    sizing: Optional[Dict[str, Any]] = None,
 ) -> Tuple[pd.DataFrame, List[Dict[str, Any]]]:
-    """The one engine entry point: returns (result frame, trade ledger)."""
-    validate_strategy_params(strategy_name, params)
-    name = strategy_name.lower().strip()
-    try:
-        strategy = get_strategy(name, **strip_run_options(params))
-    except (ValueError, TypeError) as e:
-        raise BacktestInputError(f"Invalid parameters for strategy '{name}': {e}")
-    if df is None or len(df) == 0:
-        raise ValueError("No price data to backtest")
-    res_df = strategy.generate_signals(df.copy()).reset_index(drop=True)
-    long_only = bool(getattr(strategy, "long_only", False))
-    target = _target_positions(res_df["signal"], name in STATEFUL_STRATEGIES, long_only)
-    equity, position, trades = _simulate_execution(
-        res_df, target, initial_capital, name, commission_bps, slippage_bps
-    )
-
-    res_df["target"] = target.to_numpy()
-    res_df["position"] = position
-    res_df["equity"] = equity
-    res_df["strategy_returns"] = pd.Series(equity).pct_change().replace([np.inf, -np.inf], np.nan).fillna(0).to_numpy()
-    res_df["pct_change"] = res_df["Close"].pct_change().fillna(0)
-    res_df["peak"] = res_df["equity"].cummax()
-    res_df["drawdown"] = ((res_df["equity"] - res_df["peak"]) / res_df["peak"]).fillna(0)
-    first_close = float(res_df["Close"].iloc[0])
-    res_df["benchmark"] = initial_capital * res_df["Close"].astype(float) / first_close
-    res_df.attrs["trades"] = trades
-    return res_df, trades
+    """Thin wrapper over run_spec: returns (result frame, round-trip trades)."""
+    result = run_spec(df, {
+        "strategy": strategy_name, "params": params, "initial_capital": initial_capital,
+        "commission_bps": commission_bps, "slippage_bps": slippage_bps,
+        "fee_per_fill": fee_per_fill, "fill_timing": fill_timing, "sizing": sizing,
+    }, full=False)
+    return result.frame, result["trades"]
 
 
 def run_backtest_on_df(
@@ -422,10 +680,14 @@ def run_backtest_on_df(
     initial_capital: float = 100000,
     commission_bps: float = 0.0,
     slippage_bps: float = 0.0,
+    fee_per_fill: float = 0.0,
+    fill_timing: str = DEFAULT_FILL_TIMING,
+    sizing: Optional[Dict[str, Any]] = None,
     **params
 ) -> pd.DataFrame:
     res_df, _ = run_strategy_on_df(
-        df, strategy_name, params, initial_capital, commission_bps, slippage_bps
+        df, strategy_name, params, initial_capital, commission_bps, slippage_bps,
+        fee_per_fill, fill_timing, sizing,
     )
     return res_df
 
@@ -643,15 +905,38 @@ def _run_monte_carlo(
 
 
 
-def _build_assumptions(commission_bps: float, slippage_bps: float, periods_per_year: float, seed: int) -> Dict[str, Any]:
+def _describe_sizing(sizing: Dict[str, Any]) -> str:
+    if sizing["mode"] == "fixed_quantity":
+        return (
+            f"fixed quantity of {sizing['value']:g} shares (a long buy that cash cannot cover is rejected, not "
+            "resized, and not retried while the target persists; shorts have no margin check)"
+        )
+    return f"{sizing['value'] * 100:g}% of equity, fractional shares"
+
+
+def _build_assumptions(
+    commission_bps: float,
+    slippage_bps: float,
+    periods_per_year: float,
+    seed: int,
+    sizing: Optional[Dict[str, Any]] = None,
+    fee_per_fill: float = 0.0,
+    fill_timing: str = DEFAULT_FILL_TIMING,
+) -> Dict[str, Any]:
+    sizing = sizing or DEFAULT_SIZING
     return {
-        "execution": "signal on bar close, filled at next bar open",
-        "sizing": "100% of equity, fractional shares",
+        "execution": f"signal on bar close, filled at next bar {'close' if fill_timing == 'next_close' else 'open'}",
+        # human-readable (unchanged wording for the default); the structured control is `sizingSpec`
+        "sizing": _describe_sizing(sizing),
+        "sizingSpec": dict(sizing),
         "commission_bps": commission_bps,
         "slippage_bps": slippage_bps,
+        "fee_per_fill": fee_per_fill,
+        "fill_timing": fill_timing,
         "benchmark": "buy-and-hold from first close, normalized to initial capital",
         "periodsPerYear": periods_per_year,
         "monteCarloSeed": seed,
+        "engineVersion": ENGINE_VERSION,
     }
 
 
@@ -756,30 +1041,6 @@ def _build_chart_data(res_df: pd.DataFrame) -> List[Dict[str, Any]]:
     return chart_data
 
 
-def _evaluate_strategy(
-    df: pd.DataFrame,
-    strategy_name: str,
-    params: Optional[Dict[str, Any]],
-    initial_capital: float,
-    periods_per_year: float,
-    commission_bps: float,
-    slippage_bps: float,
-    seed: int,
-) -> Dict[str, Any]:
-    """Shared by the single and multi-strategy paths so both give identical results."""
-    res_df, trades = run_strategy_on_df(
-        df, strategy_name, params, initial_capital, commission_bps, slippage_bps
-    )
-    return {
-        "res_df": res_df,
-        "trades": trades,
-        "metrics": _compute_metrics(res_df, trades, initial_capital, periods_per_year),
-        "monteCarlo": _run_monte_carlo(
-            res_df['strategy_returns'], initial_capital=initial_capital, seed=seed
-        ),
-    }
-
-
 def _validate_run_settings(
     range_period: str,
     interval: str,
@@ -789,18 +1050,32 @@ def _validate_run_settings(
     seed: Any,
     start_date: Optional[str],
     end_date: Optional[str],
-) -> Tuple[float, float, float, float, int]:
-    """Returns (initial_capital, commission_bps, slippage_bps, periods_per_year, seed)."""
+    fee_per_fill: Any = 0.0,
+    fill_timing: Any = DEFAULT_FILL_TIMING,
+    sizing: Any = None,
+) -> Dict[str, Any]:
+    """Validate the run-level settings before any data is fetched. Returns the normalised settings
+    (spec-shaped, plus `periods_per_year`). Raises ValueError."""
     ppy = get_periods_per_year(interval)
     if not (start_date and end_date):
         validate_range(range_period)
-    return (
-        validate_initial_capital(initial_capital),
-        validate_bps(commission_bps, "commission_bps"),
-        validate_bps(slippage_bps, "slippage_bps"),
-        ppy,
-        validate_seed(seed),
-    )
+    return {
+        "initial_capital": validate_initial_capital(initial_capital),
+        "commission_bps": validate_bps(commission_bps, "commission_bps"),
+        "slippage_bps": validate_bps(slippage_bps, "slippage_bps"),
+        "seed": validate_seed(seed),
+        "fee_per_fill": validate_fee_per_fill(0.0 if fee_per_fill is None else fee_per_fill),
+        "fill_timing": validate_fill_timing(DEFAULT_FILL_TIMING if fill_timing is None else fill_timing),
+        "sizing": validate_sizing(sizing),
+        "interval": interval,
+        "periods_per_year": ppy,
+    }
+
+
+def _spec_for(symbol: str, strategy_name: str, params: Optional[Dict[str, Any]], settings: Dict[str, Any]) -> Dict[str, Any]:
+    spec = {k: v for k, v in settings.items() if k != "periods_per_year"}
+    spec.update({"strategy": strategy_name, "params": params, "symbol": symbol})
+    return spec
 
 
 def run_backtest_service(
@@ -815,17 +1090,21 @@ def run_backtest_service(
     commission_bps: float = 0.0,
     slippage_bps: float = 0.0,
     seed: int = DEFAULT_MONTE_CARLO_SEED,
+    sizing: Optional[Dict[str, Any]] = None,
+    fee_per_fill: float = 0.0,
+    fill_timing: str = DEFAULT_FILL_TIMING,
     **params
 ) -> Dict[str, Any]:
     """
     Runs a backtest for a given strategy and symbol.
-    Returns D3-ready equity curve, drawdown, and signals.
+    Returns D3-ready equity curve, drawdown, signals and the trade ledger.
+    Raises MarketDataError if the market-data provider fails (an empty result is an error dict instead).
     """
     interval = str(interval or "1d").strip().lower()
     try:
-        initial_capital, commission_bps, slippage_bps, ppy, seed = _validate_run_settings(
+        settings = _validate_run_settings(
             range_period, interval, initial_capital, commission_bps, slippage_bps, seed,
-            start_date, end_date,
+            start_date, end_date, fee_per_fill, fill_timing, sizing,
         )
     except ValueError as e:
         return {"error": str(e)}
@@ -845,35 +1124,17 @@ def run_backtest_service(
 
     df = prepare_candles_df(candles)
 
-    # 2. Run the strategy through the shared execution engine
+    # 2. Run the strategy through the single engine entry point
     try:
-        evaluated = _evaluate_strategy(
-            df, strategy_name, params, initial_capital, ppy, commission_bps, slippage_bps, seed
-        )
+        result = dict(run_spec(df, _spec_for(symbol, strategy_name, params, settings)))
+        result["symbol"] = symbol
+        result["strategy"] = strategy_name
+        return result
     except BacktestInputError as e:
         return {"error": str(e)}
     except Exception:
         logger.exception("Backtest failed for %s / %s", symbol, strategy_name)
         return {"error": INTERNAL_ERROR_MESSAGE, "internal": True}
-
-    res_df = evaluated["res_df"]
-    trades = evaluated["trades"]
-
-    # 3. Format for Frontend
-    chart_data = _build_chart_data(res_df)
-
-    return {
-        "symbol": symbol,
-        "strategy": strategy_name,
-        "initialCapital": initial_capital,
-        "metrics": evaluated["metrics"],
-        "chartData": chart_data,
-        "trades": trades,
-        # value = strategy equity, benchmark = buy-and-hold, both in account currency
-        "equity_curve": [{**d, "value": d["equity"], "benchmark": d["benchmark"]} for d in chart_data],
-        "monteCarlo": evaluated["monteCarlo"],
-        "assumptions": _build_assumptions(commission_bps, slippage_bps, ppy, seed),
-    }
 
 
 def run_multi_strategy_backtest(
@@ -889,19 +1150,23 @@ def run_multi_strategy_backtest(
     commission_bps: float = 0.0,
     slippage_bps: float = 0.0,
     seed: int = DEFAULT_MONTE_CARLO_SEED,
+    sizing: Optional[Dict[str, Any]] = None,
+    fee_per_fill: float = 0.0,
+    fill_timing: str = DEFAULT_FILL_TIMING,
 ) -> Dict[str, Any]:
     """
     Runs backtest for multiple strategies and compares them.
     Returns combined equity curves and per-strategy metrics.
+    Raises MarketDataError if the market-data provider fails.
     """
     if params_dict is None:
         params_dict = {}
 
     interval = str(interval or "1d").strip().lower()
     try:
-        initial_capital, commission_bps, slippage_bps, ppy, seed = _validate_run_settings(
+        settings = _validate_run_settings(
             range_period, interval, initial_capital, commission_bps, slippage_bps, seed,
-            start_date, end_date,
+            start_date, end_date, fee_per_fill, fill_timing, sizing,
         )
     except ValueError as e:
         return {"error": str(e)}
@@ -931,10 +1196,8 @@ def run_multi_strategy_backtest(
         params = params_dict.get(strategy_name, {})
 
         try:
-            evaluated = _evaluate_strategy(
-                df, strategy_name, params, initial_capital, ppy, commission_bps, slippage_bps, seed
-            )
-            res_df = evaluated["res_df"]
+            evaluated = run_spec(df, _spec_for(symbol, strategy_name, params, settings))
+            res_df = evaluated.frame
             if not benchmark_curve:
                 benchmark_curve = [
                     {"date": str(row['Date']), "value": round(row['benchmark'], 2)}
@@ -950,7 +1213,8 @@ def run_multi_strategy_backtest(
                 "equityCurve": [
                     {"date": str(row['Date']), "value": round(row['equity'], 2)}
                     for _, row in res_df.iterrows()
-                ]
+                ],
+                "ledger": evaluated["ledger"],
             }
 
         except BacktestInputError as e:
@@ -999,8 +1263,12 @@ def run_multi_strategy_backtest(
         "combinedChartData": combined_chart_data,
         "benchmarkCurve": benchmark_curve,
         "ranking": [{"strategy": name, "return": ret} for name, ret in ranked],
-        "initialCapital": initial_capital,
-        "assumptions": _build_assumptions(commission_bps, slippage_bps, ppy, seed),
+        "initialCapital": settings["initial_capital"],
+        "assumptions": _build_assumptions(
+            settings["commission_bps"], settings["slippage_bps"], settings["periods_per_year"],
+            settings["seed"], sizing=settings["sizing"], fee_per_fill=settings["fee_per_fill"],
+            fill_timing=settings["fill_timing"],
+        ),
     }
 
 
