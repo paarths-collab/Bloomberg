@@ -1,7 +1,10 @@
+import logging
 from fastapi import APIRouter, HTTPException
 from .core.pipeline import InvestmentPipeline
 from typing import Optional, Dict
 from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 _pipeline: Optional[InvestmentPipeline] = None
@@ -38,5 +41,6 @@ async def run_super_agent(payload: SuperAgentRequest):
         
         return result
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logger.exception("Super agent request failed")
+        raise HTTPException(status_code=500, detail="Super agent request failed")

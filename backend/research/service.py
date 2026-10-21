@@ -1,5 +1,6 @@
 import os
 import json
+import logging
 from typing import Dict, Any
 from langchain_core.messages import HumanMessage
 from .core.fundamentals_service import get_fundamentals_summary
@@ -7,13 +8,15 @@ from backend.services.market_data import market_service
 from .core.stock_agent import StockSelectionAgent
 from .core.llm_manager import LLMManager
 
+logger = logging.getLogger(__name__)
+
 # Initialize Finverse Components
 # We initialize them globally to reuse clients/connections
 try:
     llm_manager = LLMManager()
     stock_agent = StockSelectionAgent(llm_manager)
-except Exception as e:
-    print(f"Warning: Failed to init Finverse Agents: {e}")
+except Exception:
+    logger.exception("Failed to init Finverse Agents")
     llm_manager = None
     stock_agent = None
 
@@ -28,8 +31,9 @@ def generate_research_report(symbol: str) -> Dict[str, Any]:
     try:
         fundamentals = get_fundamentals_summary(symbol)
         candles = market_service.fetch_candles(symbol, interval="1wk", period="3mo")
-    except Exception as e:
-        return {"error": f"Data fetch failed: {e}"}
+    except Exception:
+        logger.exception("Research data fetch failed for %s", symbol)
+        return {"error": "Data fetch failed"}
 
     if not fundamentals:
         return {"error": "Stock not found"}
@@ -58,8 +62,8 @@ def generate_research_report(symbol: str) -> Dict[str, Any]:
             # Reddit Sentiment
             sent_map = stock_agent._analyze_reddit_sentiment([symbol])
             sentiment_score = sent_map.get(symbol, 0)
-        except Exception as e:
-            print(f"Finverse Research Error: {e}")
+        except Exception:
+            logger.exception("Finverse research failed for %s", symbol)
 
     # 3. Construct Rich Prompt
     prompt = f"""
@@ -96,8 +100,9 @@ def generate_research_report(symbol: str) -> Dict[str, Any]:
             # invoke returns AIMessage, .content extracts string
             response = llm_manager.invoke([HumanMessage(content=prompt)])
             report_content = response.content
-        except Exception as e:
-            report_content = f"LLM Error: {str(e)}"
+        except Exception:
+            logger.exception("LLM report generation failed for %s", symbol)
+            report_content = "AI report generation failed."
     else:
         report_content = "Finverse LLM Manager not initialized (Missing Keys?)."
 

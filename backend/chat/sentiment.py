@@ -2,6 +2,7 @@
 Sentiment Analysis API Routes
 Endpoints for stock sentiment analysis with AI
 """
+import logging
 import math
 from fastapi import APIRouter, HTTPException, Query
 from typing import List, Optional
@@ -11,6 +12,8 @@ from .core.stock_sentiment_service import (
     analyze_stock_sentiment,
     analyze_multiple_stocks,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/sentiment", tags=["Sentiment Analysis"])
 
@@ -58,11 +61,9 @@ async def get_sentiment_analysis(
         return _sanitize_floats(result)
     except HTTPException:
         raise
-    except Exception as e:
-        import traceback
-        print(f"Error analyzing sentiment for {symbol}: {e}")
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Sentiment analysis failed: {str(e)}")
+    except Exception:
+        logger.exception("Error analyzing sentiment for %s", symbol)
+        raise HTTPException(status_code=500, detail="Sentiment analysis failed")
 
 
 @router.post("/analyze")
@@ -79,11 +80,9 @@ async def post_sentiment_analysis(request: SentimentRequest):
         return _sanitize_floats(result)
     except HTTPException:
         raise
-    except Exception as e:
-        import traceback
-        print(f"Error in POST sentiment analysis for {request.symbol}: {e}")
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Sentiment analysis failed: {str(e)}")
+    except Exception:
+        logger.exception("Error in POST sentiment analysis for %s", request.symbol)
+        raise HTTPException(status_code=500, detail="Sentiment analysis failed")
 
 
 @router.post("/batch")
@@ -100,11 +99,9 @@ async def batch_sentiment_analysis(request: BatchSentimentRequest):
             "count": len(results),
             "results": results,
         })
-    except Exception as e:
-        import traceback
-        print(f"Error in batch sentiment analysis: {e}")
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Batch analysis failed: {str(e)}")
+    except Exception:
+        logger.exception("Error in batch sentiment analysis")
+        raise HTTPException(status_code=500, detail="Batch analysis failed")
 
 
 @router.get("/quick/{symbol}")
@@ -138,8 +135,6 @@ async def get_quick_sentiment(
         })
     except HTTPException:
         raise
-    except Exception as e:
-        import traceback
-        print(f"Error in quick sentiment analysis for {symbol}: {e}")
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Quick analysis failed: {str(e)}")
+    except Exception:
+        logger.exception("Error in quick sentiment analysis for %s", symbol)
+        raise HTTPException(status_code=500, detail="Quick analysis failed")

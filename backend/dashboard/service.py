@@ -90,8 +90,9 @@ def _build_insider_component(ticker: str, include_insider: bool, finnhub_key: Op
         sells = summary.get("Recent Sells (Count)", 0)
         score = (float(buys) - float(sells)) / (float(buys) + float(sells)) if (buys + sells) > 0 else 0
         return SignalComponent(score, _label_from_score(score), True, {"buys": buys, "sells": sells})
-    except Exception as e:
-        return SignalComponent(None, "error", False, {"reason": str(e)})
+    except Exception:
+        logger.exception("Insider signal component failed for %s", ticker)
+        return SignalComponent(None, "error", False, {"reason": "insider signal unavailable"})
 
 def _build_news_component(ticker: str, include_news: bool) -> SignalComponent:
     if not include_news or not NewsFetcher:
@@ -102,8 +103,9 @@ def _build_news_component(ticker: str, include_news: bool) -> SignalComponent:
         headlines = [t.get("title", "") for t in items]
         score = calculate_headline_sentiment(headlines)
         return SignalComponent(score, _label_from_score(score), True, {"headlines": headlines[:3]})
-    except Exception as e:
-        return SignalComponent(None, "error", False, {"reason": str(e)})
+    except Exception:
+        logger.exception("News signal component failed for %s", ticker)
+        return SignalComponent(None, "error", False, {"reason": "news signal unavailable"})
 
 def _label_from_score(score: float) -> str:
     if score >= 0.2: return "bullish"

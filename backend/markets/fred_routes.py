@@ -111,8 +111,9 @@ def get_fred_service():
     """Dependency to get FRED service"""
     try:
         return FredDataService()
-    except ValueError as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except ValueError:
+        logger.exception("FRED service is not configured")
+        raise HTTPException(status_code=500, detail="FRED service is not configured")
 
 
 # ============ Sync Endpoints ============
@@ -131,8 +132,9 @@ async def sync_single_series(
             end_date=date.today()
         )
         return result
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logger.exception("FRED route sync_single_series failed")
+        raise HTTPException(status_code=500, detail="FRED data request failed")
 
 
 @router.post("/sync/indices")
@@ -148,8 +150,9 @@ async def sync_all_indices(
             "series_count": len(results),
             "results": results
         }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logger.exception("FRED route sync_all_indices failed")
+        raise HTTPException(status_code=500, detail="FRED data request failed")
 
 
 @router.post("/sync/rates")
@@ -165,8 +168,9 @@ async def sync_all_rates(
             "series_count": len(results),
             "results": results
         }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logger.exception("FRED route sync_all_rates failed")
+        raise HTTPException(status_code=500, detail="FRED data request failed")
 
 
 @router.post("/sync/all")
@@ -183,8 +187,9 @@ async def sync_all_series(
             "rates_count": len(results.get("rates", [])),
             "results": results
         }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logger.exception("FRED route sync_all_series failed")
+        raise HTTPException(status_code=500, detail="FRED data request failed")
 
 
 # ============ Query Endpoints ============
@@ -212,8 +217,9 @@ async def get_series_data(
             "count": len(data),
             "data": data
         }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logger.exception("FRED route get_series_data failed")
+        raise HTTPException(status_code=500, detail="FRED data request failed")
 
 
 @router.get("/series/{series_id}/latest")
@@ -229,8 +235,9 @@ async def get_series_latest(
         return data[0]
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logger.exception("FRED route get_series_latest failed")
+        raise HTTPException(status_code=500, detail="FRED data request failed")
 
 
 @router.get("/latest")
@@ -246,8 +253,9 @@ async def get_all_latest(
             "count": len(data),
             "data": data
         }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logger.exception("FRED route get_all_latest failed")
+        raise HTTPException(status_code=500, detail="FRED data request failed")
 
 
 @router.get("/latest-live")
@@ -296,8 +304,9 @@ async def get_latest_live(
             "count": len(data),
             "data": data,
         }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logger.exception("FRED route get_latest_live failed")
+        raise HTTPException(status_code=500, detail="FRED data request failed")
 
 
 @router.get("/latest-cached")
@@ -396,19 +405,21 @@ async def get_latest_cached(
                         "status": "success",
                         "updated_at": latest_row.updated_at.isoformat() if latest_row.updated_at else None,
                     }
-                except Exception as e:
+                except Exception:
+                    logger.exception("FRED latest value failed for %s", series_id)
                     data[series_id] = {
                         "series_id": series_id,
                         "status": "error",
-                        "message": str(e),
+                        "message": "Series data unavailable",
                     }
 
         return {
             "count": len(data),
             "data": data,
         }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logger.exception("FRED route get_latest_cached failed")
+        raise HTTPException(status_code=500, detail="FRED data request failed")
 
 
 @router.get("/trending-news")
@@ -528,13 +539,14 @@ async def get_trending_news(
                     "date": item.get("date"),
                     "summary": item.get("body"),
                 })
-        except Exception as e:
+        except Exception:
+            logger.exception("Trending news fetch failed")
             if cached_payload:
                 payload = cached_payload.get("payload") or {}
                 payload["cached"] = True
                 payload["cached_at"] = cached_payload.get("cached_at")
                 payload["status"] = "stale"
-                payload["message"] = f"News fetch failed; serving cached results. ({e})"
+                payload["message"] = "News fetch failed; serving cached results."
                 return payload
             raise
 
@@ -551,8 +563,9 @@ async def get_trending_news(
         payload["cached"] = False
         payload["cached_at"] = datetime.utcnow().isoformat()
         return payload
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logger.exception("FRED route get_trending_news failed")
+        raise HTTPException(status_code=500, detail="FRED data request failed")
 
 
 @router.get("/index-news")
@@ -666,7 +679,8 @@ async def get_index_news(
                     }
                     if background_tasks is not None:
                         background_tasks.add_task(fetch_and_cache, title, query, cache_path)
-            except Exception as e:
+            except Exception:
+                logger.exception("Index news fetch failed for %s", series_id)
                 cached_any = None
                 if cache_path.exists():
                     try:
@@ -678,12 +692,12 @@ async def get_index_news(
                     payload["cached"] = True
                     payload["cached_at"] = cached_any.get("cached_at")
                     payload["status"] = "stale"
-                    payload["message"] = f"News fetch failed; serving cached results. ({e})"
+                    payload["message"] = "News fetch failed; serving cached results."
                     results[series_id] = payload
                 else:
                     results[series_id] = {
                         "status": "error",
-                        "message": str(e),
+                        "message": "News fetch failed",
                         "title": title,
                         "query": query,
                         "articles": [],
@@ -694,8 +708,9 @@ async def get_index_news(
             "count": len(results),
             "data": results,
         }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logger.exception("FRED route get_index_news failed")
+        raise HTTPException(status_code=500, detail="FRED data request failed")
 
 
 @router.get("/dashboard")
@@ -705,8 +720,9 @@ async def get_index_dashboard(
     """Get dashboard overview with all indices and rates"""
     try:
         return service.get_index_dashboard()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logger.exception("FRED route get_index_dashboard failed")
+        raise HTTPException(status_code=500, detail="FRED data request failed")
 
 
 # ============ Metadata Endpoints ============
@@ -748,6 +764,7 @@ async def get_series_smart(
             "count": len(data),
             "data": data
         }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logger.exception("FRED route get_series_smart failed")
+        raise HTTPException(status_code=500, detail="FRED data request failed")
 

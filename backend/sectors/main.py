@@ -68,8 +68,8 @@ async def get_indices(market: str = Query("india")):
     try:
         indices = sectors_service._get_market_indices(market) # Use the fast list
         return _sanitize_for_json({"market": market, "count": len(indices), "indices": indices})
-    except Exception as e:
-        logger.error(f"Treemap indices error for market={market}: {e}")
+    except Exception:
+        logger.exception("Treemap indices error for market=%s", market)
         return {"market": market, "count": 0, "indices": [], "error": "indices_unavailable"}
 
 @router.get("/treemap/indices/live")
@@ -77,9 +77,9 @@ async def get_indices_live(market: str = Query("india")):
     try:
         indices = sectors_service.get_indices_live(market)
         return _sanitize_for_json({"market": market, "count": len(indices), "indices": indices})
-    except Exception as e:
-        logger.error(f"Treemap live error: {e}")
-        return {"market": market, "count": 0, "indices": [], "error": str(e)}
+    except Exception:
+        logger.exception("Treemap live error for market=%s", market)
+        return {"market": market, "count": 0, "indices": [], "error": "indices_unavailable"}
 
 @router.get("/treemap/index/{index_id}")
 async def get_index_stocks(

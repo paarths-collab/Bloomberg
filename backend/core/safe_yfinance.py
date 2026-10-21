@@ -85,9 +85,9 @@ def safe_fetch_history(
 
         return result
 
-    except Exception as e:
-        logger.warning(f"[safe_yfinance] fetch_history({symbol}) failed: {e}")
-        return {"status": "error", "error": str(e), "data": None}
+    except Exception:
+        logger.exception("[safe_yfinance] fetch_history(%s) failed", symbol)
+        return {"status": "error", "error": "Market data request failed", "data": None}
 
 
 def safe_fetch_info(symbol: str) -> Dict[str, Any]:
@@ -110,9 +110,9 @@ def safe_fetch_info(symbol: str) -> Dict[str, Any]:
         _cache[key] = result
         return result
 
-    except Exception as e:
-        logger.warning(f"[safe_yfinance] fetch_info({symbol}) failed: {e}")
-        return {"status": "error", "error": str(e), "data": {}}
+    except Exception:
+        logger.exception("[safe_yfinance] fetch_info(%s) failed", symbol)
+        return {"status": "error", "error": "Market data request failed", "data": {}}
 
 
 def safe_get_price(symbol: str) -> Optional[float]:
@@ -312,8 +312,9 @@ def safe_fetch_multiple_quotes(
                 except Exception:
                     batch_results[symbol] = {"symbol": ticker_key, "price": None, "change": None, "change_percent": None}
             return batch_results
-        except Exception as e:
-            return {s: {"symbol": s.upper(), "error": str(e)} for s in batch_symbols}
+        except Exception:
+            logger.exception("[safe_yfinance] batch quote fetch failed")
+            return {s: {"symbol": s.upper(), "error": "Market data request failed"} for s in batch_symbols}
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_batch = {executor.submit(fetch_batch, b): b for b in batches}

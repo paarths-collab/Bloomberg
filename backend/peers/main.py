@@ -4,6 +4,8 @@ from .service import fetch_stock_peers
 from .comparison_service import fetch_peer_comparison
 from .core.json_utils import make_json_safe
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="", tags=["Peers"])
 
 
@@ -19,10 +21,8 @@ def get_peer_comparison(
     try:
         data = fetch_peer_comparison(symbol, limit=limit, debug=debug)
         return make_json_safe(data)
-    except Exception as e:
-        import traceback
-        print(f"Error fetching peer comparison for {symbol}: {e}")
-        traceback.print_exc()
+    except Exception:
+        logger.exception("Error fetching peer comparison for %s", symbol)
         # Never propagate provider/config failures as a hard 500 to the UI.
         # Return a minimal shape so frontend can render gracefully.
         fallback_symbol = symbol.strip().upper()
@@ -48,7 +48,8 @@ def get_peer_comparison(
             "message": "Peer comparison data source temporarily unavailable. Showing fallback row.",
         }
         if debug:
-            fallback["error"] = str(e)
+            # `debug` is client-controlled, so never echo the exception text here.
+            fallback["error"] = "Peer comparison failed"
         return make_json_safe(fallback)
 
 
@@ -67,8 +68,6 @@ def get_peers(symbol: str):
             "source": "Financial Modeling Prep",
         }
 
-    except Exception as e:
-        import traceback
-        print(f"Error fetching peers for {symbol}: {e}")
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Failed to fetch peers: {str(e)}")
+    except Exception:
+        logger.exception("Error fetching peers for %s", symbol)
+        raise HTTPException(status_code=500, detail="Failed to fetch peers")

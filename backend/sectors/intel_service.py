@@ -652,8 +652,8 @@ def refresh_all_sectors(
             try:
                 res = refresh_sector(db, sector, market, force=force)
             except Exception as exc:
-                logger.exception("sector_intel error market=%s sector=%s: %s", market, sector, exc)
-                res = {"sector": sector, "market": market, "status": "error", "error": str(exc)}
+                logger.exception("sector_intel error market=%s sector=%s", market, sector)
+                res = {"sector": sector, "market": market, "status": "error", "error": "Sector refresh failed"}
             elapsed = time.monotonic() - start
             res["elapsed_seconds"] = round(elapsed, 3)
             results.append(res)

@@ -20,9 +20,9 @@ def get_latest_news(
     """
     try:
         return _NEWS_SERVICE.search_news(query=query)[:limit]
-    except Exception as e:
+    except Exception:
         logger.exception("News fetch failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="News request failed")
 
 @router.get("/live")
 def get_live_news(
@@ -37,7 +37,7 @@ def get_live_news(
         if cached_only:
             return live_news_service.get_cached_news(query=query, limit=limit)
         return live_news_service.get_news(query=query, limit=limit)
-    except Exception as e:
+    except Exception:
         logger.exception("Live news failed; returning cached fallback")
         try:
             return live_news_service.get_cached_news(query=query, limit=limit)
@@ -50,7 +50,7 @@ def get_live_news(
                 "stale": True,
                 "articles": [],
                 "source_count": 0,
-                "message": f"Live news temporarily unavailable: {str(e)}",
+                "message": "Live news temporarily unavailable",
             }
 
 @router.get("/article-summary")
@@ -61,6 +61,6 @@ def get_article_summary(url: str = Query(...)):
     try:
         result = live_news_service.summarize_article(url=url)
         return result
-    except Exception as e:
+    except Exception:
         logger.exception("Article summary failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Article summary request failed")

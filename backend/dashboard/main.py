@@ -36,9 +36,9 @@ def analyze_dashboard_sentiment(request: SentimentRequest):
     try:
         # This uses the isolated logic in service.py (Migrated from market_pulse.py)
         return get_market_sentiment(request.message, request.tickers, request.market)
-    except Exception as e:
+    except Exception:
         logger.exception("Dashboard sentiment failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Dashboard sentiment request failed")
 
 @router.post("/crowd-insight")
 def analyze_crowd_signal(request: CrowdInsightRequest):
@@ -58,9 +58,9 @@ def analyze_crowd_signal(request: CrowdInsightRequest):
                 "hosts": RAPIDAPI_HOSTS,
             },
         )
-    except Exception as e:
+    except Exception:
         logger.exception("Crowd insight failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Crowd insight request failed")
 
 @router.get("/sector-news")
 def get_dashboard_sector_news(
@@ -91,7 +91,7 @@ def get_dashboard_sector_news(
             grouped[sec].append(r)
 
         return {"market": market.upper(), "total_items": len(rows), "sectors": grouped}
-    except Exception as e:
+    except Exception:
         logger.exception("Sector news query failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Sector news request failed")
 

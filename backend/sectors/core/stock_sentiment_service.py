@@ -119,8 +119,9 @@ def fetch_stock_data(symbol: str) -> Dict:
     try:
         hist = ticker.history(period="6mo")
         info = ticker.info
-    except Exception as e:
-        return {"error": str(e), "symbol": symbol}
+    except Exception:
+        logger.exception("Market data fetch failed for %s", symbol)
+        return {"error": "Market data unavailable", "symbol": symbol}
 
     if hist.empty:
         return {"error": "No market data found", "symbol": symbol}
@@ -693,10 +694,11 @@ def analyze_multiple_stocks(symbols: List[str], max_workers: int = 5) -> List[Di
             try:
                 result = future.result(timeout=60)
                 results.append(result)
-            except Exception as e:
+            except Exception:
+                logger.exception("Sentiment analysis failed for %s", futures[future])
                 results.append({
                     "symbol": futures[future],
-                    "error": str(e),
+                    "error": "Sentiment analysis failed",
                 })
     return results
 

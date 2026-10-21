@@ -74,7 +74,7 @@ try:
     format_ticker = market_service.normalize_ticker
     get_comprehensive_stock_data = market_service.get_fundamentals # Wait, check if this is correct
     
-    from backend.services.backtest_service import run_backtest_service
+    from backend.backtest.service import run_backtest_service
     from backend.services.emotion_data_scraper import EmotionDataScraper
     from backend.services.company_resolver import resolve_company_identity
     from backend.tools.duckduckgo_mcp import DuckDuckGoMCPTool
@@ -87,7 +87,7 @@ except ImportError:
     format_ticker = ms.normalize_ticker
     get_comprehensive_stock_data = ms.get_fundamentals
     
-    from services.backtest_service import run_backtest_service
+    from backend.backtest.service import run_backtest_service
     from services.emotion_data_scraper import EmotionDataScraper
     from services.company_resolver import resolve_company_identity
     from tools.duckduckgo_mcp import DuckDuckGoMCPTool
@@ -228,12 +228,13 @@ class PipelineManager:
                 execution_time=(datetime.now() - start_time).total_seconds()
             )
             
-        except Exception as e:
+        except Exception:
+            logger.exception("Emotion pipeline failed")
             return PipelineResult(
                 pipeline="emotion",
                 success=False,
-                data={"error": str(e)},
-                summary=f"❌ Emotion analysis failed: {str(e)}",
+                data={"error": "Emotion analysis failed"},
+                summary="❌ Emotion analysis failed",
                 timestamp=datetime.now().isoformat(),
                 execution_time=(datetime.now() - start_time).total_seconds()
             )
@@ -284,14 +285,20 @@ class PipelineManager:
 
             # Backtest pipeline (single strategy baseline)
             if include_backtest:
-                backtest = await asyncio.to_thread(
-                    run_backtest_service,
-                    symbol=ticker,
-                    strategy_name="momentum",
-                    range_period="1y",
-                    interval="1d",
-                    initial_capital=100000
-                )
+                try:
+                    backtest = await asyncio.to_thread(
+                        run_backtest_service,
+                        symbol=ticker,
+                        strategy_name="momentum",
+                        range_period="1y",
+                        interval="1d",
+                        initial_capital=100000
+                    )
+                except Exception:
+                    # The backtest service raises (MarketDataError) when the data provider fails;
+                    # that must not take down the rest of the stock info pipeline.
+                    logger.exception("Baseline backtest failed for %s", ticker)
+                    backtest = {"error": "Backtest unavailable"}
                 stock_data["backtest"] = {
                     "strategy": "momentum",
                     "metrics": backtest.get("metrics"),
@@ -316,12 +323,13 @@ class PipelineManager:
                 execution_time=(datetime.now() - start_time).total_seconds()
             )
             
-        except Exception as e:
+        except Exception:
+            logger.exception("Stock info pipeline failed")
             return PipelineResult(
                 pipeline="stock_info",
                 success=False,
-                data={"error": str(e)},
-                summary=f"❌ Stock analysis failed: {str(e)}",
+                data={"error": "Stock analysis failed"},
+                summary="❌ Stock analysis failed",
                 timestamp=datetime.now().isoformat(),
                 execution_time=(datetime.now() - start_time).total_seconds()
             )
@@ -363,12 +371,13 @@ class PipelineManager:
                 execution_time=(datetime.now() - start_time).total_seconds()
             )
             
-        except Exception as e:
+        except Exception:
+            logger.exception("Wealth pipeline failed")
             return PipelineResult(
                 pipeline="wealth",
                 success=False,
-                data={"error": str(e)},
-                summary=f"❌ Wealth analysis failed: {str(e)}",
+                data={"error": "Wealth analysis failed"},
+                summary="❌ Wealth analysis failed",
                 timestamp=datetime.now().isoformat(),
                 execution_time=(datetime.now() - start_time).total_seconds()
             )
@@ -529,8 +538,9 @@ class PipelineManager:
             
             return summary
             
-        except Exception as e:
-            return f"Emotion analysis completed. Error formatting: {str(e)}"
+        except Exception:
+            logger.exception("Emotion summary formatting failed")
+            return "Emotion analysis completed. Error formatting the summary."
     
     async def _create_emotion_summary_professional(self, result: Dict) -> str:
         """Create professional emotion analysis summary without emojis"""
@@ -646,8 +656,9 @@ Recommendation: {recommendation}
             
             return summary
             
-        except Exception as e:
-            return f"Emotion analysis completed. Error formatting: {str(e)}"
+        except Exception:
+            logger.exception("Emotion summary formatting failed")
+            return "Emotion analysis completed. Error formatting the summary."
     
     def _create_stock_summary(self, data: Dict) -> str:
         """Create comprehensive human-readable stock info summary"""
@@ -785,8 +796,9 @@ Recommendation: {recommendation}
             
             return summary
             
-        except Exception as e:
-            return f"Stock analysis completed. Error formatting: {str(e)}. Check data for details."
+        except Exception:
+            logger.exception("Stock summary formatting failed")
+            return "Stock analysis completed. Error formatting the summary. Check data for details."
     
     def _create_wealth_summary(self, result: Dict) -> str:
         """Create human-readable wealth advice summary"""
@@ -1037,8 +1049,9 @@ Format as clean markdown. Be thorough but scannable."""
                 "total_filtered": len(filtered),
                 "note": "No high-confidence stock-specific news found" if not filtered else "",
             }
-        except Exception as e:
-            return {"available": False, "error": str(e)}
+        except Exception:
+            logger.exception("News relevance filtering failed")
+            return {"available": False, "error": "News unavailable"}
     
     async def _calculate_technicals(self, ticker: str, market: str) -> Dict[str, Any]:
         """Calculate technical indicators for the stock"""
@@ -1120,8 +1133,9 @@ Format as clean markdown. Be thorough but scannable."""
                     "support": float(recent_low)
                 }
             }
-        except Exception as e:
-            return {"available": False, "error": str(e)}
+        except Exception:
+            logger.exception("Technical indicator calculation failed")
+            return {"available": False, "error": "Technical indicators unavailable"}
 
     async def _calculate_sharpe_ratio(self, ticker: str, market: str) -> Optional[float]:
         """Compute annualized Sharpe ratio from daily returns."""
@@ -1194,8 +1208,9 @@ Format as clean markdown. Be thorough but scannable."""
             try:
                 text = await asyncio.to_thread(self.ddg_tool.search, q, 6)
                 results.append({"query": q, "results": text})
-            except Exception as e:
-                results.append({"query": q, "error": str(e)})
+            except Exception:
+                logger.exception("DDG research query failed")
+                results.append({"query": q, "error": "Search failed"})
         return results
     
     async def _normalize_text(self, text: str) -> str:
@@ -1366,8 +1381,9 @@ Previous Close: {currency}{data.get('previous_close', 0):,.2f}
             
             return summary
             
-        except Exception as e:
-            return f"Stock analysis completed. Error formatting: {str(e)}"
+        except Exception:
+            logger.exception("Stock summary formatting failed")
+            return "Stock analysis completed. Error formatting the summary."
 
 
 # Singleton instance

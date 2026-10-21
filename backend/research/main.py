@@ -1,3 +1,4 @@
+import logging
 from fastapi import APIRouter, HTTPException, Body
 from fastapi.responses import FileResponse
 from .service import generate_research_report
@@ -6,6 +7,8 @@ from backend.services.market_data import market_service
 from typing import Dict, Any
 from pathlib import Path
 from datetime import datetime
+
+logger = logging.getLogger(__name__)
 
 REPORTS_DIR = Path(__file__).parent / "reports"
 REPORTS_DIR.mkdir(exist_ok=True)
@@ -29,8 +32,11 @@ def analyze_stock(
         if "error" in report:
              raise HTTPException(status_code=400, detail=report["error"])
         return report
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Research report generation failed for %s", symbol)
+        raise HTTPException(status_code=500, detail="Research request failed")
 
 
 @router.post("/report")
@@ -104,11 +110,9 @@ def generate_research_report_file(payload: Dict[str, Any] = Body(...)):
         }
     except HTTPException:
         raise
-    except Exception as e:
-        import traceback
-        print(f"Error generating QuantStats report for {symbol}: {e}")
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"QuantStats report generation failed: {str(e)}")
+    except Exception:
+        logger.exception("QuantStats report generation failed for %s", symbol)
+        raise HTTPException(status_code=500, detail="QuantStats report generation failed")
 
 
 @router.post("/interpret-image")

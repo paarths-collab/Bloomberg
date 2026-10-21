@@ -1,9 +1,13 @@
+import logging
+
 import requests
 import pandas as pd
 
 from typing import Dict, Any
 from pathlib import Path
 from functools import lru_cache
+
+logger = logging.getLogger(__name__)
 
 # --- Helper function to format tickers for API calls ---
 
@@ -43,9 +47,13 @@ class InsiderAgent:
             resp.raise_for_status()
             return resp.json()
         except requests.exceptions.RequestException as e:
-            return {"error": f"API Request Failed: {e}"}
+            # Request exceptions embed the full URL, including the API token in the query string,
+            # so only the exception type is logged and nothing is returned to callers.
+            logger.warning("Insider API request failed (%s)", type(e).__name__)
+            return {"error": "API request failed"}
         except Exception as e:
-            return {"error": f"An unexpected error occurred: {e}"}
+            logger.warning("Insider API call failed unexpectedly (%s)", type(e).__name__)
+            return {"error": "Unexpected API error"}
 
     def analyze(self, ticker: str) -> dict:
         """
