@@ -1,9 +1,112 @@
 import math
 import pandas as pd
 import numpy as np
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from .core.strategy_adapter import get_strategy
 from .core.data_loader import get_history, format_ticker
+
+
+DEFAULT_INITIAL_CAPITAL = 100000.0
+DEFAULT_MONTE_CARLO_SEED = 42
+
+# Lookback windows accepted by the `range` request field (explicit start+end overrides this).
+_PERIOD_OFFSETS = {
+    "1d": pd.DateOffset(days=1),
+    "5d": pd.DateOffset(days=5),
+    "1mo": pd.DateOffset(months=1),
+    "3mo": pd.DateOffset(months=3),
+    "6mo": pd.DateOffset(months=6),
+    "1y": pd.DateOffset(years=1),
+    "2y": pd.DateOffset(years=2),
+    "5y": pd.DateOffset(years=5),
+}
+SUPPORTED_RANGES = tuple(_PERIOD_OFFSETS.keys())
+
+# Bars per year by candle interval; used to annualize Sharpe / Sortino / volatility / CAGR.
+PERIODS_PER_YEAR = {
+    "1d": 252.0,
+    "1wk": 52.0,
+    "1mo": 12.0,
+    "1h": 252.0 * 6.5,
+    "60m": 252.0 * 6.5,
+    "30m": 252.0 * 13,
+    "15m": 252.0 * 26,
+    "5m": 252.0 * 78,
+}
+_DAILY_OR_SLOWER = {"1d", "1wk", "1mo"}
+
+# Strategies whose signal is already a target position (0 = flat). All the others emit
+# sparse event signals where 0 means "hold the previous position".
+STATEFUL_STRATEGIES = {
+    "momentum",
+    "mean_reversion",
+    "rsi_reversal",
+    "rsi_momentum",
+}
+
+# Keys that configure the run rather than the strategy; never forwarded to get_strategy().
+RUN_OPTION_KEYS = ("initial_capital", "initialCapital", "commission_bps", "slippage_bps", "seed")
+
+
+def validate_range(range_period: Any) -> str:
+    key = str(range_period).strip().lower() if range_period is not None else ""
+    if key not in _PERIOD_OFFSETS:
+        raise ValueError(
+            f"Unsupported range '{range_period}'. Supported values: {', '.join(SUPPORTED_RANGES)} "
+            "(or pass explicit start and end dates)."
+        )
+    return key
+
+
+def get_periods_per_year(interval: Any) -> float:
+    key = str(interval).strip().lower() if interval is not None else ""
+    if key not in PERIODS_PER_YEAR:
+        raise ValueError(
+            f"Unsupported interval '{interval}'. Supported values: {', '.join(PERIODS_PER_YEAR.keys())}."
+        )
+    return PERIODS_PER_YEAR[key]
+
+
+def _coerce_number(value: Any, name: str) -> float:
+    if isinstance(value, bool) or value is None:
+        raise ValueError(f"{name} must be a number")
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} must be a number")
+    if not math.isfinite(number):
+        raise ValueError(f"{name} must be a finite number")
+    return number
+
+
+def validate_initial_capital(value: Any) -> float:
+    capital = _coerce_number(value, "initial_capital")
+    if capital <= 0:
+        raise ValueError("initial_capital must be greater than 0")
+    return capital
+
+
+def validate_bps(value: Any, name: str) -> float:
+    bps = _coerce_number(value, name)
+    if bps < 0:
+        raise ValueError(f"{name} must be >= 0")
+    return bps
+
+
+def validate_seed(value: Any) -> int:
+    if isinstance(value, bool) or value is None:
+        raise ValueError("seed must be an integer")
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise ValueError("seed must be an integer")
+    if not math.isfinite(number) or number != int(number) or number < 0:
+        raise ValueError("seed must be a non-negative integer")
+    return int(number)
+
+
+def strip_run_options(params: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    return {k: v for k, v in (params or {}).items() if k not in RUN_OPTION_KEYS}
 
 
 def fetch_candles(
@@ -15,22 +118,15 @@ def fetch_candles(
     market: str = "us",
 ) -> List[Dict[str, Any]]:
     """Backtest-local candle fetcher to keep this module self-contained."""
+    if not (start and end):
+        period = validate_range(period)  # raises ValueError for unknown ranges
+
     try:
         ticker = format_ticker(symbol, market)
 
         if not (start and end):
             end_ts = pd.Timestamp.now(tz="UTC").normalize()
-            period_map = {
-                "1d": pd.DateOffset(days=1),
-                "5d": pd.DateOffset(days=5),
-                "1mo": pd.DateOffset(months=1),
-                "3mo": pd.DateOffset(months=3),
-                "6mo": pd.DateOffset(months=6),
-                "1y": pd.DateOffset(years=1),
-                "2y": pd.DateOffset(years=2),
-                "5y": pd.DateOffset(years=5),
-            }
-            start_ts = end_ts - period_map.get(period, pd.DateOffset(months=1))
+            start_ts = end_ts - _PERIOD_OFFSETS[period]
             start = start_ts.strftime("%Y-%m-%d")
             end = end_ts.strftime("%Y-%m-%d")
 
@@ -38,10 +134,11 @@ def fetch_candles(
         if df is None or df.empty:
             return []
 
+        date_fmt = "%Y-%m-%d" if str(interval).lower() in _DAILY_OR_SLOWER else "%Y-%m-%d %H:%M"
         candles: List[Dict[str, Any]] = []
         for idx, row in df.iterrows():
             candles.append({
-                "date": idx.strftime("%Y-%m-%d") if hasattr(idx, "strftime") else str(idx),
+                "date": idx.strftime(date_fmt) if hasattr(idx, "strftime") else str(idx),
                 "open": float(row.get("Open", 0)),
                 "high": float(row.get("High", 0)),
                 "low": float(row.get("Low", 0)),
@@ -111,38 +208,192 @@ def prepare_candles_df(candles: List[Dict]) -> pd.DataFrame:
         "close": "Close",
         "volume": "Volume"
     }, inplace=True)
+    if "Close" in df.columns:
+        # Bars without a usable close cannot be marked to market.
+        close = pd.to_numeric(df["Close"], errors="coerce")
+        df = df[np.isfinite(close)].reset_index(drop=True)
     return df
 
 
-def _compute_equity_from_signals(res_df: pd.DataFrame, initial_capital: float, strategy_name: str) -> pd.DataFrame:
-    df = res_df.copy()
-    stateful_strategies = {
-        "momentum",
-        "mean_reversion",
-        "rsi_reversal",
-        "rsi_momentum",
-    }
-    if strategy_name in stateful_strategies:
-        df['position'] = df['signal'].shift(1).fillna(0)
+# ---------------------------------------------------------------------------
+# Execution engine
+#
+# Convention (single source of truth for single, multi, heatmap, quantstats and WS runs):
+#   * the target position for bar t is derived from the strategy signal on bar t's close
+#     (stateful strategies: signal as-is; others: 0 = hold previous; long/flat strategies:
+#     -1 = go flat);
+#   * it is executed at the OPEN of bar t+1 (never on the signal bar, no look-ahead); if that
+#     bar has no usable Open the fill is at its Close and the trade is annotated;
+#   * 100% of current equity, fractional shares; a reversal closes and re-opens at the same open;
+#   * equity is marked to market at every close; costs (slippage worsens the fill price,
+#     commission is a fraction of traded notional) are charged on every fill;
+#   * a position still open on the last bar is closed at that bar's Close ("end_of_data").
+# ---------------------------------------------------------------------------
+
+def _target_positions(signal: pd.Series, stateful: bool, long_only: bool) -> pd.Series:
+    sig = pd.to_numeric(signal, errors="coerce").fillna(0)
+    if stateful:
+        target = sig
     else:
-        df['position'] = df['signal'].replace(0, np.nan).ffill().shift(1).fillna(0)
-    df['pct_change'] = df['Close'].pct_change().fillna(0)
-    df['strategy_returns'] = df['position'] * df['pct_change']
-    df['equity'] = initial_capital * (1 + df['strategy_returns']).cumprod()
-    df['peak'] = df['equity'].cummax()
-    df['drawdown'] = (df['equity'] - df['peak']) / df['peak']
-    return df
+        target = sig.replace(0, np.nan).ffill().fillna(0)
+    if long_only:
+        target = target.clip(lower=0)
+    return np.sign(target).astype(float)
+
+
+def _simulate_execution(
+    df: pd.DataFrame,
+    target: pd.Series,
+    initial_capital: float,
+    strategy_name: str,
+    commission_bps: float = 0.0,
+    slippage_bps: float = 0.0,
+) -> Tuple[np.ndarray, np.ndarray, List[Dict[str, Any]]]:
+    """Returns (equity[n], position_held_at_close[n], trades)."""
+    n = len(df)
+    close = pd.to_numeric(df["Close"], errors="coerce").to_numpy(dtype=float)
+    if "Open" in df.columns:
+        open_ = pd.to_numeric(df["Open"], errors="coerce").to_numpy(dtype=float)
+    else:
+        open_ = np.full(n, np.nan)
+    dates = [str(d) for d in df["Date"]]
+    tgt = target.to_numpy(dtype=float)
+    comm = commission_bps / 10000.0
+    slip = slippage_bps / 10000.0
+
+    equity = np.full(n, float(initial_capital))
+    position = np.zeros(n)
+    trades: List[Dict[str, Any]] = []
+
+    realized = float(initial_capital)  # account value while flat
+    side = 0
+    shares = 0.0
+    entry_fill = 0.0
+    entry_base = 0.0  # equity right after the entry commission
+    equity_at_entry = 0.0
+    entry_idx = 0
+    entry_signal_idx: Optional[int] = None
+    entry_notes: List[str] = []
+
+    def _close_position(i: int, raw_price: float, reason: str, signal_idx: Optional[int],
+                        notes: List[str], open_at_end: bool = False, liquidated: bool = False) -> float:
+        nonlocal side, shares
+        closing_side = side
+        # Selling a long / covering a short: slippage always worsens the price.
+        fill = raw_price * (1 - slip) if closing_side > 0 else raw_price * (1 + slip)
+        proceeds = entry_base + closing_side * shares * (fill - entry_fill)
+        new_equity = max(proceeds - shares * fill * comm, 0.0)
+        if liquidated:
+            new_equity = 0.0
+        pnl = new_equity - equity_at_entry
+        trades.append({
+            "side": "long" if closing_side > 0 else "short",
+            "entryDate": dates[entry_idx],
+            "entryPrice": _safe_number(entry_fill),
+            "entryReason": _trade_reason(strategy_name, "entry_" + ("long" if closing_side > 0 else "short")),
+            "exitDate": dates[i],
+            "exitPrice": _safe_number(fill),
+            "exitReason": reason or _trade_reason(strategy_name, "exit_" + ("long" if closing_side > 0 else "short")),
+            "pnl": _safe_number(pnl),
+            "pnlPct": _safe_number(pnl / equity_at_entry * 100) if equity_at_entry else None,
+            "duration": int(i - entry_idx),
+            "shares": _safe_number(shares),
+            "entrySignalDate": dates[entry_signal_idx] if entry_signal_idx is not None else None,
+            "exitSignalDate": dates[signal_idx] if signal_idx is not None else None,
+            "openAtEnd": bool(open_at_end),
+            "notes": list(entry_notes) + list(notes),
+        })
+        side = 0
+        shares = 0.0
+        return new_equity
+
+    for i in range(n):
+        if i > 0 and (realized > 0 or side != 0):
+            desired = int(tgt[i - 1])
+            if desired != side:
+                fill_notes: List[str] = []
+                raw = open_[i]
+                if not (math.isfinite(raw) and raw > 0):
+                    raw = close[i]
+                    fill_notes.append(f"Open unavailable on {dates[i]}; filled at Close")
+                if side != 0:
+                    realized = _close_position(i, raw, "", i - 1, fill_notes)
+                if desired != 0 and realized > 0:
+                    # Buying (long) / selling short: slippage worsens the price.
+                    fill = raw * (1 + slip) if desired > 0 else raw * (1 - slip)
+                    shares = realized / fill
+                    entry_base = realized - shares * fill * comm
+                    equity_at_entry = realized
+                    entry_fill = fill
+                    side = desired
+                    entry_idx = i
+                    entry_signal_idx = i - 1
+                    entry_notes = list(fill_notes)
+
+        if side != 0:
+            marked = entry_base + side * shares * (close[i] - entry_fill)
+            position[i] = side
+            if marked <= 0:
+                # Short squeezed through zero equity: account is wiped out.
+                realized = _close_position(i, close[i], "liquidated", None, [], liquidated=True)
+                equity[i] = 0.0
+            else:
+                equity[i] = marked
+                if i == n - 1:
+                    realized = _close_position(i, close[i], "end_of_data", None, [], open_at_end=True)
+                    equity[i] = realized
+        else:
+            equity[i] = realized
+
+    return equity, position, trades
+
+
+def run_strategy_on_df(
+    df: pd.DataFrame,
+    strategy_name: str,
+    params: Optional[Dict[str, Any]] = None,
+    initial_capital: float = DEFAULT_INITIAL_CAPITAL,
+    commission_bps: float = 0.0,
+    slippage_bps: float = 0.0,
+) -> Tuple[pd.DataFrame, List[Dict[str, Any]]]:
+    """The one engine entry point: returns (result frame, trade ledger)."""
+    name = (strategy_name or "").lower().strip()
+    strategy = get_strategy(name, **strip_run_options(params))
+    if df is None or len(df) == 0:
+        raise ValueError("No price data to backtest")
+    res_df = strategy.generate_signals(df.copy()).reset_index(drop=True)
+    long_only = bool(getattr(strategy, "long_only", False))
+    target = _target_positions(res_df["signal"], name in STATEFUL_STRATEGIES, long_only)
+    equity, position, trades = _simulate_execution(
+        res_df, target, initial_capital, name, commission_bps, slippage_bps
+    )
+
+    res_df["target"] = target.to_numpy()
+    res_df["position"] = position
+    res_df["equity"] = equity
+    res_df["strategy_returns"] = pd.Series(equity).pct_change().replace([np.inf, -np.inf], np.nan).fillna(0).to_numpy()
+    res_df["pct_change"] = res_df["Close"].pct_change().fillna(0)
+    res_df["peak"] = res_df["equity"].cummax()
+    res_df["drawdown"] = ((res_df["equity"] - res_df["peak"]) / res_df["peak"]).fillna(0)
+    first_close = float(res_df["Close"].iloc[0])
+    res_df["benchmark"] = initial_capital * res_df["Close"].astype(float) / first_close
+    res_df.attrs["trades"] = trades
+    return res_df, trades
 
 
 def run_backtest_on_df(
     df: pd.DataFrame,
     strategy_name: str,
     initial_capital: float = 100000,
+    commission_bps: float = 0.0,
+    slippage_bps: float = 0.0,
     **params
 ) -> pd.DataFrame:
-    strategy = get_strategy(strategy_name, **params)
-    res_df = strategy.generate_signals(df.copy())
-    return _compute_equity_from_signals(res_df, initial_capital, strategy_name)
+    res_df, _ = run_strategy_on_df(
+        df, strategy_name, params, initial_capital, commission_bps, slippage_bps
+    )
+    return res_df
+
 
 
 def _compute_drawdown_duration(drawdown_series: pd.Series) -> int:
@@ -177,6 +428,10 @@ def _trade_reason(strategy_name: str, side: str) -> str:
             "entry_short": "Price rose above upper band",
             "exit_short": "Price reverted back below mean",
         },
+        "fibonacci_pullback": {
+            "entry_long": "Pullback to 61.8% Fibonacci retracement",
+            "exit_long": "Price reached prior high",
+        },
         "momentum": {
             "entry_long": "Momentum turned positive",
             "exit_long": "Momentum turned negative",
@@ -192,88 +447,6 @@ def _trade_reason(strategy_name: str, side: str) -> str:
     }
     return reasons.get(strategy_name, {}).get(side, "Signal triggered")
 
-
-def _extract_trades(res_df: pd.DataFrame, strategy_name: str) -> List[Dict[str, Any]]:
-    trades: List[Dict[str, Any]] = []
-    positions = res_df['position'].fillna(0).tolist()
-    current_trade = None
-    entry_index = None
-
-    for i in range(len(res_df)):
-        row = res_df.iloc[i]
-        pos = positions[i]
-        prev_pos = positions[i - 1] if i > 0 else 0
-
-        if prev_pos == 0 and pos != 0:
-            side = "long" if pos > 0 else "short"
-            current_trade = {
-                "side": side,
-                "entryDate": str(row['Date']),
-                "entryPrice": _safe_number(row['Close']),
-                "entryReason": _trade_reason(strategy_name, f"entry_{side}")
-            }
-            entry_index = i
-            continue
-
-        if prev_pos != 0 and pos == 0 and current_trade:
-            exit_price = _safe_number(row['Close'])
-            entry_price = current_trade.get("entryPrice")
-            side = current_trade.get("side", "long")
-            pnl = None
-            pnl_pct = None
-            if entry_price is not None and exit_price is not None:
-                if side == "long":
-                    pnl = exit_price - entry_price
-                else:
-                    pnl = entry_price - exit_price
-                pnl_pct = (pnl / entry_price) * 100 if entry_price else None
-
-            trades.append({
-                **current_trade,
-                "exitDate": str(row['Date']),
-                "exitPrice": exit_price,
-                "exitReason": _trade_reason(strategy_name, f"exit_{side}"),
-                "pnl": _safe_number(pnl),
-                "pnlPct": _safe_number(pnl_pct),
-                "duration": int(i - (entry_index or i))
-            })
-            current_trade = None
-            entry_index = None
-            continue
-
-        if prev_pos != 0 and pos != 0 and pos != prev_pos and current_trade:
-            exit_price = _safe_number(row['Close'])
-            entry_price = current_trade.get("entryPrice")
-            side = current_trade.get("side", "long")
-            pnl = None
-            pnl_pct = None
-            if entry_price is not None and exit_price is not None:
-                if side == "long":
-                    pnl = exit_price - entry_price
-                else:
-                    pnl = entry_price - exit_price
-                pnl_pct = (pnl / entry_price) * 100 if entry_price else None
-
-            trades.append({
-                **current_trade,
-                "exitDate": str(row['Date']),
-                "exitPrice": exit_price,
-                "exitReason": _trade_reason(strategy_name, f"exit_{side}"),
-                "pnl": _safe_number(pnl),
-                "pnlPct": _safe_number(pnl_pct),
-                "duration": int(i - (entry_index or i))
-            })
-
-            new_side = "long" if pos > 0 else "short"
-            current_trade = {
-                "side": new_side,
-                "entryDate": str(row['Date']),
-                "entryPrice": _safe_number(row['Close']),
-                "entryReason": _trade_reason(strategy_name, f"entry_{new_side}")
-            }
-            entry_index = i
-
-    return trades
 
 
 def _compute_advanced_trade_metrics(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -329,14 +502,20 @@ def _compute_advanced_trade_metrics(trades: List[Dict[str, Any]]) -> Dict[str, A
     }
 
 
-def _run_monte_carlo(returns: pd.Series, simulations: int = 1000, initial_capital: float = 100000) -> Dict[str, Any]:
-    """Run Monte Carlo simulation with VaR, CVaR, and full simulation paths."""
+
+def _run_monte_carlo(
+    returns: pd.Series,
+    simulations: int = 1000,
+    initial_capital: float = 100000,
+    seed: int = DEFAULT_MONTE_CARLO_SEED,
+) -> Dict[str, Any]:
+    """Run a seeded Monte Carlo simulation with VaR, CVaR, and full simulation paths."""
     if returns.empty:
-        return {"simulations": 0, "histogram": [], "percentiles": {}, "riskMetrics": {}, "simulationPaths": [], "percentilePaths": {}}
+        return {"simulations": 0, "histogram": [], "percentiles": {}, "riskMetrics": {}, "simulationPaths": [], "percentilePaths": {}, "seed": seed}
 
     clean = returns.dropna().values
     if len(clean) == 0:
-        return {"simulations": 0, "histogram": [], "percentiles": {}, "riskMetrics": {}, "simulationPaths": [], "percentilePaths": {}}
+        return {"simulations": 0, "histogram": [], "percentiles": {}, "riskMetrics": {}, "simulationPaths": [], "percentilePaths": {}, "seed": seed}
 
     n_steps = len(clean)
     # Downsample to max 50 points for charting
@@ -346,12 +525,13 @@ def _run_monte_carlo(returns: pd.Series, simulations: int = 1000, initial_capita
     if sample_indices[-1] != n_steps - 1:
         sample_indices.append(n_steps - 1)
 
+    rng = np.random.default_rng(seed)
     sim_returns = []
     sim_max_drawdowns = []
     all_equity_curves = []  # Store all simulation paths
 
     for _ in range(simulations):
-        sample = np.random.choice(clean, size=n_steps, replace=True)
+        sample = rng.choice(clean, size=n_steps, replace=True)
         total = (1 + sample).prod() - 1
         sim_returns.append(total * 100)
 
@@ -422,7 +602,170 @@ def _run_monte_carlo(returns: pd.Series, simulations: int = 1000, initial_capita
         "simulationPaths": simulation_paths,
         "percentilePaths": percentile_paths,
         "pathSteps": len(sample_indices),
+        "seed": seed,
     }
+
+
+
+def _build_assumptions(commission_bps: float, slippage_bps: float, periods_per_year: float, seed: int) -> Dict[str, Any]:
+    return {
+        "execution": "signal on bar close, filled at next bar open",
+        "sizing": "100% of equity, fractional shares",
+        "commission_bps": commission_bps,
+        "slippage_bps": slippage_bps,
+        "benchmark": "buy-and-hold from first close, normalized to initial capital",
+        "periodsPerYear": periods_per_year,
+        "monteCarloSeed": seed,
+    }
+
+
+def _compute_metrics(
+    res_df: pd.DataFrame,
+    trades: List[Dict[str, Any]],
+    initial_capital: float,
+    periods_per_year: float,
+) -> Dict[str, Any]:
+    equity = res_df['equity']
+    final_equity = float(equity.iloc[-1])
+    total_return = ((final_equity - initial_capital) / initial_capital) * 100
+    min_drawdown = float(res_df['drawdown'].min())
+    max_drawdown = min_drawdown * 100
+
+    returns = res_df['strategy_returns']
+    ann = np.sqrt(periods_per_year)
+    std = returns.std()
+    has_std = bool(np.isfinite(std) and std > 0)
+    sharpe_ratio = (returns.mean() / std) * ann if has_std else 0
+    downside = returns[returns < 0]
+    down_std = downside.std()
+    sortino_ratio = (returns.mean() / down_std) * ann if (np.isfinite(down_std) and down_std > 0) else 0
+    annual_volatility = float(std * ann * 100) if has_std else 0
+
+    n_returns = len(res_df) - 1
+    if n_returns > 0 and final_equity > 0:
+        annual_return = (final_equity / initial_capital) ** (periods_per_year / n_returns) - 1
+    elif final_equity <= 0:
+        annual_return = -1.0
+    else:
+        annual_return = 0.0
+    calmar_ratio = annual_return / abs(min_drawdown) if min_drawdown != 0 else 0
+    max_dd_duration = _compute_drawdown_duration(res_df['drawdown'])
+
+    positions = res_df['position'].fillna(0)
+    time_in_market = round((positions != 0).sum() / len(positions) * 100, 1) if len(positions) > 0 else 0
+
+    total_trades = len(trades)
+    win_rate = 0.0
+    if total_trades > 0:
+        wins = len([t for t in trades if (t.get('pnl') or 0) > 0])
+        win_rate = (wins / total_trades) * 100
+
+    adv = _compute_advanced_trade_metrics(trades)
+    first_close = float(res_df['Close'].iloc[0])
+    benchmark_return = (float(res_df['Close'].iloc[-1]) / first_close - 1) * 100 if first_close else 0
+
+    return {
+        "totalReturn": round(total_return, 2),
+        "maxDrawdown": round(max_drawdown, 2),
+        "sharpeRatio": round(float(sharpe_ratio), 2),
+        "sortinoRatio": round(float(sortino_ratio), 2),
+        "calmarRatio": round(float(calmar_ratio), 2),
+        "maxDrawdownDuration": max_dd_duration,
+        "winRate": round(win_rate, 1),
+        "totalTrades": total_trades,
+        "initialCapital": initial_capital,
+        "finalEquity": round(final_equity, 6),
+        "annualReturn": round(float(annual_return) * 100, 2),
+        "annualVolatility": round(annual_volatility, 2),
+        "timeInMarket": time_in_market,
+        "benchmarkReturn": round(benchmark_return, 2),
+        "profitFactor": adv["profitFactor"],
+        "expectancy": adv["expectancy"],
+        "sqn": adv["sqn"],
+        "avgWin": adv["avgWin"],
+        "avgLoss": adv["avgLoss"],
+        "maxConsecutiveWins": adv["maxConsecutiveWins"],
+        "maxConsecutiveLosses": adv["maxConsecutiveLosses"],
+        "bestTrade": adv["bestTrade"],
+        "worstTrade": adv["worstTrade"],
+    }
+
+
+def _build_chart_data(res_df: pd.DataFrame) -> List[Dict[str, Any]]:
+    # Columns that are bookkeeping rather than indicators.
+    exclude_cols = {
+        'Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'equity', 'drawdown',
+        'strategy_returns', 'peak', 'pct_change', 'position', 'target', 'signal', 'benchmark',
+    }
+    chart_data = []
+    for _, row in res_df.iterrows():
+        data_point = {
+            "date": str(row['Date']),
+            "equity": round(row['equity'], 2),
+            "drawdown": round(row['drawdown'] * 100, 2),  # Percentage
+            "close": row['Close'],
+            "benchmark": round(row['benchmark'], 2),
+            "position": int(row['position']),
+        }
+        # Add all other numeric columns (indicators) to data_point
+        for col in res_df.columns:
+            if col not in exclude_cols:
+                val = row[col]
+                if isinstance(val, (int, float, np.number)):
+                    if not math.isnan(val) and not math.isinf(val):
+                        data_point[col] = val
+                    else:
+                        data_point[col] = None
+        chart_data.append(data_point)
+    return chart_data
+
+
+def _evaluate_strategy(
+    df: pd.DataFrame,
+    strategy_name: str,
+    params: Optional[Dict[str, Any]],
+    initial_capital: float,
+    periods_per_year: float,
+    commission_bps: float,
+    slippage_bps: float,
+    seed: int,
+) -> Dict[str, Any]:
+    """Shared by the single and multi-strategy paths so both give identical results."""
+    res_df, trades = run_strategy_on_df(
+        df, strategy_name, params, initial_capital, commission_bps, slippage_bps
+    )
+    return {
+        "res_df": res_df,
+        "trades": trades,
+        "metrics": _compute_metrics(res_df, trades, initial_capital, periods_per_year),
+        "monteCarlo": _run_monte_carlo(
+            res_df['strategy_returns'], initial_capital=initial_capital, seed=seed
+        ),
+    }
+
+
+def _validate_run_settings(
+    range_period: str,
+    interval: str,
+    initial_capital: Any,
+    commission_bps: Any,
+    slippage_bps: Any,
+    seed: Any,
+    start_date: Optional[str],
+    end_date: Optional[str],
+) -> Tuple[float, float, float, float, int]:
+    """Returns (initial_capital, commission_bps, slippage_bps, periods_per_year, seed)."""
+    ppy = get_periods_per_year(interval)
+    if not (start_date and end_date):
+        validate_range(range_period)
+    return (
+        validate_initial_capital(initial_capital),
+        validate_bps(commission_bps, "commission_bps"),
+        validate_bps(slippage_bps, "slippage_bps"),
+        ppy,
+        validate_seed(seed),
+    )
+
 
 def run_backtest_service(
     symbol: str,
@@ -430,15 +773,27 @@ def run_backtest_service(
     range_period: str = "1y",
     interval: str = "1d",
     market: str = "us",
-    initial_capital: float = 100000,
+    initial_capital: float = DEFAULT_INITIAL_CAPITAL,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
+    commission_bps: float = 0.0,
+    slippage_bps: float = 0.0,
+    seed: int = DEFAULT_MONTE_CARLO_SEED,
     **params
 ) -> Dict[str, Any]:
     """
     Runs a backtest for a given strategy and symbol.
     Returns D3-ready equity curve, drawdown, and signals.
     """
+    interval = str(interval or "1d").strip().lower()
+    try:
+        initial_capital, commission_bps, slippage_bps, ppy, seed = _validate_run_settings(
+            range_period, interval, initial_capital, commission_bps, slippage_bps, seed,
+            start_date, end_date,
+        )
+    except ValueError as e:
+        return {"error": str(e)}
+
     # 1. Fetch Data
     # fetch_candles returns list of dictionaries. Convert to DataFrame.
     candles = _fetch_candles_with_fallback(
@@ -453,116 +808,32 @@ def run_backtest_service(
         return {"error": f"No data found for symbol '{symbol}' in market '{market}'. Try a valid ticker or switch market."}
 
     df = prepare_candles_df(candles)
-    
-    # Ensure Date is index if needed or keep as column. 
-    # Strategies might need reset index or not. 
-    # EMACrossoverStrategy expects columns.
-    
-    # 2. Initialize Strategy
+
+    # 2. Run the strategy through the shared execution engine
     try:
-        res_df = run_backtest_on_df(df, strategy_name, initial_capital=initial_capital, **params)
+        evaluated = _evaluate_strategy(
+            df, strategy_name, params, initial_capital, ppy, commission_bps, slippage_bps, seed
+        )
     except Exception as e:
         return {"error": f"Strategy error: {str(e)}"}
-    
-    # 5. Format for Frontend
-    # Need lists for charts: {date, equity}, {date, drawdown}
-    chart_data = []
-    trade_signals = []
-    
-    for idx, row in res_df.iterrows():
-        # Ensure date is string
-        date_str = str(row['Date'])
-        
-        data_point = {
-            "date": date_str,
-            "equity": round(row['equity'], 2),
-            "drawdown": round(row['drawdown'] * 100, 2), # Percentage
-            "close": row['Close']
-        }
-        
-        # Add all other numeric columns (indicators) to data_point
-        # Exclude standard columns we already handled or don't want
-        exclude_cols = {'Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'equity', 'drawdown', 'strategy_returns', 'peak', 'pct_change', 'position', 'signal'}
-        
-        for col in res_df.columns:
-            if col not in exclude_cols:
-                val = row[col]
-                # Check if numeric
-                if isinstance(val, (int, float, np.number)):
-                    # Check for nan/inf
-                    if not math.isnan(val) and not math.isinf(val):
-                        data_point[col] = val
-                    else:
-                        data_point[col] = None
-        
-        chart_data.append(data_point)
-        
-        if 'signal' in row:
-            if row['signal'] == 1:
-                trade_signals.append({"date": date_str, "type": "buy", "price": _safe_number(row['Close'])})
-            elif row['signal'] == -1:
-                trade_signals.append({"date": date_str, "type": "sell", "price": _safe_number(row['Close'])})
 
-    # Summary Metrics
-    total_return = ((res_df['equity'].iloc[-1] - initial_capital) / initial_capital) * 100
-    max_drawdown = res_df['drawdown'].min() * 100
-    
-    # Calculate additional metrics
-    returns = res_df['strategy_returns']
-    sharpe_ratio = (returns.mean() / returns.std()) * np.sqrt(252) if returns.std() != 0 else 0
-    downside = returns[returns < 0]
-    sortino_ratio = (returns.mean() / downside.std()) * np.sqrt(252) if downside.std() != 0 else 0
-    annual_volatility = float(returns.std() * np.sqrt(252) * 100) if returns.std() != 0 else 0
+    res_df = evaluated["res_df"]
+    trades = evaluated["trades"]
 
-    periods = max(len(res_df), 1)
-    annual_return = (res_df['equity'].iloc[-1] / initial_capital) ** (252 / periods) - 1 if periods > 1 else 0
-    calmar_ratio = annual_return / abs(res_df['drawdown'].min()) if res_df['drawdown'].min() != 0 else 0
-    max_dd_duration = _compute_drawdown_duration(res_df['drawdown'])
+    # 3. Format for Frontend
+    chart_data = _build_chart_data(res_df)
 
-    # Time in market
-    positions = res_df['position'].fillna(0)
-    time_in_market = round((positions != 0).sum() / len(positions) * 100, 1) if len(positions) > 0 else 0
-
-    trades = _extract_trades(res_df, strategy_name)
-    total_trades = len(trades)
-    win_rate = 0.0
-    if total_trades > 0:
-        wins = len([t for t in trades if (t.get('pnl') or 0) > 0])
-        win_rate = (wins / total_trades) * 100
-
-    # Advanced trade metrics
-    adv = _compute_advanced_trade_metrics(trades)
-    
     return {
         "symbol": symbol,
         "strategy": strategy_name,
-        "metrics": {
-            "totalReturn": round(total_return, 2),
-            "maxDrawdown": round(max_drawdown, 2),
-            "sharpeRatio": round(sharpe_ratio, 2),
-            "sortinoRatio": round(sortino_ratio, 2),
-            "calmarRatio": round(calmar_ratio, 2),
-            "maxDrawdownDuration": max_dd_duration,
-            "winRate": round(win_rate, 1),
-            "totalTrades": total_trades,
-            "initialCapital": initial_capital,
-            "finalEquity": round(res_df['equity'].iloc[-1], 2),
-            "annualVolatility": round(annual_volatility, 2),
-            "timeInMarket": time_in_market,
-            "profitFactor": adv["profitFactor"],
-            "expectancy": adv["expectancy"],
-            "sqn": adv["sqn"],
-            "avgWin": adv["avgWin"],
-            "avgLoss": adv["avgLoss"],
-            "maxConsecutiveWins": adv["maxConsecutiveWins"],
-            "maxConsecutiveLosses": adv["maxConsecutiveLosses"],
-            "bestTrade": adv["bestTrade"],
-            "worstTrade": adv["worstTrade"],
-        },
+        "initialCapital": initial_capital,
+        "metrics": evaluated["metrics"],
         "chartData": chart_data,
         "trades": trades,
-        "equity_curve": [{**d, "value": d["equity"], "benchmark": d["close"]} for d in chart_data],
-        "monteCarlo": _run_monte_carlo(returns, initial_capital=initial_capital)
+        # value = strategy equity, benchmark = buy-and-hold, both in account currency
+        "equity_curve": [{**d, "value": d["equity"], "benchmark": d["benchmark"]} for d in chart_data],
+        "monteCarlo": evaluated["monteCarlo"],
+        "assumptions": _build_assumptions(commission_bps, slippage_bps, ppy, seed),
     }
 
 
@@ -572,10 +843,13 @@ def run_multi_strategy_backtest(
     range_period: str = "1y",
     interval: str = "1d",
     market: str = "us",
-    initial_capital: float = 100000,
+    initial_capital: float = DEFAULT_INITIAL_CAPITAL,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
-    params_dict: Dict[str, Dict] = None
+    params_dict: Dict[str, Dict] = None,
+    commission_bps: float = 0.0,
+    slippage_bps: float = 0.0,
+    seed: int = DEFAULT_MONTE_CARLO_SEED,
 ) -> Dict[str, Any]:
     """
     Runs backtest for multiple strategies and compares them.
@@ -583,7 +857,16 @@ def run_multi_strategy_backtest(
     """
     if params_dict is None:
         params_dict = {}
-    
+
+    interval = str(interval or "1d").strip().lower()
+    try:
+        initial_capital, commission_bps, slippage_bps, ppy, seed = _validate_run_settings(
+            range_period, interval, initial_capital, commission_bps, slippage_bps, seed,
+            start_date, end_date,
+        )
+    except ValueError as e:
+        return {"error": str(e)}
+
     # Fetch data once
     candles = _fetch_candles_with_fallback(
         symbol=symbol,
@@ -595,99 +878,49 @@ def run_multi_strategy_backtest(
     )
     if not candles:
         return {"error": f"No data found for symbol '{symbol}' in market '{market}'. Try a valid ticker or switch market."}
-        
-    df = pd.DataFrame(candles)
-    df.rename(columns={
-        "date": "Date",
-        "open": "Open", 
-        "high": "High", 
-        "low": "Low", 
-        "close": "Close", 
-        "volume": "Volume"
-    }, inplace=True)
-    
+
+    df = prepare_candles_df(candles)
+
     strategy_results = {}
     combined_chart_data = []
-    
+    benchmark_curve: List[Dict[str, Any]] = []
+
     # Generate color palette for strategies
     colors = ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899']
-    
+
     for idx, strategy_name in enumerate(strategy_names):
         params = params_dict.get(strategy_name, {})
-        
+
         try:
-            strategy = get_strategy(strategy_name, **params)
-            res_df = strategy.generate_signals(df.copy())
-            res_df = _compute_equity_from_signals(res_df, initial_capital, strategy_name)
-            
-            # Calculate metrics
-            total_return = ((res_df['equity'].iloc[-1] - initial_capital) / initial_capital) * 100
-            max_drawdown = res_df['drawdown'].min() * 100
-            returns = res_df['strategy_returns']
-            sharpe_ratio = (returns.mean() / returns.std()) * np.sqrt(252) if returns.std() != 0 else 0
-            downside = returns[returns < 0]
-            sortino_ratio = (returns.mean() / downside.std()) * np.sqrt(252) if downside.std() != 0 else 0
-            annual_volatility = float(returns.std() * np.sqrt(252) * 100) if returns.std() != 0 else 0
+            evaluated = _evaluate_strategy(
+                df, strategy_name, params, initial_capital, ppy, commission_bps, slippage_bps, seed
+            )
+            res_df = evaluated["res_df"]
+            if not benchmark_curve:
+                benchmark_curve = [
+                    {"date": str(row['Date']), "value": round(row['benchmark'], 2)}
+                    for _, row in res_df.iterrows()
+                ]
 
-            periods = max(len(res_df), 1)
-            annual_return = (res_df['equity'].iloc[-1] / initial_capital) ** (252 / periods) - 1 if periods > 1 else 0
-            calmar_ratio = annual_return / abs(res_df['drawdown'].min()) if res_df['drawdown'].min() != 0 else 0
-            max_dd_duration = _compute_drawdown_duration(res_df['drawdown'])
-
-            # Time in market
-            positions = res_df['position'].fillna(0)
-            time_in_market = round((positions != 0).sum() / len(positions) * 100, 1) if len(positions) > 0 else 0
-
-            trades = _extract_trades(res_df, strategy_name)
-            total_trades = len(trades)
-            win_rate = 0.0
-            if total_trades > 0:
-                wins = len([t for t in trades if (t.get('pnl') or 0) > 0])
-                win_rate = (wins / total_trades) * 100
-
-            # Advanced trade metrics
-            adv = _compute_advanced_trade_metrics(trades)
-            
             strategy_results[strategy_name] = {
                 "name": strategy_name,
                 "color": colors[idx % len(colors)],
-                "metrics": {
-                    "totalReturn": round(total_return, 2),
-                    "maxDrawdown": round(max_drawdown, 2),
-                    "sharpeRatio": round(sharpe_ratio, 2),
-                    "sortinoRatio": round(sortino_ratio, 2),
-                    "calmarRatio": round(calmar_ratio, 2),
-                    "maxDrawdownDuration": max_dd_duration,
-                    "winRate": round(win_rate, 1),
-                    "totalTrades": total_trades,
-                    "finalEquity": round(res_df['equity'].iloc[-1], 2),
-                    "annualVolatility": round(annual_volatility, 2),
-                    "timeInMarket": time_in_market,
-                    "profitFactor": adv["profitFactor"],
-                    "expectancy": adv["expectancy"],
-                    "sqn": adv["sqn"],
-                    "avgWin": adv["avgWin"],
-                    "avgLoss": adv["avgLoss"],
-                    "maxConsecutiveWins": adv["maxConsecutiveWins"],
-                    "maxConsecutiveLosses": adv["maxConsecutiveLosses"],
-                    "bestTrade": adv["bestTrade"],
-                    "worstTrade": adv["worstTrade"],
-                },
-                "trades": trades,
-                "monteCarlo": _run_monte_carlo(returns, initial_capital=initial_capital),
+                "metrics": evaluated["metrics"],
+                "trades": evaluated["trades"],
+                "monteCarlo": evaluated["monteCarlo"],
                 "equityCurve": [
                     {"date": str(row['Date']), "value": round(row['equity'], 2)}
                     for _, row in res_df.iterrows()
                 ]
             }
-            
+
         except Exception as e:
             strategy_results[strategy_name] = {
                 "name": strategy_name,
                 "error": str(e),
                 "metrics": None
             }
-    
+
     # Build combined chart data (merge all equity curves)
     # Use first strategy's dates as reference
     first_valid = None
@@ -695,7 +928,7 @@ def run_multi_strategy_backtest(
         if "equityCurve" in result:
             first_valid = result
             break
-    
+
     if first_valid:
         for i, point in enumerate(first_valid["equityCurve"]):
             data_point = {"date": point["date"]}
@@ -703,23 +936,25 @@ def run_multi_strategy_backtest(
                 if "equityCurve" in result and i < len(result["equityCurve"]):
                     data_point[name] = result["equityCurve"][i]["value"]
             combined_chart_data.append(data_point)
-    
+
     # Rank strategies by total return
     ranked = sorted(
-        [(name, res["metrics"]["totalReturn"]) 
-         for name, res in strategy_results.items() 
+        [(name, res["metrics"]["totalReturn"])
+         for name, res in strategy_results.items()
          if res.get("metrics")],
         key=lambda x: x[1],
         reverse=True
     )
-    
+
     return {
         "symbol": symbol,
         "mode": "multi_strategy",
         "strategies": strategy_results,
         "combinedChartData": combined_chart_data,
+        "benchmarkCurve": benchmark_curve,
         "ranking": [{"strategy": name, "return": ret} for name, ret in ranked],
-        "initialCapital": initial_capital
+        "initialCapital": initial_capital,
+        "assumptions": _build_assumptions(commission_bps, slippage_bps, ppy, seed),
     }
 
 

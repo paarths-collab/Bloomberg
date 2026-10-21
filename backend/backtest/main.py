@@ -2,7 +2,20 @@ import math
 import matplotlib
 from fastapi import APIRouter, HTTPException, Body, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, Response
-from .service import run_backtest_service, run_multi_strategy_backtest, generate_backtest_report, prepare_candles_df, run_backtest_on_df, fetch_candles
+from .service import (
+    run_backtest_service,
+    run_multi_strategy_backtest,
+    generate_backtest_report,
+    prepare_candles_df,
+    run_backtest_on_df,
+    fetch_candles,
+    validate_initial_capital,
+    validate_bps,
+    validate_seed,
+    strip_run_options,
+    DEFAULT_INITIAL_CAPITAL,
+    DEFAULT_MONTE_CARLO_SEED,
+)
 from .core.groq_agent import GroqAgent
 from .core.strategy_adapter import STRATEGY_REGISTRY
 from typing import Dict, Any, List
@@ -73,6 +86,54 @@ def _normalize_strategy_params(strategy: str, params: Dict[str, Any]) -> Dict[st
             normalized["std_dev"] = normalized.pop("std")
 
     return normalized
+
+
+def _resolve_run_options(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Single normalisation of the run-level options used by /run, /heatmap, /quantstats-report
+    and the WebSocket path: initial capital, trading costs and the Monte Carlo seed.
+
+    Lookup order: top-level payload (initial_capital, then the initialCapital alias), then
+    `params` (flat), then any per-strategy dict inside `params` (backward compatible).
+    Raises HTTPException(400) on invalid values.
+    """
+    raw_params = payload.get("params")
+    sources: List[Dict[str, Any]] = [payload]
+    if isinstance(raw_params, dict):
+        sources.append(raw_params)
+        sources.extend(v for v in raw_params.values() if isinstance(v, dict))
+
+    def pick(*names):
+        for src in sources:
+            for name in names:
+                if src.get(name) is not None:
+                    return src[name]
+        return None
+
+    capital = pick("initial_capital", "initialCapital")
+    commission = pick("commission_bps")
+    slippage = pick("slippage_bps")
+    seed = pick("seed")
+    try:
+        return {
+            "initial_capital": validate_initial_capital(DEFAULT_INITIAL_CAPITAL if capital is None else capital),
+            "commission_bps": validate_bps(0.0 if commission is None else commission, "commission_bps"),
+            "slippage_bps": validate_bps(0.0 if slippage is None else slippage, "slippage_bps"),
+            "seed": validate_seed(DEFAULT_MONTE_CARLO_SEED if seed is None else seed),
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+def _extract_single_strategy_params(strategy: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Strategy ctor params for one strategy, without run-level options."""
+    params = payload.get("params") or {}
+    if not isinstance(params, dict):
+        params = {}
+    # params may be keyed by strategy id, or flat
+    if strategy in params and isinstance(params[strategy], dict):
+        params = params[strategy]
+    return _normalize_strategy_params(strategy, strip_run_options(params))
 
 
 @router.post("/interpret")
@@ -364,10 +425,17 @@ async def backtest_websocket(websocket: WebSocket):
             
             # Run backtest in thread pool to avoid blocking
             try:
-                strategy = payload.get("strategy") or payload.get("strategies", [None])[0]
+                strategy = payload.get("strategy") or (payload.get("strategies") or [None])[0]
                 if not strategy:
                     await websocket.send_json({"error": "Strategy is required"})
                     continue
+                strategy = _normalize_strategy_name(strategy)
+                try:
+                    run_options = _resolve_run_options(payload)
+                except HTTPException as http_err:
+                    await websocket.send_json({"error": http_err.detail})
+                    continue
+                strategy_params = _extract_single_strategy_params(strategy, payload)
                 
                 # Send data fetching status
                 await websocket.send_json({
@@ -385,7 +453,8 @@ async def backtest_websocket(websocket: WebSocket):
                     market=payload.get("market", "us"),
                     start_date=payload.get("start"),
                     end_date=payload.get("end"),
-                    **payload.get("params", {})
+                    **run_options,
+                    **strategy_params
                 )
                 
                 if "error" in result:
@@ -486,6 +555,7 @@ def run_simulation(
         market = payload.get("market", "us")
         start_date = payload.get("start")
         end_date = payload.get("end")
+        run_options = _resolve_run_options(payload)
         
         # Check for multiple strategies
         strategies = payload.get("strategies")
@@ -502,7 +572,11 @@ def run_simulation(
                 strategy_params = {}
                 if isinstance(raw_params_dict, dict):
                     strategy_params = raw_params_dict.get(raw_strategy) or raw_params_dict.get(normalized_strategy) or {}
-                normalized_params_dict[normalized_strategy] = _normalize_strategy_params(normalized_strategy, strategy_params)
+                if not isinstance(strategy_params, dict):
+                    strategy_params = {}
+                normalized_params_dict[normalized_strategy] = _normalize_strategy_params(
+                    normalized_strategy, strip_run_options(strategy_params)
+                )
             
             result = run_multi_strategy_backtest(
                 symbol=symbol,
@@ -512,7 +586,8 @@ def run_simulation(
                 market=market,
                 start_date=start_date,
                 end_date=end_date,
-                params_dict=normalized_params_dict
+                params_dict=normalized_params_dict,
+                **run_options
             )
         else:
             # Single strategy mode (backward compatible)
@@ -521,11 +596,8 @@ def run_simulation(
                 raise HTTPException(status_code=400, detail="Strategy is required")
             strategy = _normalize_strategy_name(strategy)
                 
-            params = payload.get("params", {})
-            # If params is a dict of strategy params, extract the right one
-            if isinstance(params, dict) and strategy in params:
-                params = params[strategy]
-            params = _normalize_strategy_params(strategy, params)
+            # If params is a dict keyed by strategy id, extract the right one
+            params = _extract_single_strategy_params(strategy, payload)
             
             result = run_backtest_service(
                 symbol=symbol,
@@ -535,6 +607,7 @@ def run_simulation(
                 market=market,
                 start_date=start_date,
                 end_date=end_date,
+                **run_options,
                 **params
             )
         
@@ -572,7 +645,8 @@ def get_available_strategies():
     strategies = []
     for strategy_id, strategy_cls in STRATEGY_REGISTRY.items():
         try:
-            params = strategy_cls().parameters()
+            # `parameters` is a dict attribute on the instance (default ctor values)
+            params = dict(strategy_cls().parameters)
         except Exception:
             params = {}
         name = getattr(strategy_cls, "name", strategy_id.replace("_", " ").title())
@@ -606,6 +680,7 @@ def run_heatmap(payload: Dict[str, Any] = Body(...)):
             raise HTTPException(status_code=400, detail="Symbol and strategy are required")
 
         range_period = payload.get("range", "1y")
+        run_options = _resolve_run_options(payload)
 
         heatmap_config = {
             "ema_crossover": {
@@ -661,12 +736,16 @@ def run_heatmap(payload: Dict[str, Any] = Body(...)):
         x_values = payload.get("x_values", config["x_values"])
         y_values = payload.get("y_values", config["y_values"])
 
-        candles = fetch_candles(symbol, "1d", range_period)
+        try:
+            candles = fetch_candles(symbol, "1d", range_period)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
         if not candles:
             raise HTTPException(status_code=400, detail="No data found for heatmap")
 
         df = prepare_candles_df(candles)
         values = []
+        run_options_engine = {k: v for k, v in run_options.items() if k != "seed"}
 
         for y in y_values:
             row = []
@@ -682,8 +761,11 @@ def run_heatmap(payload: Dict[str, Any] = Body(...)):
                     continue
 
                 try:
-                    res_df = run_backtest_on_df(df, strategy, **params)
-                    total_return = ((res_df['equity'].iloc[-1] - 100000) / 100000) * 100
+                    res_df = run_backtest_on_df(
+                        df, strategy, **run_options_engine, **_normalize_strategy_params(strategy, params)
+                    )
+                    initial_capital = run_options["initial_capital"]
+                    total_return = ((res_df['equity'].iloc[-1] - initial_capital) / initial_capital) * 100
                     row.append(round(float(total_return), 2))
                 except Exception:
                     row.append(None)
@@ -785,9 +867,6 @@ def generate_quantstats_report(payload: Dict[str, Any] = Body(...)):
         "benchmark": "SPY"
     }
     """
-    import quantstats as qs
-    import pandas as pd
-
     symbol = payload.get("symbol")
     strategy_name = payload.get("strategy")
     if not symbol or not strategy_name:
@@ -795,19 +874,27 @@ def generate_quantstats_report(payload: Dict[str, Any] = Body(...)):
 
     range_period = payload.get("range", "1y")
     strategy_name = _normalize_strategy_name(strategy_name)
-    params = _normalize_strategy_params(strategy_name, payload.get("params", {}))
+    params = _extract_single_strategy_params(strategy_name, payload)
+    run_options = {k: v for k, v in _resolve_run_options(payload).items() if k != "seed"}
     benchmark = payload.get("benchmark", "SPY")
+
+    # Heavy imports only after the request has been validated.
+    import quantstats as qs
+    import pandas as pd
 
     try:
         # 1. Fetch candles and prepare DataFrame
-        candles = fetch_candles(symbol, "1d", range_period)
+        try:
+            candles = fetch_candles(symbol, "1d", range_period)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
         if not candles:
             raise HTTPException(status_code=400, detail="No market data found")
 
         df = prepare_candles_df(candles)
 
         # 2. Run backtest to get strategy returns
-        res_df = run_backtest_on_df(df, strategy_name, initial_capital=100000, **params)
+        res_df = run_backtest_on_df(df, strategy_name, **run_options, **params)
 
         # 3. Extract daily strategy returns as a proper pandas Series
         returns = res_df["strategy_returns"].copy()

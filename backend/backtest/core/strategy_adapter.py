@@ -16,6 +16,8 @@ from typing import Dict, Any
 class BaseStrategy:
     name: str = "base"
     parameters: Dict[str, Any] = {}
+    # True for long/flat strategies: a -1 signal means "exit to cash", never "go short".
+    long_only: bool = False
 
     def generate_signals(self, df: pd.DataFrame) -> pd.DataFrame:
         raise NotImplementedError
@@ -220,6 +222,7 @@ class RSIReversalStrategy(BaseStrategy):
 
 class FibonacciPullbackStrategy(BaseStrategy):
     name = "Fibonacci Pullback"
+    long_only = True  # -1 is an exit (reached the old high), not a short signal
 
     def __init__(self, lookback: int = 50):
         self.lookback = int(lookback)
@@ -234,7 +237,7 @@ class FibonacciPullbackStrategy(BaseStrategy):
         df["signal"] = 0
         # Buy on pullback to 61.8% level
         df.loc[(df["Close"] <= df["fib_618"]) & (df["Close"].shift(1) > df["fib_618"]), "signal"] = 1
-        # Exit when reaching old high
+        # Exit (go flat) when reaching old high; the engine treats -1 as flat for long_only strategies
         df.loc[df["Close"] >= df["hh"].shift(1), "signal"] = -1
         return df
 
