@@ -2,6 +2,7 @@ import os
 import re
 import logging
 from contextlib import contextmanager
+from urllib.parse import unquote
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
@@ -15,9 +16,22 @@ logger = logging.getLogger(__name__)
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./boomerang.db")
 SQLITE_FALLBACK_URL = os.getenv("SQLITE_FALLBACK_URL", "sqlite:///./boomerang.db")
-DB_FALLBACK_TO_SQLITE = os.getenv("DB_FALLBACK_TO_SQLITE", "true").lower() == "true"
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    """Parse a boolean environment variable ("true" enables it)."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() == "true"
+
+
+# Explicit opt-in: silently switching a hosted service from a configured remote
+# database to a local SQLite file would create divergent, ephemeral data.
+DB_FALLBACK_TO_SQLITE = _env_flag("DB_FALLBACK_TO_SQLITE", default=False)
 
 _active_database_url = DATABASE_URL
+_fallback_active = False
 
 
 def _engine_options_for(db_url: str):
@@ -43,12 +57,32 @@ def _create_engine_for(db_url: str):
 
 
 def _safe_db_url(db_url: str) -> str:
-    if "@" in db_url and "://" in db_url:
-        prefix, rest = db_url.split("://", 1)
-        if "@" in rest:
-            _, tail = rest.split("@", 1)
-            return f"{prefix}://***:***@{tail}"
+    """Return a loggable form of a DB URL with username and password masked."""
+    if "://" not in db_url:
+        return "<unparseable database url>"
+    prefix, rest = db_url.split("://", 1)
+    if "@" in rest:
+        # Split on the LAST "@" so passwords containing "@" are fully masked.
+        _, tail = rest.rsplit("@", 1)
+        return f"{prefix}://***:***@{tail}"
     return db_url
+
+
+def redact_db_secrets(message: str) -> str:
+    """Strip configured database URLs/credentials from free text (e.g. exception messages)."""
+    redacted = str(message)
+    for url in (DATABASE_URL, SQLITE_FALLBACK_URL, _active_database_url):
+        if not url or "://" not in url:
+            continue
+        redacted = redacted.replace(url, _safe_db_url(url))
+        authority = url.split("://", 1)[1].rsplit("@", 1)[0] if "@" in url else ""
+        if authority:
+            user, _, password = authority.partition(":")
+            for secret in (password, user):
+                if secret:
+                    redacted = redacted.replace(secret, "***")
+                    redacted = redacted.replace(unquote(secret), "***")
+    return redacted
 
 # Lazy engine creation
 _engine = None
@@ -61,16 +95,27 @@ def get_engine():
 
 
 def get_active_database_url() -> str:
+    """Raw active URL (may contain credentials). Internal use only; never log or return it."""
     return _active_database_url
 
 
+def get_database_status() -> dict:
+    """Safe, non-sensitive database status fields suitable for the /health response."""
+    return {
+        "database_connected": check_db_connection(),
+        "database_fallback_active": _fallback_active,
+    }
+
+
 def switch_to_sqlite_fallback(reason: str = ""):
-    global _engine, _active_database_url
+    global _engine, _active_database_url, _fallback_active
     if _active_database_url.startswith("sqlite"):
         return
 
     previous_url = _active_database_url
+    safe_reason = redact_db_secrets(reason)  # before the active URL changes
     _active_database_url = SQLITE_FALLBACK_URL
+    _fallback_active = True
 
     if _engine is not None:
         try:
@@ -83,7 +128,7 @@ def switch_to_sqlite_fallback(reason: str = ""):
         "Database fallback activated. previous_url=%s fallback_url=%s reason=%s",
         _safe_db_url(previous_url),
         _safe_db_url(_active_database_url),
-        reason,
+        safe_reason,
     )
 
 # For backwards compatibility (engine instance)
@@ -150,7 +195,7 @@ def init_db():
         Base.metadata.create_all(bind=get_engine())
     except SQLAlchemyError as e:
         if DB_FALLBACK_TO_SQLITE and not get_active_database_url().startswith("sqlite"):
-            switch_to_sqlite_fallback(reason=f"init_db failed: {e}")
+            switch_to_sqlite_fallback(reason=f"init_db failed: {type(e).__name__}: {e}")
             Base.metadata.create_all(bind=get_engine())
         else:
             raise
@@ -159,7 +204,7 @@ def run_init_sql():
     """Run init.sql to create tables that might not be in ORM (like user_profiles)"""
     init_sql_path = os.path.join(os.path.dirname(__file__), "init.sql")
     if os.path.exists(init_sql_path):
-        print(f"Running init.sql from {init_sql_path}...")
+        logger.info("Running init.sql from %s...", init_sql_path)
         with open(init_sql_path, "r") as f:
             sql_script = f.read()
 
@@ -232,10 +277,13 @@ def run_init_sql():
                 except Exception as e:
                     # Critical: reset failed transaction so subsequent statements can run.
                     connection.rollback()
-                    print(f"Warning executing statement: {e}")
-                    print(f"[SQL: {statement[:200]}]")
+                    logger.warning(
+                        "Warning executing statement: %s [SQL: %s]",
+                        redact_db_secrets(str(e)),
+                        statement[:200],
+                    )
 
-        print("init.sql executed successfully.")
+        logger.info("init.sql executed successfully.")
 
 # =====================================================
 # HEALTH CHECK
@@ -248,5 +296,10 @@ def check_db_connection() -> bool:
             conn.execute(text("SELECT 1"))
         return True
     except Exception as e:
-        print(f"Database connection failed ({get_active_database_url()}): {e}")
+        logger.error(
+            "Database connection failed (%s): %s: %s",
+            _safe_db_url(get_active_database_url()),
+            type(e).__name__,
+            redact_db_secrets(str(e)),
+        )
         return False

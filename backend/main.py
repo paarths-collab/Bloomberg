@@ -61,7 +61,7 @@ async def global_exception_handler(request: Request, exc: Exception):
         status_code=500,
         content={
             "status": "error",
-            "message": str(exc)
+            "message": "Internal server error"
         }
     )
 
@@ -77,9 +77,31 @@ default_origins = [
     "http://127.0.0.1:3000",
     "http://127.0.0.1:3001",
 ]
+
+
+def parse_cors_origins(raw, defaults=None):
+    """Merge a comma-separated CORS_ORIGINS value with the default origins.
+
+    Items are whitespace-trimmed; empty items are ignored. A literal "*" is
+    ignored (with a warning) because credentialed CORS must use explicit origins.
+    """
+    origins = list(default_origins if defaults is None else defaults)
+    for item in (raw or "").split(","):
+        origin = item.strip().rstrip("/")
+        if not origin:
+            continue
+        if origin == "*":
+            logger.warning("Ignoring wildcard '*' in CORS_ORIGINS: credentials are enabled, list explicit origins instead.")
+            continue
+        if origin not in origins:
+            origins.append(origin)
+    return origins
+
+
+cors_origins = parse_cors_origins(os.getenv("CORS_ORIGINS"))
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=default_origins,
+    allow_origins=cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -113,12 +135,14 @@ def fundamentals_summary_compat(symbol: str):
     return data
 
 # Database Initialization
-from backend.database.connection import init_db, run_init_sql, check_db_connection, get_active_database_url
+from backend.database.connection import init_db, run_init_sql, get_database_status, redact_db_secrets
 try:
     init_db()
     run_init_sql()
 except Exception as e:
-    logger.exception("Database init failed: %s", e)
+    # Keep starting so /health can report "degraded". The traceback is omitted on
+    # purpose: driver errors can embed connection details.
+    logger.error("Database init failed: %s: %s", type(e).__name__, redact_db_secrets(str(e)))
 
 # Investment Pipeline
 _pipeline = None
@@ -129,11 +153,12 @@ def _get_pipeline() -> InvestmentPipeline:
 
 @app.get("/health")
 def health_check():
+    db_status = get_database_status()
     return {
-        "status": "ok",
+        "status": "ok" if db_status["database_connected"] else "degraded",
         "version": "2.2.0-modular",
-        "database_connected": check_db_connection(),
-        "database_url": get_active_database_url(),
+        "database_connected": db_status["database_connected"],
+        "database_fallback_active": db_status["database_fallback_active"],
     }
 
 
