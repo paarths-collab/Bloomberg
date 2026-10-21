@@ -1,9 +1,37 @@
+import inspect
+import logging
 import math
 import pandas as pd
 import numpy as np
 from typing import Dict, Any, List, Optional, Tuple
-from .core.strategy_adapter import get_strategy
+from .core.strategy_adapter import get_strategy, STRATEGY_REGISTRY
 from .core.data_loader import get_history, format_ticker
+
+logger = logging.getLogger(__name__)
+
+INTERNAL_ERROR_MESSAGE = "Backtest failed due to an internal error."
+
+
+class BacktestInputError(ValueError):
+    """A problem with the request itself (bad strategy name/params); safe to show to the client."""
+
+
+def validate_strategy_params(strategy_name: Any, params: Optional[Dict[str, Any]]) -> None:
+    """Reject unknown strategies and params the strategy constructor does not accept."""
+    if not isinstance(strategy_name, str):
+        raise BacktestInputError("strategy must be a string")
+    name = strategy_name.lower().strip()
+    cls = STRATEGY_REGISTRY.get(name)
+    if cls is None:
+        available = ", ".join(STRATEGY_REGISTRY.keys())
+        raise BacktestInputError(f"Strategy '{name}' not found. Available: {available}")
+    allowed = [p for p in inspect.signature(cls.__init__).parameters if p != "self"]
+    unknown = sorted(str(k) for k in strip_run_options(params) if k not in allowed)
+    if unknown:
+        raise BacktestInputError(
+            f"Unknown parameter(s) for strategy '{name}': {', '.join(unknown)}. "
+            f"Supported: {', '.join(allowed) or 'none'}"
+        )
 
 
 DEFAULT_INITIAL_CAPITAL = 100000.0
@@ -282,9 +310,12 @@ def _simulate_execution(
         # Selling a long / covering a short: slippage always worsens the price.
         fill = raw_price * (1 - slip) if closing_side > 0 else raw_price * (1 + slip)
         proceeds = entry_base + closing_side * shares * (fill - entry_fill)
-        new_equity = max(proceeds - shares * fill * comm, 0.0)
-        if liquidated:
+        new_equity = proceeds - shares * fill * comm
+        if new_equity <= 0 or liquidated:
+            # Short gapped through zero equity (or squeezed intrabar): the account is wiped out.
             new_equity = 0.0
+            if reason != "end_of_data":
+                reason = "liquidated"
         pnl = new_equity - equity_at_entry
         trades.append({
             "side": "long" if closing_side > 0 else "short",
@@ -357,8 +388,12 @@ def run_strategy_on_df(
     slippage_bps: float = 0.0,
 ) -> Tuple[pd.DataFrame, List[Dict[str, Any]]]:
     """The one engine entry point: returns (result frame, trade ledger)."""
-    name = (strategy_name or "").lower().strip()
-    strategy = get_strategy(name, **strip_run_options(params))
+    validate_strategy_params(strategy_name, params)
+    name = strategy_name.lower().strip()
+    try:
+        strategy = get_strategy(name, **strip_run_options(params))
+    except (ValueError, TypeError) as e:
+        raise BacktestInputError(f"Invalid parameters for strategy '{name}': {e}")
     if df is None or len(df) == 0:
         raise ValueError("No price data to backtest")
     res_df = strategy.generate_signals(df.copy()).reset_index(drop=True)
@@ -538,7 +573,8 @@ def _run_monte_carlo(
         # Full equity curve for this simulation
         equity = np.cumprod(1 + sample)
         peak = np.maximum.accumulate(equity)
-        dd = ((equity - peak) / peak).min() * 100
+        # peak is 0 only on a path that lost everything on its first draw; treat that as no drawdown
+        dd = np.divide(equity - peak, peak, out=np.zeros_like(equity), where=peak > 0).min() * 100
         sim_max_drawdowns.append(dd)
 
         # Downsample the equity curve
@@ -814,8 +850,11 @@ def run_backtest_service(
         evaluated = _evaluate_strategy(
             df, strategy_name, params, initial_capital, ppy, commission_bps, slippage_bps, seed
         )
-    except Exception as e:
-        return {"error": f"Strategy error: {str(e)}"}
+    except BacktestInputError as e:
+        return {"error": str(e)}
+    except Exception:
+        logger.exception("Backtest failed for %s / %s", symbol, strategy_name)
+        return {"error": INTERNAL_ERROR_MESSAGE, "internal": True}
 
     res_df = evaluated["res_df"]
     trades = evaluated["trades"]
@@ -914,10 +953,17 @@ def run_multi_strategy_backtest(
                 ]
             }
 
-        except Exception as e:
+        except BacktestInputError as e:
             strategy_results[strategy_name] = {
                 "name": strategy_name,
                 "error": str(e),
+                "metrics": None
+            }
+        except Exception:
+            logger.exception("Backtest failed for %s / %s", symbol, strategy_name)
+            strategy_results[strategy_name] = {
+                "name": strategy_name,
+                "error": INTERNAL_ERROR_MESSAGE,
                 "metrics": None
             }
 
@@ -994,7 +1040,8 @@ def generate_backtest_report(
 
         conversion = convert_html_to_pdf(str(html_path), str(pdf_path))
         if not conversion.get("success"):
-            return {"error": conversion.get("error", "PDF conversion failed.")}
+            logger.error("PDF conversion failed: %s", conversion.get("error"))
+            return {"error": "PDF conversion failed."}
 
         return {
             "success": True,
@@ -1069,8 +1116,9 @@ def generate_csv_report(
             "filename": filename,
             "downloadUrl": f"/api/backtest/report/download/{filename}"
         }
-    except Exception as e:
-        return {"error": str(e)}
+    except Exception:
+        logger.exception("Report generation failed")
+        return {"error": "Report generation failed."}
 
 
 def generate_html_report(
@@ -1212,5 +1260,6 @@ def generate_html_report(
             "filename": filename,
             "downloadUrl": f"/api/backtest/report/download/{filename}"
         }
-    except Exception as e:
-        return {"error": str(e)}
+    except Exception:
+        logger.exception("Report generation failed")
+        return {"error": "Report generation failed."}

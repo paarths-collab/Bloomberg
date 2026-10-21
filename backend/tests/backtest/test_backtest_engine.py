@@ -1,6 +1,7 @@
 """Regression tests for the backtest execution engine (synthetic data only, no network)."""
 import copy
 import math
+import warnings
 
 import numpy as np
 import pytest
@@ -18,6 +19,10 @@ STRATEGY_CASES = [
     ("breakout", {"lookback": 20}),
     ("rsi_momentum", {"period": 14, "oversold": 40, "overbought": 60}),
     ("fibonacci_pullback", {"lookback": 20}),
+    ("mean_reversion", {"period": 20, "std_dev": 1.5}),
+    ("momentum", {"period": 10}),
+    ("rsi_reversal", {"window": 14, "lower": 40, "upper": 60}),
+    ("support_resistance", {"lookback": 30, "tolerance_pct": 0.01}),
 ]
 COST_CASES = [(0.0, 0.0), (10.0, 5.0)]
 
@@ -197,7 +202,7 @@ def test_strategies_actually_trade_in_the_invariant_fixture(long_candles, patch_
     """Guard against vacuous invariants: most strategies must produce several trades here."""
     patch_candles(long_candles)
     counts = {s: run(long_candles, s, p)["metrics"]["totalTrades"] for s, p in STRATEGY_CASES}
-    assert sum(1 for c in counts.values() if c >= 3) >= 5, counts
+    assert sum(1 for c in counts.values() if c >= 3) >= 7, counts
 
 
 # ---------------------------------------------------------------------------
@@ -216,6 +221,10 @@ def test_no_lookahead(long_candles, strategy, params, k):
 
     res_a, trades_a = service.run_strategy_on_df(base_df, strategy, params, INITIAL)
     res_b, trades_b = service.run_strategy_on_df(pert_df, strategy, params, INITIAL)
+
+    # the decided target position on every bar <= k is untouched by anything after bar k
+    np.testing.assert_array_equal(res_a["target"].to_numpy()[: k + 1], res_b["target"].to_numpy()[: k + 1])
+    np.testing.assert_array_equal(res_a["signal"].to_numpy()[: k + 1], res_b["signal"].to_numpy()[: k + 1])
 
     # equity (mark-to-market at each close) up to bar k is untouched by anything after bar k
     np.testing.assert_allclose(res_a["equity"].to_numpy()[: k + 1], res_b["equity"].to_numpy()[: k + 1], rtol=0, atol=1e-9)
@@ -243,6 +252,23 @@ def test_no_lookahead(long_candles, strategy, params, k):
         assert t["entryDate"] > t["entrySignalDate"]
         if t["exitSignalDate"] is not None:
             assert t["exitDate"] > t["exitSignalDate"]
+
+
+@pytest.mark.parametrize("strategy,params", STRATEGY_CASES)
+def test_signals_do_not_depend_on_future_bars(long_candles, strategy, params):
+    """
+    Truncation test: the target decided on bar k must be identical whether or not bars after k exist.
+    This catches a signal that peeks one bar ahead (e.g. shift(-1)), which fills at k+1 and so is
+    invisible to a perturbation test that only compares results up to bar k.
+    """
+    df = service.prepare_candles_df(long_candles)
+    full, _ = service.run_strategy_on_df(df, strategy, params, INITIAL)
+    full_signal = full["signal"].to_numpy()
+    full_target = full["target"].to_numpy()
+    for k in range(60, len(df) - 1, 7):
+        part, _ = service.run_strategy_on_df(df.iloc[: k + 1].reset_index(drop=True), strategy, params, INITIAL)
+        np.testing.assert_array_equal(part["signal"].to_numpy(), full_signal[: k + 1], err_msg=f"signal k={k}")
+        np.testing.assert_array_equal(part["target"].to_numpy(), full_target[: k + 1], err_msg=f"target k={k}")
 
 
 def test_entry_fills_use_next_bar_open(long_candles):
@@ -385,3 +411,73 @@ def test_invalid_initial_capital_rejected_by_service(long_candles, patch_candles
     patch_candles(long_candles)
     out = service.run_backtest_service("TEST", "ema_crossover", initial_capital=bad)
     assert "initial_capital" in out["error"]
+
+
+# ---------------------------------------------------------------------------
+# Liquidation (short squeezed through zero equity)
+# ---------------------------------------------------------------------------
+
+def _squeeze_candles(opens, closes):
+    return [
+        {"date": f"2024-02-{i + 1:02d}", "open": float(o), "high": max(o, c) + 0.1,
+         "low": min(o, c) - 0.1, "close": float(c), "volume": 1}
+        for i, (o, c) in enumerate(zip(opens, closes))
+    ]
+
+
+def test_short_squeeze_liquidates_account_and_stays_flat(patch_candles):
+    # Same first 8 bars as the hand-computed fixture: long 3->7 (equity 91304.35), short from open 10.5.
+    # idx 8 closes at 30: short marked at 91304.35 + 8695.65 * (10.5 - 30) < 0 -> wiped out at that close.
+    opens = [10, 10, 10.5, 11.5, 12.5, 13, 11, 10.5, 25, 30, 30, 31]
+    closes = [10, 10, 11, 12, 13, 12, 10, 9, 30, 30, 31, 30]
+    candles = _squeeze_candles(opens, closes)
+    patch_candles(candles)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # no divide-by-zero / invalid-value warnings in metrics or Monte Carlo
+        out = run(candles, "sma_crossover", SMA_PARAMS)
+    equity_after_long = 100000 + (100000 / 11.5) * (10.5 - 11.5)
+    assert [t["side"] for t in out["trades"]] == ["long", "short"]
+    squeezed = out["trades"][1]
+    assert squeezed["exitReason"] == "liquidated"
+    assert squeezed["exitDate"] == candles[8]["date"]
+    assert squeezed["pnlPct"] == pytest.approx(-100.0)
+    assert squeezed["pnl"] == pytest.approx(-equity_after_long)
+    eq = [p["value"] for p in out["equity_curve"]]
+    assert all(v == 0 for v in eq[8:])
+    assert all(row["position"] == 0 for row in out["chartData"][9:])  # flat afterwards, no re-entry
+    assert out["metrics"]["finalEquity"] == 0
+    assert out["metrics"]["totalReturn"] == pytest.approx(-100.0)
+    assert out["metrics"]["maxDrawdown"] == pytest.approx(-100.0)
+    assert sum(t["pnl"] for t in out["trades"]) == pytest.approx(-100000)
+    assert out["monteCarlo"]["riskMetrics"]["medianMaxDrawdown"] is not None
+
+
+def test_short_wiped_out_by_gap_at_exit_open_is_liquidated(patch_candles):
+    # Short from open 10.5 (idx 7). idx 8 closes at 15 (still alive, signal flips long) but idx 9
+    # opens at 30: covering there costs more than the account holds.
+    opens = [10, 10, 10.5, 11.5, 12.5, 13, 11, 10.5, 12, 30, 30]
+    closes = [10, 10, 11, 12, 13, 12, 10, 9, 15, 30, 30]
+    candles = _squeeze_candles(opens, closes)
+    patch_candles(candles)
+    out = run(candles, "sma_crossover", SMA_PARAMS)
+    short = out["trades"][1]
+    assert short["side"] == "short"
+    assert short["exitDate"] == candles[9]["date"]
+    assert short["exitSignalDate"] == candles[8]["date"]
+    assert short["exitReason"] == "liquidated"
+    assert short["pnlPct"] == pytest.approx(-100.0)
+    assert len(out["trades"]) == 2  # nothing is re-opened with a zero balance
+    eq = [p["value"] for p in out["equity_curve"]]
+    assert eq[8] > 0 and all(v == 0 for v in eq[9:])
+    assert sum(t["pnl"] for t in out["trades"]) == pytest.approx(out["metrics"]["finalEquity"] - 100000)
+
+
+def test_monte_carlo_handles_paths_that_lose_everything():
+    import pandas as pd
+
+    returns = pd.Series([-1.0, -1.0, -1.0, -1.0])
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        mc = service._run_monte_carlo(returns, simulations=20, seed=1)
+    assert mc["riskMetrics"]["medianMaxDrawdown"] == 0.0  # peak 0 -> defined as no drawdown, not NaN
+    assert mc["percentiles"]["p50"] == -100.0

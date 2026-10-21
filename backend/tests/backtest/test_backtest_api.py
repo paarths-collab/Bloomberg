@@ -1,4 +1,7 @@
 """HTTP-level tests for /api/backtest (monkeypatched data, minimal app with only the backtest router)."""
+import sys
+from types import SimpleNamespace
+
 import pytest
 
 STRAT_PARAMS = {"fast": 5, "slow": 20}  # frontend-style names, normalised to fast_period/slow_period
@@ -186,3 +189,137 @@ def test_heatmap_and_quantstats_share_capital_and_range_validation(served, long_
     assert r2.json()["values"] == r.json()["values"]
     r = served.post("/api/backtest/quantstats-report", json={"symbol": "TEST", "strategy": "sma_crossover", "initial_capital": -5})
     assert r.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# WebSocket path and forwarding spies
+# ---------------------------------------------------------------------------
+
+def _ws_result(client, payload):
+    """Send one request on the backtest WS route and return (all messages, final message)."""
+    messages = []
+    with client.websocket_connect("/api/backtest/ws") as ws:
+        ws.send_json(payload)
+        while True:
+            msg = ws.receive_json()
+            messages.append(msg)
+            if msg.get("status") in {"complete", "error"} or "error" in msg:
+                return messages, msg
+
+
+def test_websocket_run_uses_requested_capital_and_costs(served):
+    _, final = _ws_result(served, {
+        "symbol": "TEST", "strategy": "sma_crossover", "params": dict(STRAT_PARAMS),
+        "initial_capital": 50000, "commission_bps": 10, "slippage_bps": 5, "seed": 9,
+    })
+    assert final["status"] == "complete", final
+    data = final["data"]
+    assert data["metrics"]["initialCapital"] == 50000
+    assert data["equity_curve"][0]["value"] == pytest.approx(50000)
+    assert data["equity_curve"][0]["benchmark"] == pytest.approx(50000)
+    assert data["assumptions"]["commission_bps"] == 10 and data["assumptions"]["monteCarloSeed"] == 9
+    # the WS path runs exactly the same engine as /run
+    http = served.post("/api/backtest/run", json=single_payload(
+        initial_capital=50000, commission_bps=10, slippage_bps=5, seed=9)).json()
+    assert data["metrics"] == http["metrics"] and data["trades"] == http["trades"]
+
+
+def test_websocket_rejects_bad_input_without_leaking_internals(served):
+    _, final = _ws_result(served, {"symbol": "TEST", "strategy": "sma_crossover", "initial_capital": 0})
+    assert "initial_capital" in final["error"]
+    _, final = _ws_result(served, {"symbol": "TEST", "strategy": 5})
+    assert final["error"] == "strategy must be a string"
+    _, final = _ws_result(served, {"symbol": "TEST", "strategy": "sma_crossover", "params": {"symbol": "x"}})
+    assert "Unknown parameter" in final["error"]
+
+
+def test_heatmap_forwards_capital_and_costs_to_the_engine(served, long_candles, monkeypatch):
+    from backend.backtest import main as backtest_main
+
+    calls = []
+    real = backtest_main.run_backtest_on_df
+
+    def spy(df, strategy_name, *args, **kwargs):
+        calls.append(kwargs)
+        return real(df, strategy_name, *args, **kwargs)
+
+    monkeypatch.setattr(backtest_main, "fetch_candles", lambda *a, **k: [dict(c) for c in long_candles])
+    monkeypatch.setattr(backtest_main, "run_backtest_on_df", spy)
+    r = served.post("/api/backtest/heatmap", json={
+        "symbol": "TEST", "strategy": "sma_crossover", "x_values": [5, 10], "y_values": [20, 30],
+        "initial_capital": 5000, "commission_bps": 7, "slippage_bps": 3,
+    })
+    assert r.status_code == 200, r.text
+    assert len(calls) == 4
+    assert all(c["initial_capital"] == 5000 and c["commission_bps"] == 7 and c["slippage_bps"] == 3 for c in calls)
+    # default capital still applies when none is requested
+    calls.clear()
+    served.post("/api/backtest/heatmap", json={
+        "symbol": "TEST", "strategy": "sma_crossover", "x_values": [5], "y_values": [20],
+    })
+    assert calls and calls[0]["initial_capital"] == 100000 and calls[0]["commission_bps"] == 0
+
+
+def test_quantstats_report_forwards_capital_and_costs_to_the_engine(served, long_candles, monkeypatch):
+    from backend.backtest import main as backtest_main
+
+    calls = []
+    real = backtest_main.run_backtest_on_df
+
+    def spy(df, strategy_name, *args, **kwargs):
+        calls.append((strategy_name, kwargs))
+        return real(df, strategy_name, *args, **kwargs)
+
+    reports = []
+    fake_qs = SimpleNamespace(reports=SimpleNamespace(html=lambda returns, **kw: reports.append((returns, kw))))
+    monkeypatch.setitem(sys.modules, "quantstats", fake_qs)  # the real import is heavy and needs fonts
+    monkeypatch.setattr(backtest_main, "fetch_candles", lambda *a, **k: [dict(c) for c in long_candles])
+    monkeypatch.setattr(backtest_main, "run_backtest_on_df", spy)
+    r = served.post("/api/backtest/quantstats-report", json={
+        "symbol": "TEST", "strategy": "sma_crossover", "params": dict(STRAT_PARAMS),
+        "initial_capital": 25000, "commission_bps": 4, "slippage_bps": 2,
+    })
+    assert r.status_code == 200, r.text
+    assert len(calls) == 1
+    name, kwargs = calls[0]
+    assert name == "sma_crossover"
+    assert kwargs["initial_capital"] == 25000 and kwargs["commission_bps"] == 4 and kwargs["slippage_bps"] == 2
+    assert kwargs["fast_period"] == 5 and kwargs["slow_period"] == 20 and "seed" not in kwargs
+    assert len(reports) == 1 and len(reports[0][0]) == len(long_candles)
+
+
+# ---------------------------------------------------------------------------
+# Error hygiene: no internal exception text for clients
+# ---------------------------------------------------------------------------
+
+def test_strategy_must_be_a_string_and_params_must_be_known(served):
+    r = served.post("/api/backtest/run", json=single_payload(strategy=5))
+    assert r.status_code == 400 and r.json()["detail"] == "strategy must be a string"
+    r = served.post("/api/backtest/run", json=multi_payload(strategies=["sma_crossover", 5]))
+    assert r.status_code == 400
+    for bad_params in ({"symbol": "x"}, {"fast": 5, "slow": 20, "bogus": 1}, {"strategy_name": "x"}):
+        r = served.post("/api/backtest/run", json=single_payload(params=bad_params))
+        assert r.status_code == 400, (bad_params, r.text)
+        assert "Unknown parameter" in r.json()["detail"]
+    r = served.post("/api/backtest/run", json=single_payload(strategy="nope", params={}))
+    assert r.status_code == 400 and "not found" in r.json()["detail"]
+    r = served.post("/api/backtest/run", json=single_payload(params={"fast": "abc", "slow": 20}))
+    assert r.status_code == 400 and "Invalid parameters" in r.json()["detail"]
+
+
+def test_unexpected_engine_failures_are_generic(served, monkeypatch):
+    from backend.backtest import service
+
+    def boom(*a, **k):
+        raise RuntimeError("secret internal detail /var/db/x")
+
+    monkeypatch.setattr(service, "_simulate_execution", boom)
+    r = served.post("/api/backtest/run", json=single_payload())
+    assert r.status_code == 500
+    assert "secret" not in r.text and "internal error" in r.json()["detail"].lower()
+    r = served.post("/api/backtest/run", json=multi_payload())
+    assert r.status_code == 200
+    for result in r.json()["strategies"].values():
+        assert result["metrics"] is None and "secret" not in result["error"]
+    _, final = _ws_result(served, {"symbol": "TEST", "strategy": "sma_crossover", "params": dict(STRAT_PARAMS)})
+    assert "secret" not in str(final)

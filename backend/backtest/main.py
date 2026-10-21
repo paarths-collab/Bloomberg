@@ -13,6 +13,8 @@ from .service import (
     validate_bps,
     validate_seed,
     strip_run_options,
+    validate_strategy_params,
+    BacktestInputError,
     DEFAULT_INITIAL_CAPITAL,
     DEFAULT_MONTE_CARLO_SEED,
 )
@@ -36,8 +38,25 @@ REPORTS_DIR = Path(__file__).parent / "reports"
 REPORTS_DIR.mkdir(exist_ok=True)
 
 
-def _normalize_strategy_name(strategy: str) -> str:
+def _internal_error(context: str) -> HTTPException:
+    """Log the active exception and return a client-safe 500 (no internal exception text)."""
+    logger.exception("Backtest %s failed", context)
+    return HTTPException(status_code=500, detail=f"Internal error while {context}.")
+
+
+def _normalize_strategy_name(strategy: Any) -> str:
+    if strategy is not None and not isinstance(strategy, str):
+        raise HTTPException(status_code=400, detail="strategy must be a string")
     return (strategy or "").strip().lower()
+
+
+def _validated_strategy_params(strategy: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    """400 for unknown strategies/params (including names that would collide with service kwargs)."""
+    try:
+        validate_strategy_params(strategy, params)
+    except BacktestInputError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return params
 
 
 def _normalize_strategy_params(strategy: str, params: Dict[str, Any]) -> Dict[str, Any]:
@@ -133,7 +152,7 @@ def _extract_single_strategy_params(strategy: str, payload: Dict[str, Any]) -> D
     # params may be keyed by strategy id, or flat
     if strategy in params and isinstance(params[strategy], dict):
         params = params[strategy]
-    return _normalize_strategy_params(strategy, strip_run_options(params))
+    return _validated_strategy_params(strategy, _normalize_strategy_params(strategy, strip_run_options(params)))
 
 
 @router.post("/interpret")
@@ -410,7 +429,14 @@ async def backtest_websocket(websocket: WebSocket):
     try:
         while True:
             data = await websocket.receive_text()
-            payload = json.loads(data)
+            try:
+                payload = json.loads(data)
+            except ValueError:
+                await websocket.send_json({"error": "Invalid JSON payload"})
+                continue
+            if not isinstance(payload, dict):
+                await websocket.send_json({"error": "Payload must be a JSON object"})
+                continue
             
             symbol = payload.get("symbol")
             if not symbol:
@@ -472,17 +498,21 @@ async def backtest_websocket(websocket: WebSocket):
                         "data": _sanitize_floats(result)
                     })
                     
-            except Exception as e:
+            except HTTPException as http_err:
+                await websocket.send_json({"status": "error", "error": http_err.detail})
+            except Exception:
+                logger.exception("Backtest websocket run failed")
                 await websocket.send_json({
                     "status": "error",
-                    "error": str(e)
+                    "error": "Internal error while running the backtest."
                 })
                 
     except WebSocketDisconnect:
         logger.info("Backtest websocket disconnected")
-    except Exception as e:
+    except Exception:
+        logger.exception("Backtest websocket failed")
         try:
-            await websocket.send_json({"error": str(e)})
+            await websocket.send_json({"error": "Internal error while running the backtest."})
         except Exception as send_error:
             logger.debug("Failed to send websocket error payload: %s", send_error)
 
@@ -612,14 +642,14 @@ def run_simulation(
             )
         
         if "error" in result:
-            raise HTTPException(status_code=400, detail=result["error"])
+            raise HTTPException(status_code=500 if result.get("internal") else 400, detail=result["error"])
             
         return _sanitize_floats(result)
         
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        raise _internal_error("running the backtest")
 
 
 @router.get("/strategies")
@@ -784,8 +814,8 @@ def run_heatmap(payload: Dict[str, Any] = Body(...)):
 
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        raise _internal_error("generating the heatmap")
 
 
 @router.post("/report")
@@ -821,8 +851,8 @@ def generate_report(payload: Dict[str, Any] = Body(...)):
         
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        raise _internal_error("generating the report")
 
 
 @router.get("/report/download/{filename}")
@@ -929,5 +959,5 @@ def generate_quantstats_report(payload: Dict[str, Any] = Body(...)):
 
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        raise _internal_error("generating the QuantStats report")
