@@ -35,6 +35,7 @@ from backend.network.main import router as network_app
 from backend.news.main import router as news_app
 from backend.screener.main import router as screener_app
 from backend.profile.main import router as profile_app
+from backend.auth.routes import router as auth_app
 from backend.technical.fundamentals_service import get_fundamentals_summary
 
 # FRED routes registered at /api level so /api/fred/* matches frontend api.ts
@@ -122,6 +123,7 @@ app.include_router(network_app,   prefix="/api/network",   tags=["Network"])
 app.include_router(news_app,      prefix="/api/news",      tags=["News"])
 app.include_router(screener_app,  prefix="/api/screener",  tags=["Screener"])
 app.include_router(profile_app,   prefix="/api/profile",   tags=["Profile"])
+app.include_router(auth_app)
 # FRED at top-level /api so frontend /api/fred/* calls resolve correctly
 app.include_router(fred_router,   prefix="/api",            tags=["FRED Data"])
 

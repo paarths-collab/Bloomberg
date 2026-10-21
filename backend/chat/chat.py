@@ -1,5 +1,11 @@
 """
 WebSocket Chat Routes - Real-time chat interface for multi-agent system
+
+Identity: comes only from a bearer token (``Authorization`` header, or a ``token`` query param
+for WebSockets). A client-supplied ``user_id`` is ignored. Callers without a valid token are
+anonymous: their pseudo-identity is derived from the session_id, so for anonymous chats the
+session_id itself acts as a capability - whoever knows it can read and continue that session.
+Authenticated sessions are owned by their user and cannot be accessed by anyone else.
 """
 import json
 import asyncio
@@ -7,7 +13,7 @@ import uuid
 from typing import Optional
 from datetime import datetime
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect, HTTPException, Query
+from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect, HTTPException, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -21,6 +27,7 @@ except ImportError:
 
 from autogen_core.models import UserMessage, AssistantMessage, SystemMessage
 
+from backend.auth.security import anonymous_identity, optional_user, user_from_token
 from backend.utils.json_safe import make_json_safe
 
 
@@ -35,7 +42,10 @@ class ChatMessage(BaseModel):
     """Request model for REST chat endpoint"""
     message: str = Field(..., description="User message")
     session_id: Optional[str] = Field(None, description="Session ID for conversation continuity")
-    user_id: str = Field(default="default", description="User identifier")
+    user_id: Optional[str] = Field(
+        default=None,
+        description="Deprecated and ignored: identity comes from the bearer token only",
+    )
 
 
 class ChatResponse(BaseModel):
@@ -84,15 +94,37 @@ _GENERAL_SYSTEM_PROMPT = (
 )
 
 
-async def _get_general_response(session_id: str, user_message: str) -> tuple[str, str]:
+def _identity_for(token: Optional[str], session_id: str) -> str:
+    """Authenticated user id from the token, else a per-session anonymous identity."""
+    return user_from_token(token) or anonymous_identity(session_id)
+
+
+def _ws_token(websocket: WebSocket, token: Optional[str]) -> Optional[str]:
+    """Bearer token for a WebSocket: ``token`` query param, else the Authorization header."""
+    if token:
+        return token
+    header = websocket.headers.get("authorization", "")
+    scheme, _, value = header.partition(" ")
+    if scheme.lower() == "bearer" and value.strip():
+        return value.strip()
+    return None
+
+
+def _general_key(identity: str, session_id: str) -> str:
+    """General-chat memory is namespaced by identity so session ids cannot cross users."""
+    return f"{identity}:{session_id}"
+
+
+async def _get_general_response(session_id: str, user_message: str, identity: str) -> tuple[str, str]:
     client, provider = get_model_client()
     if not client:
         return "LLM not configured. Set GEMINI_API_KEY, GROQ_API_KEY, or OPENAI_API_KEY.", "none"
 
-    history = _general_sessions.get(session_id)
+    key = _general_key(identity, session_id)
+    history = _general_sessions.get(key)
     if not history:
         history = [SystemMessage(content=_GENERAL_SYSTEM_PROMPT, source="system")]
-        _general_sessions[session_id] = history
+        _general_sessions[key] = history
 
     history.append(UserMessage(content=user_message, source="user"))
 
@@ -106,7 +138,7 @@ async def _get_general_response(session_id: str, user_message: str) -> tuple[str
 
     # Keep system + recent history
     if len(history) > 21:
-        _general_sessions[session_id] = [history[0]] + history[-20:]
+        _general_sessions[key] = [history[0]] + history[-20:]
 
     return content, provider
 
@@ -119,12 +151,15 @@ async def _get_general_response(session_id: str, user_message: str) -> tuple[str
 async def websocket_chat(
     websocket: WebSocket,
     session_id: Optional[str] = Query(None),
-    user_id: str = Query("default")
+    token: Optional[str] = Query(None),
+    user_id: Optional[str] = Query(None),  # deprecated, ignored: identity comes from the token
 ):
     """
     WebSocket endpoint for real-time chat.
     
-    Connect: ws://localhost:8000/api/chat/ws?session_id=xxx&user_id=yyy
+    Connect: ws://localhost:8000/api/chat/ws?session_id=xxx&token=<bearer token>
+    (the token is optional; without a valid one the chat is anonymous and unpersonalised.
+    A user_id query parameter is ignored.)
     
     Send: {"message": "What's happening with AAPL?"}
     
@@ -133,9 +168,14 @@ async def websocket_chat(
     # Generate session ID if not provided
     if not session_id:
         session_id = str(uuid.uuid4())
-    
-    await manager.connect(websocket, session_id)
+
+    identity = _identity_for(_ws_token(websocket, token), session_id)
     orchestrator = get_chat_orchestrator()
+    if not orchestrator.session_accessible(session_id, identity):
+        await websocket.close(code=1008)  # policy violation: session belongs to someone else
+        return
+
+    await manager.connect(websocket, session_id)
     
     # Send welcome message
     await websocket.send_json({
@@ -169,7 +209,7 @@ async def websocket_chat(
             async for response in orchestrator.process_message(
                 session_id=session_id,
                 user_message=user_message,
-                user_id=user_id
+                user_id=identity
             ):
                 await websocket.send_json(make_json_safe(response))
             
@@ -183,15 +223,18 @@ async def websocket_chat(
 async def websocket_general_chat(
     websocket: WebSocket,
     session_id: Optional[str] = Query(None),
-    user_id: str = Query("default")
+    token: Optional[str] = Query(None),
+    user_id: Optional[str] = Query(None),  # deprecated, ignored: identity comes from the token
 ):
     """
     WebSocket endpoint for general chat (non-pipeline).
     
-    Connect: ws://localhost:8000/api/chat/ws-general?session_id=xxx&user_id=yyy
+    Connect: ws://localhost:8000/api/chat/ws-general?session_id=xxx&token=<bearer token>
     """
     if not session_id:
         session_id = str(uuid.uuid4())
+
+    identity = _identity_for(_ws_token(websocket, token), session_id)
 
     await general_manager.connect(websocket, session_id)
 
@@ -225,7 +268,7 @@ async def websocket_general_chat(
                 "metadata": {"mode": "general"}
             })
 
-            response_text, provider = await _get_general_response(session_id, user_message)
+            response_text, provider = await _get_general_response(session_id, user_message, identity)
 
             await websocket.send_json(make_json_safe({
                 "type": "result",
@@ -242,20 +285,24 @@ async def websocket_general_chat(
 # ============================================================================
 
 @router.post("/message", response_model=ChatResponse)
-async def send_chat_message(request: ChatMessage):
+async def send_chat_message(request: ChatMessage, auth_user: Optional[str] = Depends(optional_user)):
     """
     REST endpoint for chat (non-streaming fallback).
     
     For real-time experience, use the WebSocket endpoint instead.
+    Identity comes from the bearer token only (anonymous without one); request.user_id is ignored.
     """
     session_id = request.session_id or str(uuid.uuid4())
+    identity = auth_user or anonymous_identity(session_id)
     orchestrator = get_chat_orchestrator()
+    if not orchestrator.session_accessible(session_id, identity):
+        raise HTTPException(status_code=403, detail="Session belongs to another user")
     
     responses = []
     async for response in orchestrator.process_message(
         session_id=session_id,
         user_message=request.message,
-        user_id=request.user_id
+        user_id=identity
     ):
         responses.append(response)
     
@@ -267,10 +314,11 @@ async def send_chat_message(request: ChatMessage):
 
 
 @router.get("/history/{session_id}")
-async def get_chat_history(session_id: str):
-    """Get conversation history for a session"""
+async def get_chat_history(session_id: str, auth_user: Optional[str] = Depends(optional_user)):
+    """Get conversation history for a session (only the owner's; others see an empty history)"""
     orchestrator = get_chat_orchestrator()
-    history = orchestrator.get_conversation_history(session_id)
+    identity = auth_user or anonymous_identity(session_id)
+    history = orchestrator.get_conversation_history(session_id, user_id=identity)
     
     return {
         "session_id": session_id,
@@ -280,18 +328,19 @@ async def get_chat_history(session_id: str):
 
 
 @router.delete("/history/{session_id}")
-async def clear_chat_history(session_id: str):
-    """Clear conversation history for a session"""
+async def clear_chat_history(session_id: str, auth_user: Optional[str] = Depends(optional_user)):
+    """Clear conversation history for a session (only the owner can clear it)"""
     orchestrator = get_chat_orchestrator()
-    orchestrator.clear_conversation(session_id)
+    orchestrator.clear_conversation(session_id, user_id=auth_user or anonymous_identity(session_id))
     
     return {"message": f"Conversation {session_id} cleared"}
 
 
 @router.get("/general/history/{session_id}")
-async def get_general_chat_history(session_id: str):
-    """Get general chat history for a session"""
-    history = _general_sessions.get(session_id, [])
+async def get_general_chat_history(session_id: str, auth_user: Optional[str] = Depends(optional_user)):
+    """Get general chat history for a session (namespaced by caller identity)"""
+    identity = auth_user or anonymous_identity(session_id)
+    history = _general_sessions.get(_general_key(identity, session_id), [])
     messages = []
     for m in history:
         if isinstance(m, SystemMessage):
@@ -304,20 +353,21 @@ async def get_general_chat_history(session_id: str):
 
 
 @router.delete("/general/history/{session_id}")
-async def clear_general_chat_history(session_id: str):
-    """Clear general chat history for a session"""
-    if session_id in _general_sessions:
-        del _general_sessions[session_id]
+async def clear_general_chat_history(session_id: str, auth_user: Optional[str] = Depends(optional_user)):
+    """Clear general chat history for a session (namespaced by caller identity)"""
+    _general_sessions.pop(_general_key(auth_user or anonymous_identity(session_id), session_id), None)
     return {"message": f"General conversation {session_id} cleared"}
 
 
 @router.get("/sessions")
-async def list_active_sessions():
-    """List active chat sessions"""
+async def list_active_sessions(auth_user: Optional[str] = Depends(optional_user)):
+    """List the authenticated caller's active chat sessions (anonymous callers see none)"""
     orchestrator = get_chat_orchestrator()
     
     sessions = []
     for sid, ctx in orchestrator.conversations.items():
+        if not auth_user or ctx.user_id != auth_user:
+            continue
         sessions.append({
             "session_id": sid,
             "user_id": ctx.user_id,

@@ -17,6 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 
+from backend.auth.security import optional_user
 from backend.database.connection import get_db
 
 logger = logging.getLogger(__name__)
@@ -30,7 +31,8 @@ router = APIRouter(prefix="/stock-advisor", tags=["Stock Advisor"])
 
 class RecommendRequest(BaseModel):
     user_input: str = Field(..., description="User's investment query")
-    user_id: str = Field(default="default")
+    # Deprecated and ignored: whose profile is read comes only from the bearer token.
+    user_id: Optional[str] = Field(default=None)
     market: str = Field(default="US")
 
 
@@ -273,17 +275,24 @@ def _run_multi_pov_langgraph(symbol: str, market: str, context: str = "") -> Dic
 # ---------------------------------------------------------------------------
 
 @router.post("/recommend")
-async def recommend(request: RecommendRequest, db=Depends(get_db)):
+async def recommend(
+    request: RecommendRequest,
+    auth_user: Optional[str] = Depends(optional_user),
+    db=Depends(get_db),
+):
     """
-    Auto-recommend stocks: reads saved profile, combines with user input,
-    and runs through WealthOrchestrator.
+    Auto-recommend stocks: reads the caller's saved profile (identified only by the
+    bearer token; anonymous callers get no personalisation), combines it with user
+    input, and runs through WealthOrchestrator.
     """
     try:
-        # 1. Load user profile from DB
-        row = db.execute(
-            text("SELECT * FROM user_profiles WHERE user_id = :uid"),
-            {"uid": request.user_id},
-        ).mappings().first()
+        # 1. Load the authenticated user's profile from DB (never a client-supplied user_id)
+        row = None
+        if auth_user:
+            row = db.execute(
+                text("SELECT * FROM user_profiles WHERE user_id = :uid"),
+                {"uid": auth_user},
+            ).mappings().first()
 
         profile_context = ""
         if row:
