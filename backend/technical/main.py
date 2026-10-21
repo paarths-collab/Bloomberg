@@ -193,8 +193,9 @@ def get_peer_comparison_route(symbol: str, limit: int = Query(12)):
     try:
         data = fetch_peer_comparison(symbol, limit=limit)
         return make_json_safe(data)
-    except Exception as e:
-        return make_json_safe({"symbol": symbol, "error": str(e), "rows": []})
+    except Exception:
+        logger.exception("Peer comparison failed for %s", symbol)
+        return make_json_safe({"symbol": symbol, "error": "Peer comparison failed", "rows": []})
 
 @router.get("/peers/{symbol}")
 def get_peers_route(symbol: str):

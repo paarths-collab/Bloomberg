@@ -337,7 +337,7 @@ async def recommend(
         raise HTTPException(status_code=504, detail="Analysis timed out")
     except Exception as e:
         logger.exception("Recommend failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Stock advisor request failed")
 
 
 @router.post("/multi-pov")
@@ -361,4 +361,4 @@ def multi_pov_analysis(request: MultiPovRequest):
         }
     except Exception as e:
         logger.exception("Multi-POV analysis failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Stock advisor request failed")

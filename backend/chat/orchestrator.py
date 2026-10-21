@@ -5,6 +5,7 @@ Manages conversation flow, intent clarification, and pipeline execution.
 import os
 import asyncio
 import json
+import logging
 from typing import Dict, List, Any, Optional, Callable, AsyncGenerator, Tuple
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -12,6 +13,8 @@ from enum import Enum
 
 # AutoGen configuration
 USE_AUTOGEN = True  # Enable AutoGen features
+
+logger = logging.getLogger(__name__)
 
 # Import AutoGen via centralized setup
 try:
@@ -200,11 +203,12 @@ class ChatOrchestrator:
                 }
                 ctx.state = ConversationState.IDLE
                 
-        except Exception as e:
+        except Exception:
+            logger.exception("Chat orchestrator failed")
             yield {
                 "type": "error",
-                "content": f"Sorry, I encountered an error: {str(e)}",
-                "metadata": {"error": str(e)}
+                "content": "Sorry, I encountered an error. Please try again.",
+                "metadata": {"error": "Chat request failed"}
             }
             ctx.state = ConversationState.IDLE
     

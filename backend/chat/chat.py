@@ -9,6 +9,7 @@ Authenticated sessions are owned by their user and cannot be accessed by anyone 
 """
 import json
 import asyncio
+import logging
 import uuid
 from typing import Optional
 from datetime import datetime
@@ -30,6 +31,7 @@ from autogen_core.models import UserMessage, AssistantMessage, SystemMessage
 from backend.auth.security import anonymous_identity, optional_user, user_from_token
 from backend.utils.json_safe import make_json_safe
 
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/chat", tags=["Chat"])
 
@@ -131,8 +133,9 @@ async def _get_general_response(session_id: str, user_message: str, identity: st
     try:
         result = await client.create(messages=history)
         content = result.content if isinstance(result.content, str) else str(result.content)
-    except Exception as e:
-        content = f"⚠️ General chat failed: {e}"
+    except Exception:
+        logger.exception("General chat failed")
+        content = "⚠️ Chat request failed. Please try again."
 
     history.append(AssistantMessage(content=content, source="assistant"))
 
