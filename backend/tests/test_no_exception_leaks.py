@@ -47,14 +47,16 @@ ALLOWLIST = [
     ("technical/main.py", "HTTPException(status_code=400, detail=str(e))"),
     # ReproduceError is our own typed error with a fixed, hand-written message.
     ("experiments/routes.py", "'message': exc.message"),
+    # Benchmark symbol validation in /portfolio/risk.  Only ProfileValidationError (our own class,
+    # always raised with fixed text in investor_profile.py) is caught here; any other exception
+    # is logged and answered with a fixed 422 message instead.
+    ("portfolio/investor_profile.py", "HTTPException(status_code=422, detail=str(exc))"),
 ]
 
 # Known leaks in modules that were outside the scope of the change that added this test (they are
 # owned by other workstreams).  This list must only ever shrink: fix the code, then delete the
 # entry.  New leaks must be fixed, not added here.
-PENDING_FIXES = [
-    ("portfolio/investor_profile.py", "HTTPException(status_code=422, detail=str(exc))"),
-]
+PENDING_FIXES = []
 
 
 def _names_in(node: ast.AST) -> set:

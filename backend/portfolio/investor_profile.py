@@ -57,12 +57,20 @@ router = APIRouter(prefix="/api/investor-profile", tags=["Investor Profile"])
 # Models
 # ---------------------------------------------------------------------------
 
+class ProfileValidationError(ValueError):
+    """Deliberate input validation failure raised by this module.
+
+    The message is always fixed text written here (never exception text from a library), so it
+    is safe to return to the client as a 422 detail. Any other exception is not client-safe.
+    """
+
+
 def _normalize_symbol(value: Any) -> str:
     if not isinstance(value, str):
-        raise ValueError("symbol must be a string")
+        raise ProfileValidationError("symbol must be a string")
     symbol = value.strip().upper()
     if not SYMBOL_RE.match(symbol):
-        raise ValueError("symbol must be 1-20 characters of A-Z, 0-9, '.', '-', '^' or '='")
+        raise ProfileValidationError("symbol must be 1-20 characters of A-Z, 0-9, '.', '-', '^' or '='")
     return symbol
 
 
@@ -92,11 +100,13 @@ class ProfilePayload(BaseModel):
         if value is None or not value.strip():
             return None
         if not value.lstrip().startswith("{"):
-            raise ValueError("existing_investments must be a JSON object of holdings")
+            raise ProfileValidationError("existing_investments must be a JSON object of holdings")
         try:
-            return json.dumps(_normalize_holdings(json.loads(value)))
-        except (ValueError, TypeError, RecursionError) as exc:
-            raise ValueError(f"existing_investments must be valid holdings JSON: {exc}")
+            raw = json.loads(value)
+        except (ValueError, TypeError, RecursionError):
+            # json's error text is not ours to echo back; keep the message fixed.
+            raise ProfileValidationError("existing_investments must be valid holdings JSON")
+        return json.dumps(_normalize_holdings(raw))  # raises ProfileValidationError with a specific message
 
 
 class TradeRequest(BaseModel):
@@ -139,19 +149,19 @@ def _is_number(value: Any) -> bool:
 def _normalize_holdings(raw: Any) -> Dict[str, Dict[str, Any]]:
     """Validate/normalise a holdings mapping; raises ValueError if it is malformed."""
     if not isinstance(raw, dict):
-        raise ValueError("holdings must be a JSON object keyed by symbol")
+        raise ProfileValidationError("holdings must be a JSON object keyed by symbol")
     if len(raw) > MAX_HOLDINGS:
-        raise ValueError(f"at most {MAX_HOLDINGS} holdings are allowed")
+        raise ProfileValidationError(f"at most {MAX_HOLDINGS} holdings are allowed")
     result: Dict[str, Dict[str, Any]] = {}
     for key, data in raw.items():
         symbol = _normalize_symbol(key)
         if not isinstance(data, dict):
-            raise ValueError(f"holding for {symbol} must be an object")
+            raise ProfileValidationError(f"holding for {symbol} must be an object")
         qty, avg, invested = data.get("quantity"), data.get("avg_price"), data.get("total_invested")
         if not (_is_number(qty) and qty > 0):
-            raise ValueError(f"holding for {symbol}: quantity must be a positive number")
+            raise ProfileValidationError(f"holding for {symbol}: quantity must be a positive number")
         if not (_is_number(avg) and avg >= 0) or not (_is_number(invested) and invested >= 0):
-            raise ValueError(f"holding for {symbol}: avg_price/total_invested must be non-negative numbers")
+            raise ProfileValidationError(f"holding for {symbol}: avg_price/total_invested must be non-negative numbers")
         holding = {"quantity": float(qty), "avg_price": float(avg), "total_invested": float(invested)}
         if isinstance(data.get("last_trade_at"), str):
             holding["last_trade_at"] = data["last_trade_at"]
@@ -527,8 +537,12 @@ def get_portfolio_risk(
     if benchmark is not None:
         try:
             benchmark = _normalize_symbol(benchmark)
-        except ValueError as exc:
+        except ProfileValidationError as exc:
+            # Our own fixed validation text only (see ProfileValidationError).
             raise HTTPException(status_code=422, detail=str(exc))
+        except Exception:
+            logger.exception("Benchmark validation failed")
+            raise HTTPException(status_code=422, detail="benchmark must be a valid ticker symbol")
 
     try:
         row = db.execute(
