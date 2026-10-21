@@ -3,9 +3,13 @@ Isolated trade_levels_service for chat/core.
 Refactored to use unified MarketDataService.
 Ensures 100% architectural consistency and resolves direct yfinance usage.
 """
+import logging
+
 import pandas as pd
 from typing import Dict, Any
 from backend.services.market_data import market_service
+
+logger = logging.getLogger(__name__)
 
 class TradeLevelsService:
     """Calculate trade entry, target, and stop-loss levels."""
@@ -51,8 +55,9 @@ class TradeLevelsService:
                 "atr": round(atr, 2),
                 "risk_reward": risk_reward,
             }
-        except Exception as e:
-            return {"ticker": ticker, "error": str(e)}
+        except Exception:
+            logger.exception("Trade levels calculation failed for %s", ticker)
+            return {"ticker": ticker, "error": "Trade levels unavailable"}
 
     def calculate_risk(self, entry: float, stop: float, target: float, capital: float = 100000) -> Dict[str, Any]:
         """Calculate risk/reward metrics for a given trade setup."""

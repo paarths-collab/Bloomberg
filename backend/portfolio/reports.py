@@ -1,15 +1,19 @@
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 from pathlib import Path
+import logging
 import os
+
+logger = logging.getLogger(__name__)
 
 def convert_html_to_pdf(html_path: str, pdf_path: str) -> dict:
     try:
         import pdfkit
         pdfkit.from_file(html_path, pdf_path)
         return {"success": True, "error": None}
-    except Exception as e:
-         return {"success": False, "error": str(e)}
+    except Exception:
+         logger.exception("HTML to PDF conversion failed")
+         return {"success": False, "error": "PDF conversion error"}
 
 router = APIRouter(prefix="/api/reports", tags=["Reports"])
 

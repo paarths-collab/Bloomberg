@@ -35,6 +35,14 @@ def get_strategy(name: str, **params):
     # For now, assume dynamic kwargs are passed safely or we let Python raise TypeError if invalid args
     return strategy_class(**params)
 
+def get_strategy_parameter_names(name: str) -> List[str]:
+    """Accepted parameter names for a registered strategy, taken from its default parameters."""
+    for entry in get_available_strategies():
+        if entry["id"] == name:
+            return list(entry["parameters"])
+    return []
+
+
 def get_available_strategies():
     """
     Return a list of available strategies with default parameters.
@@ -143,6 +151,10 @@ def _is_number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
+class ParamValidationError(ValueError):
+    """Parameter validation failure whose message is always text written by this module (client-safe)."""
+
+
 def validate_params(strategy_instance: Any, raw_params: Dict[str, Any]) -> None:
     """
     Reject semantically bad params that the strategy constructors accept
@@ -152,22 +164,22 @@ def validate_params(strategy_instance: Any, raw_params: Dict[str, Any]) -> None:
     for key, value in raw_params.items():
         if key in THRESHOLD_PARAMS:
             if not _is_number(value) or not math.isfinite(value):
-                raise ValueError(f"'{key}' must be a finite number")
+                raise ParamValidationError(f"'{key}' must be a finite number")
             continue
         if not _is_number(value) or not math.isfinite(value) or float(value) != int(value):
-            raise ValueError(f"'{key}' must be a positive integer")
+            raise ParamValidationError(f"'{key}' must be a positive integer")
         if not 1 <= int(value) <= MAX_WINDOW:
-            raise ValueError(f"'{key}' must be an integer between 1 and {MAX_WINDOW}")
+            raise ParamValidationError(f"'{key}' must be an integer between 1 and {MAX_WINDOW}")
 
     effective = dict(getattr(strategy_instance, "parameters", {}) or {})
     for key, value in effective.items():
         if key not in THRESHOLD_PARAMS and _is_number(value) and value < 1:
-            raise ValueError(f"'{key}' must be a positive integer")
+            raise ParamValidationError(f"'{key}' must be a positive integer")
     if "oversold" in effective and "overbought" in effective:
         oversold = raw_params.get("oversold", effective["oversold"])
         overbought = raw_params.get("overbought", effective["overbought"])
         if oversold >= overbought:
-            raise ValueError("'oversold' must be less than 'overbought'")
+            raise ParamValidationError("'oversold' must be less than 'overbought'")
 
 
 def resolve_fetch_period(period: str, interval: str) -> str:

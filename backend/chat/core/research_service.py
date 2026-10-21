@@ -3,8 +3,11 @@ Isolated research_service for chat/core.
 Refactored to use unified MarketDataService.
 Ensures 100% architectural consistency and resolves direct yfinance usage.
 """
+import logging
 from typing import Dict, Any
 from backend.services.market_data import market_service
+
+logger = logging.getLogger(__name__)
 
 def generate_research_report(ticker: str, market: str = "us") -> Dict[str, Any]:
     """
@@ -41,8 +44,8 @@ def generate_research_report(ticker: str, market: str = "us") -> Dict[str, Any]:
             "status": "success",
         }
     except Exception as e:
-        print(f"[research_service] generate_research_report({ticker}) failed: {e}")
-        return {"ticker": ticker, "error": str(e), "status": "error"}
+        logger.exception("Research report generation failed for %s", ticker)
+        return {"ticker": ticker, "error": "Research report unavailable", "status": "error"}
 
 def get_fundamentals_summary(ticker: str) -> Dict[str, Any]:
     """Return key fundamental metrics for a ticker."""

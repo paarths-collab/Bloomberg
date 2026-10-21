@@ -17,6 +17,8 @@ from .core.strategy_service import (
     analyze_dataframe,
     get_available_strategies,
     get_strategy,
+    ParamValidationError,
+    get_strategy_parameter_names,
     normalize_period,
     resolve_fetch_period,
     validate_params,
@@ -90,10 +92,25 @@ def _run_analysis(
         strategy_params = _parse_params(params)
         try:
             instance = get_strategy(strategy_id, **strategy_params)
-            validate_params(instance, strategy_params)
-        except (TypeError, ValueError, OverflowError) as e:
+        except (TypeError, ValueError, OverflowError):
+            # Arbitrary constructor error text is never sent to the client.
+            logger.warning("Invalid params for strategy %s", strategy_id, exc_info=True)
+            accepted = ", ".join(get_strategy_parameter_names(strategy_id)) or "none"
             raise HTTPException(
-                status_code=400, detail=f"Invalid params for strategy '{strategy_id}': {e}"
+                status_code=400,
+                detail=f"Invalid params for strategy '{strategy_id}'. Accepted parameters: {accepted}",
+            )
+        try:
+            validate_params(instance, strategy_params)
+        except ParamValidationError as e:
+            # Our own validation text, e.g. "'fast_period' must be a positive integer".
+            raise HTTPException(status_code=400, detail=str(e))
+        except (TypeError, ValueError, OverflowError):
+            logger.warning("Invalid params for strategy %s", strategy_id, exc_info=True)
+            accepted = ", ".join(get_strategy_parameter_names(strategy_id)) or "none"
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid params for strategy '{strategy_id}'. Accepted parameters: {accepted}",
             )
 
         interval = (interval or "1d").strip().lower()

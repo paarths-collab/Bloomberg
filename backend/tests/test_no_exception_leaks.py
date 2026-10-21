@@ -45,7 +45,6 @@ ALLOWLIST = [
     ("backtest/service.py", "'error': str(e), 'metrics': None"),
     # Strategy / period parameter validation raised by our own strategy registry and validators.
     ("technical/main.py", "HTTPException(status_code=400, detail=str(e))"),
-    ("technical/main.py", "Invalid params for strategy"),
     # ReproduceError is our own typed error with a fixed, hand-written message.
     ("experiments/routes.py", "'message': exc.message"),
 ]
@@ -54,17 +53,7 @@ ALLOWLIST = [
 # owned by other workstreams).  This list must only ever shrink: fix the code, then delete the
 # entry.  New leaks must be fixed, not added here.
 PENDING_FIXES = [
-    ("backtest/core/groq_agent.py", "return f'Error calling Groq API: {str(e)}'"),
-    ("backtest/core/groq_agent.py", "return f'Error calling Groq vision API: {str(e)}'"),
-    ("chat/core/groq_agent.py", "return f'Error calling Groq API: {str(e)}'"),
-    ("chat/core/groq_agent.py", "return f'Error calling Groq vision API: {str(e)}'"),
-    ("chat/core/position_sizing_service.py", "{'error': str(e)}"),
-    ("chat/core/research_service.py", "'error': str(e)"),
-    ("chat/core/trade_levels_service.py", "'error': str(e)"),
-    ("chat/stock_advisor.py", "return f'[Gemini error: {e}]'"),
-    ("chat/stock_advisor.py", "return f'[Groq error: {e}]'"),
     ("portfolio/investor_profile.py", "HTTPException(status_code=422, detail=str(exc))"),
-    ("portfolio/reports.py", "{'success': False, 'error': str(e)}"),
 ]
 
 

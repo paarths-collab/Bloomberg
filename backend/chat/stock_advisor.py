@@ -74,8 +74,8 @@ def _call_gemini(prompt: str) -> str:
         response = model.generate_content(prompt)
         return response.text
     except Exception as e:
-        logger.warning(f"Gemini call failed: {e}")
-        return f"[Gemini error: {e}]"
+        logger.exception("Gemini call failed")
+        return "[Gemini error: AI analysis unavailable]"
 
 
 def _call_groq(prompt: str) -> str:
@@ -94,8 +94,8 @@ def _call_groq(prompt: str) -> str:
         )
         return resp.choices[0].message.content
     except Exception as e:
-        logger.warning(f"Groq call failed: {e}")
-        return f"[Groq error: {e}]"
+        logger.exception("Groq call failed")
+        return "[Groq error: AI analysis unavailable]"
 
 
 # ---------------------------------------------------------------------------
