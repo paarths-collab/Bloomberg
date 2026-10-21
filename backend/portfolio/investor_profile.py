@@ -202,10 +202,11 @@ def _parse_holdings_blob(blob: Optional[str]) -> Dict[str, Dict[str, Any]]:
         return {}
     try:
         return _normalize_holdings(json.loads(blob))
-    except (ValueError, TypeError, RecursionError) as exc:
+    except (ValueError, TypeError, RecursionError):
+        logger.exception("Stored holdings are not valid JSON holdings")
         raise HTTPException(
             status_code=409,
-            detail=f"Stored holdings are not valid ({exc}). Re-save the profile with valid holdings.",
+            detail="Stored holdings are not valid. Re-save the profile with valid holdings.",
         )
 
 
@@ -576,19 +577,23 @@ def get_portfolio_risk(
             detail=f"Risk metrics support at most {MAX_RISK_SYMBOLS} holdings (portfolio has {len(quantities)})",
         )
     db.close()  # holdings are read; don't hold a DB connection during the upstream price fetches
-    if quantities:
-        price_history = load_price_history(list(quantities), period=period)
-        benchmark_history = load_price_history([benchmark], period=period).get(benchmark)
-    else:
-        price_history, benchmark_history = {}, None
+    try:
+        if quantities:
+            price_history = load_price_history(list(quantities), period=period)
+            benchmark_history = load_price_history([benchmark], period=period).get(benchmark)
+        else:
+            price_history, benchmark_history = {}, None
 
-    result = compute_portfolio_risk(
-        quantities,
-        price_history,
-        benchmark_history,
-        benchmark_symbol=benchmark,
-        risk_free_rate=risk_free_rate,
-    )
+        result = compute_portfolio_risk(
+            quantities,
+            price_history,
+            benchmark_history,
+            benchmark_symbol=benchmark,
+            risk_free_rate=risk_free_rate,
+        )
+    except Exception:
+        logger.exception("Risk computation failed")
+        raise HTTPException(status_code=500, detail="Risk computation failed")
     return {**result, "period": period, "as_of": _now_iso()}
 
 
