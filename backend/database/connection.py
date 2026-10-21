@@ -56,16 +56,47 @@ def _create_engine_for(db_url: str):
     return create_engine(db_url, connect_args=connect_args, **_engine_options_for(db_url))
 
 
+_SENSITIVE_QUERY_PARAM_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(sslpassword|password|passwd|pwd)=([^&\s#'\"]*)",
+    re.IGNORECASE,
+)
+_MIN_FREE_TEXT_SECRET_LEN = 3
+
+
+def _mask_query_secrets(text_value: str) -> str:
+    """Mask the values of password-like query parameters (password=, passwd=, sslpassword=, pwd=)."""
+    return _SENSITIVE_QUERY_PARAM_RE.sub(lambda m: f"{m.group(1)}=***", text_value)
+
+
+def _split_userinfo(rest: str):
+    """Split the part of a URL after "://" into (userinfo or None, remainder).
+
+    The query string is excluded when looking for the credentials separator so an "@" in a
+    query value cannot be mistaken for it, while the LAST "@" before the query is used so
+    passwords containing "@" are fully covered.
+    """
+    base, sep, query = rest.partition("?")
+    if "@" in base:
+        userinfo, tail_base = base.rsplit("@", 1)
+        return userinfo, tail_base + sep + query
+    return None, rest
+
+
 def _safe_db_url(db_url: str) -> str:
-    """Return a loggable form of a DB URL with username and password masked."""
+    """Return a loggable form of a DB URL with username, password and query-string passwords masked."""
     if "://" not in db_url:
         return "<unparseable database url>"
     prefix, rest = db_url.split("://", 1)
-    if "@" in rest:
-        # Split on the LAST "@" so passwords containing "@" are fully masked.
-        _, tail = rest.rsplit("@", 1)
-        return f"{prefix}://***:***@{tail}"
-    return db_url
+    userinfo, tail = _split_userinfo(rest)
+    if userinfo is not None:
+        return _mask_query_secrets(f"{prefix}://***:***@{tail}")
+    return _mask_query_secrets(db_url)
+
+
+def _replace_standalone(text_value: str, token: str) -> str:
+    """Replace `token` only where it is not embedded in a longer word-like run."""
+    pattern = r"(?<![A-Za-z0-9_])" + re.escape(token) + r"(?![A-Za-z0-9_])"
+    return re.sub(pattern, "***", text_value)
 
 
 def redact_db_secrets(message: str) -> str:
@@ -74,15 +105,33 @@ def redact_db_secrets(message: str) -> str:
     for url in (DATABASE_URL, SQLITE_FALLBACK_URL, _active_database_url):
         if not url or "://" not in url:
             continue
+        # 1. Full URL forms first (works for credentials of any length).
         redacted = redacted.replace(url, _safe_db_url(url))
-        authority = url.split("://", 1)[1].rsplit("@", 1)[0] if "@" in url else ""
-        if authority:
-            user, _, password = authority.partition(":")
-            for secret in (password, user):
-                if secret:
-                    redacted = redacted.replace(secret, "***")
-                    redacted = redacted.replace(unquote(secret), "***")
-    return redacted
+        userinfo, tail = _split_userinfo(url.split("://", 1)[1])
+        secrets = []  # (token, must_be_standalone)
+        if userinfo is not None:
+            for form in {userinfo, unquote(userinfo)}:
+                if form:
+                    redacted = redacted.replace(f"://{form}@", "://***:***@")
+            user, _, password = userinfo.partition(":")
+            for form in (password, unquote(password)):
+                if len(form) >= _MIN_FREE_TEXT_SECRET_LEN:
+                    secrets.append((form, False))
+            for form in (user, unquote(user)):
+                if len(form) >= _MIN_FREE_TEXT_SECRET_LEN:
+                    secrets.append((form, True))
+        for match in _SENSITIVE_QUERY_PARAM_RE.finditer(tail):
+            for form in (match.group(2), unquote(match.group(2))):
+                if len(form) >= _MIN_FREE_TEXT_SECRET_LEN:
+                    secrets.append((form, False))
+        # 2. Free-text pass; longest first so a short secret that is a substring of a longer one
+        #    cannot leave a fragment of the longer one behind.
+        for token, standalone in sorted(set(secrets), key=lambda item: -len(item[0])):
+            if standalone:
+                redacted = _replace_standalone(redacted, token)
+            else:
+                redacted = redacted.replace(token, "***")
+    return _mask_query_secrets(redacted)
 
 # Lazy engine creation
 _engine = None

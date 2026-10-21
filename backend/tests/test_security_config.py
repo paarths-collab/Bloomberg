@@ -104,6 +104,104 @@ def test_redact_db_secrets_scrubs_configured_urls(monkeypatch):
     assert "s3cr3t-pw" not in redacted and "alice" not in redacted
 
 
+def _patch_urls(monkeypatch, url):
+    monkeypatch.setattr(connection, "DATABASE_URL", url)
+    monkeypatch.setattr(connection, "_active_database_url", url)
+    monkeypatch.setattr(connection, "SQLITE_FALLBACK_URL", "sqlite://")
+
+
+def test_safe_db_url_password_with_at_and_colon_keeps_host():
+    url = "postgresql://bob:p@ss:w0rd@host.example:5432/db"
+    masked = connection._safe_db_url(url)
+    assert masked == "postgresql://***:***@host.example:5432/db"
+    for token in ("bob", "p@ss", "w0rd"):
+        assert token not in masked
+
+
+def test_safe_db_url_percent_encoded_password():
+    masked = connection._safe_db_url("postgresql://bob:p%40ss%3Aw0rd@host.example/db")
+    assert masked == "postgresql://***:***@host.example/db"
+
+
+def test_safe_db_url_empty_username():
+    masked = connection._safe_db_url("postgresql://:hunter2@host.example:5432/db")
+    assert masked == "postgresql://***:***@host.example:5432/db"
+    assert "hunter2" not in masked
+
+
+@pytest.mark.parametrize("key", ["password", "passwd", "sslpassword", "pwd", "PASSWORD", "SslPassword"])
+def test_safe_db_url_masks_query_string_passwords(key):
+    masked = connection._safe_db_url(f"postgresql://host.example/db?user=u&{key}=hunter2&sslmode=require")
+    assert "hunter2" not in masked
+    assert f"{key}=***" in masked
+    assert masked.startswith("postgresql://host.example/db?user=u&")
+    assert masked.endswith("&sslmode=require")
+
+
+def test_safe_db_url_masks_both_userinfo_and_query_password():
+    masked = connection._safe_db_url("postgresql://alice:s3cr3t-pw@db.internal/prod?password=hunter2")
+    assert masked == "postgresql://***:***@db.internal/prod?password=***"
+
+
+def test_safe_db_url_at_sign_in_query_value_does_not_hide_host():
+    masked = connection._safe_db_url("postgresql://host.example/db?application_name=a@b&password=hunter2")
+    assert masked.startswith("postgresql://host.example/db?")
+    assert "hunter2" not in masked
+
+
+def test_redact_db_secrets_password_with_at_and_colon(monkeypatch):
+    _patch_urls(monkeypatch, "postgresql://bob:p@ss:w0rd@host.example/db")
+    redacted = connection.redact_db_secrets("failed: p@ss:w0rd for bob at postgresql://bob:p@ss:w0rd@host.example/db")
+    for token in ("bob", "p@ss", "w0rd"):
+        assert token not in redacted
+    assert "host.example/db" in redacted
+
+
+def test_redact_db_secrets_percent_encoded_password(monkeypatch):
+    _patch_urls(monkeypatch, "postgresql://bob:p%40ss%3Aw0rd@host.example/db")
+    redacted = connection.redact_db_secrets("bad password p@ss:w0rd; url postgresql://bob:p%40ss%3Aw0rd@host.example/db")
+    assert "p@ss" not in redacted and "p%40ss" not in redacted and "bob" not in redacted
+    assert "host.example" in redacted
+
+
+def test_redact_db_secrets_empty_username(monkeypatch):
+    _patch_urls(monkeypatch, "postgresql://:hunter2@host.example/db")
+    redacted = connection.redact_db_secrets("auth failed with hunter2 at postgresql://:hunter2@host.example/db")
+    assert "hunter2" not in redacted
+    assert "host.example" in redacted
+
+
+def test_redact_db_secrets_query_string_passwords(monkeypatch):
+    _patch_urls(monkeypatch, "postgresql://host.example/db?user=u&password=hunter2&sslpassword=keypass9")
+    redacted = connection.redact_db_secrets(
+        "boom postgresql://host.example/db?user=u&password=hunter2&sslpassword=keypass9 "
+        "also passwd=other1 pwd=other2 and bare hunter2"
+    )
+    for token in ("hunter2", "keypass9", "other1", "other2"):
+        assert token not in redacted
+    assert "host.example/db" in redacted
+
+
+def test_redact_db_secrets_short_credentials_do_not_mangle_text(monkeypatch):
+    _patch_urls(monkeypatch, "postgresql://a:b@h/d")
+    text_in = "a table abc about b"
+    assert connection.redact_db_secrets(text_in) == text_in
+
+    redacted = connection.redact_db_secrets(f"{text_in} via postgresql://a:b@h/d and postgresql://a:b@h/other")
+    assert redacted.startswith(text_in)
+    assert "a:b@" not in redacted
+    assert "postgresql://***:***@h/d" in redacted
+    assert "postgresql://***:***@h/other" in redacted
+
+
+def test_redact_db_secrets_long_username_only_replaced_as_whole_word(monkeypatch):
+    _patch_urls(monkeypatch, "postgresql://alice:s3cr3t-pw@db.internal/prod")
+    redacted = connection.redact_db_secrets("alice failed; malicesaid alicex; pw=s3cr3t-pw!")
+    assert redacted.startswith("*** failed;")
+    assert "malicesaid alicex" in redacted
+    assert "s3cr3t-pw" not in redacted
+
+
 # --- Global exception handler -----------------------------------------------
 
 @pytest.mark.asyncio
