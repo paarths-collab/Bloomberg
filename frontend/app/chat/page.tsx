@@ -6,7 +6,7 @@ import {
   Terminal, Send, Loader2, GripVertical,
   TrendingUp, BarChart3, AlertTriangle, Activity, Globe
 } from 'lucide-react'
-import { getWsUrl, stockAdvisorAPI, superAgentAPI, API_BASE, backtestAPI, extractErrorMessage, type SuperAgentResponse } from '@/lib/api'
+import { getWsUrl, stockAdvisorAPI, superAgentAPI, backtestAPI, extractErrorMessage, type SuperAgentResponse } from '@/lib/api'
 import { MessageBubble, AnalysisRack, type Message, type RackSnapshot, type ChartPoint } from '@/components/ChatComponents'
 
 const WS_URL = getWsUrl('/ws/live')
@@ -544,18 +544,14 @@ export default function ChatPage() {
 
     if (shouldUseBacktest) {
       try {
-        const response = await fetch(`${API_BASE}/backtest/run`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            symbol: btTicker!,
-            market: getMarketFromTicker(btTicker!),
-            strategies,
-            interval: '1d',
-            lookback_days: 365,
-          }),
-        }).then(r => r.json())
-        const content = formatBacktestContent(response, btTicker!, strategies)
+        const response = await backtestAPI.run({
+          symbol: btTicker!,
+          market: getMarketFromTicker(btTicker!),
+          strategies,
+          interval: '1d',
+          range: '1y',
+        })
+        const content = formatBacktestContent(response as Record<string, unknown>, btTicker!, strategies)
         setMessages(prev => {
           const filtered = prev.filter(m => !m.isStreaming)
           return [...filtered, { id: uid(), role: 'assistant', content, timestamp: new Date() }]

@@ -31,6 +31,7 @@
   "news.live": { "method": "GET", "path": "/api/news/live" },
 
   "investorProfile.portfolio": { "method": "GET", "path": "/api/portfolio/api/investor-profile/portfolio" },
+  "investorProfile.risk": { "method": "GET", "path": "/api/portfolio/api/investor-profile/portfolio/risk" },
 
   "ws.live": { "method": "WS", "path": "/ws/live" }
 }

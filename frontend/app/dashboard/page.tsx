@@ -103,9 +103,10 @@ function TimeDisplay() {
       return [now.getHours(), now.getMinutes(), now.getSeconds()]
         .map(n => String(n).padStart(2, '0')).join(':')
     }
-    setTime(fmt())
+    // First tick is deferred (not a synchronous setState in the effect); still client-only to avoid a hydration mismatch.
+    const first = setTimeout(() => setTime(fmt()), 0)
     const id = setInterval(() => setTime(fmt()), 1000)
-    return () => clearInterval(id)
+    return () => { clearTimeout(first); clearInterval(id) }
   }, [])
   if (!time) return null
   return <span className="text-indigo-400 data-text tabular-nums">{time}</span>
@@ -176,15 +177,28 @@ function NeonLine({ data, color, id, unit }: { data: { v: number }[]; color: str
   )
 }
 
+// Price-dependent fields are null when the backend has no live price (price_status === 'unavailable').
 type BackendHolding = {
   symbol: string
   quantity: number
   avg_price: number
-  current_price: number
-  current_value: number
-  pl: number
-  pl_pct: number
+  current_price: number | null
+  current_value: number | null
+  pl: number | null
+  pl_pct: number | null
 }
+
+type HoldingRow = {
+  symbol: string
+  qty: number
+  avg: number
+  ltp: number | null
+  value: number | null
+  pl: number | null
+  pct: number | null
+}
+
+const UNAVAILABLE = 'Unavailable'
 
 function IndexCard({ idx, symbol }: { idx: typeof INDICES_US[0]; symbol: string }) {
   const isUp = idx.pct >= 0
@@ -234,10 +248,12 @@ export default function DashboardPage() {
   const [market, setMarket] = useState<Market>('us')
   const [refreshing, setRefreshing] = useState(false)
   const [indices, setIndices] = useState(market === 'us' ? INDICES_US : INDICES_IN)
-  const [holdings, setHoldings] = useState(market === 'us' ? HOLDINGS_US : HOLDINGS_IN)
+  const [holdings, setHoldings] = useState<HoldingRow[]>(market === 'us' ? HOLDINGS_US : HOLDINGS_IN)
   const [watchlist, setWatchlist] = useState(market === 'us' ? WATCHLIST_US : WATCHLIST_IN)
   const [macro, setMacro] = useState(market === 'us' ? FRED : RBI)
   const [error, setError] = useState<string | null>(null)
+  // Beta / Sharpe of the current holdings from GET .../portfolio/risk (null = unavailable).
+  const [risk, setRisk] = useState<{ status: 'loading' | 'done'; beta: number | null; sharpe: number | null }>({ status: 'loading', beta: null, sharpe: null })
 
   const isUS = market === 'us'
   const sym = isUS ? '$' : '₹'
@@ -255,6 +271,19 @@ export default function DashboardPage() {
         investorProfileAPI.getPortfolio(),
         fredAPI.getLatestCached(['FEDFUNDS', 'CPIAUCSL', 'UNRATE', 'DGS10']),
       ])
+
+      if (Array.isArray(portfolio?.holdings) && portfolio.holdings.length) {
+        setRisk(r => ({ ...r, status: 'loading' }))
+        investorProfileAPI.getRisk()
+          .then(res => {
+            const metricValue = (m?: { value: number | null; status: string }) =>
+              m && m.status === 'ok' && typeof m.value === 'number' && Number.isFinite(m.value) ? m.value : null
+            setRisk({ status: 'done', beta: metricValue(res?.metrics?.beta), sharpe: metricValue(res?.metrics?.sharpe_ratio) })
+          })
+          .catch(() => setRisk({ status: 'done', beta: null, sharpe: null }))
+      } else {
+        setRisk({ status: 'done', beta: null, sharpe: null })
+      }
 
       const overviewIndices = overview?.indices || {}
       const fredData = fredSnapshot?.data || {}
@@ -302,6 +331,7 @@ export default function DashboardPage() {
         setMacro(RBI)
       }
     } catch (err) {
+      setRisk({ status: 'done', beta: null, sharpe: null })
       setError(extractErrorMessage(err, 'Failed to load dashboard data from backend.'))
     } finally {
       setRefreshing(false)
@@ -312,13 +342,19 @@ export default function DashboardPage() {
     void loadBackendData()
   }, [loadBackendData])
 
-  const portfolioVal = HOLDINGS.reduce((a, h) => a + h.value, 0)
-  const portfolioPL = HOLDINGS.reduce((a, h) => a + h.pl, 0)
-  const portfolioPct = ((portfolioPL / (portfolioVal - portfolioPL)) * 100).toFixed(2)
-  const animatedPortfolioVal = useCountUp(portfolioVal, 800)
-  const animatedPortfolioPL = useCountUp(portfolioPL, 800)
-  const animatedExposure = useCountUp(1.12, 700)
-  const animatedRisk = useCountUp(1.87, 700)
+  // Totals only exist when every holding could be priced; otherwise they are unavailable (never 0).
+  const valuationComplete = HOLDINGS.every(h => h.value !== null && h.pl !== null)
+  const portfolioVal: number | null = valuationComplete ? HOLDINGS.reduce((a, h) => a + (h.value ?? 0), 0) : null
+  const portfolioPL: number | null = valuationComplete ? HOLDINGS.reduce((a, h) => a + (h.pl ?? 0), 0) : null
+  const portfolioPct = portfolioVal !== null && portfolioPL !== null
+    ? ((portfolioPL / (portfolioVal - portfolioPL)) * 100).toFixed(2)
+    : null
+  const animatedPortfolioVal = useCountUp(portfolioVal ?? 0, 800)
+  const animatedPortfolioPL = useCountUp(portfolioPL ?? 0, 800)
+  const animatedExposure = useCountUp(risk.beta ?? 0, 700)
+  const animatedRisk = useCountUp(risk.sharpe ?? 0, 700)
+  const riskText = (animated: number, value: number | null) =>
+    risk.status === 'loading' ? '…' : value === null ? UNAVAILABLE : animated.toFixed(2)
 
   const doRefresh = async () => {
     await loadBackendData()
@@ -411,10 +447,10 @@ export default function DashboardPage() {
       {/* ── System Metrics ── */}
       <div className="grid grid-cols-1 sm:grid-cols-4 gap-4 relative z-10">
         {[
-          { label: 'Portfolio Value', val: fmtVal(animatedPortfolioVal), sub: `+${portfolioPct}% TOTAL`, glow: true },
-          { label: 'Unrealized P&L', val: `${portfolioPL >= 0 ? '+' : ''}${fmtVal(animatedPortfolioPL)}`, sub: 'ESTIMATED_VALUE', glow: false },
-          { label: 'Exposure Index', val: animatedExposure.toFixed(2), sub: 'SYSTEM_CALCULATED', glow: false },
-          { label: 'Risk Efficiency', val: animatedRisk.toFixed(2), sub: 'SHARPE_ANNUAL', glow: false },
+          { label: 'Portfolio Value', val: portfolioVal === null ? UNAVAILABLE : fmtVal(animatedPortfolioVal), sub: portfolioPct === null ? 'PRICES_UNAVAILABLE' : `${Number(portfolioPct) >= 0 ? '+' : ''}${portfolioPct}% TOTAL`, glow: true },
+          { label: 'Unrealized P&L', val: portfolioPL === null ? UNAVAILABLE : `${portfolioPL >= 0 ? '+' : ''}${fmtVal(animatedPortfolioPL)}`, sub: portfolioPL === null ? 'PRICES_UNAVAILABLE' : 'ESTIMATED_VALUE', glow: false },
+          { label: 'Exposure Index', val: riskText(animatedExposure, risk.beta), sub: risk.status === 'done' && risk.beta === null ? 'UNAVAILABLE' : 'SYSTEM_CALCULATED', glow: false },
+          { label: 'Risk Efficiency', val: riskText(animatedRisk, risk.sharpe), sub: risk.status === 'done' && risk.sharpe === null ? 'UNAVAILABLE' : 'SHARPE_ANNUAL', glow: false },
         ].map(card => (
           <div key={card.label} className={card.glow ? CARD_GLOW : CARD}>
             <div className="absolute inset-0 opacity-0 group-hover:opacity-100 transition-opacity duration-300 bg-[radial-gradient(circle_at_top_right,rgba(79,107,255,0.18),transparent_60%)]" />
@@ -442,7 +478,7 @@ export default function DashboardPage() {
         <div className="lg:col-span-2 rounded-2xl border border-white/[0.07] bg-white/[0.03] backdrop-blur-xl overflow-hidden">
           <div className="px-6 py-4 border-b border-white/[0.05] flex items-center justify-between">
           <span className="data-text text-[11px] text-white/35 uppercase tracking-[0.2em] font-medium">Live Holdings</span>
-          <span className="metric-text primary-text text-[15px] tabular-nums">{fmtVal(portfolioVal)}</span>
+          <span className="metric-text primary-text text-[15px] tabular-nums">{portfolioVal === null ? UNAVAILABLE : fmtVal(portfolioVal)}</span>
         </div>
         <div className="p-4 space-y-1.5">
           {HOLDINGS.map(h => (
@@ -452,9 +488,9 @@ export default function DashboardPage() {
                 <div className="data-text text-[11px] text-white/30 mt-0.5">{h.qty} × {sym}{h.avg.toFixed(0)}</div>
               </div>
               <div className="text-right">
-                <div className="metric-text primary-text text-[14px] tabular-nums">{fmtVal(h.value)}</div>
-                <div className={`data-text text-[11px] font-medium mt-0.5 ${h.pct >= 0 ? 'text-indigo-400' : 'text-white/30'}`}>
-                  {h.pct >= 0 ? '+' : ''}{h.pct.toFixed(2)}%
+                <div className="metric-text primary-text text-[14px] tabular-nums">{h.value === null ? UNAVAILABLE : fmtVal(h.value)}</div>
+                <div className={`data-text text-[11px] font-medium mt-0.5 ${h.pct !== null && h.pct >= 0 ? 'text-indigo-400' : 'text-white/30'}`}>
+                  {h.pct === null ? UNAVAILABLE : `${h.pct >= 0 ? '+' : ''}${h.pct.toFixed(2)}%`}
                 </div>
               </div>
             </div>
@@ -462,8 +498,8 @@ export default function DashboardPage() {
         </div>
         <div className="px-6 py-3.5 border-t border-white/[0.05] flex justify-between data-text text-[12px]">
           <span className="text-white/25 uppercase tracking-wider">TOTAL P&L</span>
-          <span className={`metric-text tabular-nums ${portfolioPL >= 0 ? 'text-indigo-400' : 'text-white/35'}`}>
-            {portfolioPL >= 0 ? '+' : ''}{fmtVal(portfolioPL)} ({portfolioPct}%)
+          <span className={`metric-text tabular-nums ${portfolioPL !== null && portfolioPL >= 0 ? 'text-indigo-400' : 'text-white/35'}`}>
+            {portfolioPL === null ? UNAVAILABLE : `${portfolioPL >= 0 ? '+' : ''}${fmtVal(portfolioPL)} (${portfolioPct}%)`}
           </span>
         </div>
       </div>

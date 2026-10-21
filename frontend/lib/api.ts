@@ -633,6 +633,29 @@ export type PortfolioResponse = {
   unpriced_symbols: string[]
 }
 
+/** One computed risk metric; `value` is null (status 'unavailable') with a `reason` when it cannot be computed. */
+export type PortfolioRiskMetric = {
+  value: number | null
+  status: 'ok' | 'unavailable' | string
+  reason?: string
+}
+
+export type PortfolioRiskResponse = {
+  metrics: {
+    beta: PortfolioRiskMetric
+    sharpe_ratio: PortfolioRiskMetric
+    max_drawdown_pct: PortfolioRiskMetric
+    volatility_annualized_pct: PortfolioRiskMetric
+  }
+  benchmark?: string
+  period?: string
+  observations?: number
+  start?: string | null
+  end?: string | null
+  as_of?: string
+  [key: string]: unknown
+}
+
 // ─── API objects ─────────────────────────────────────────────────────────────
 
 export const superAgentAPI = {
@@ -727,6 +750,9 @@ export const investorProfileAPI = {
   /** Requires auth: sends the guest bearer token, refreshing it once on a 401. */
   getPortfolio: () =>
     request<PortfolioResponse>('investorProfile.portfolio', { auth: true }),
+  /** Requires auth. Historical beta / Sharpe / max drawdown / volatility of the current holdings. */
+  getRisk: () =>
+    request<PortfolioRiskResponse>('investorProfile.risk', { auth: true }),
 }
 
 // ─── Formatting ──────────────────────────────────────────────────────────────

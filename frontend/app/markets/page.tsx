@@ -297,6 +297,8 @@ export default function MarketsPage() {
   };
 
   useEffect(() => {
+    // localStorage only exists in the browser, so the cached snapshot can only be read after mount.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     const hasCache = loadFromCache();
     // Always try background refresh so cache appears immediately but data stays current.
     void fetchAllData(!hasCache);
