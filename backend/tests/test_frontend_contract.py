@@ -9,8 +9,9 @@ each entry:
   * is actually *reached* by that concrete URL (an earlier, broader route cannot shadow it);
   * for investor-profile (paper-portfolio) routes, requires ``require_user``, while
     POST /api/auth/guest stays public so the client can obtain its token;
+  * declares every query parameter that api.ts sends to it (see QUERY_PARAMS);
 
-and that api.ts and the JSON reference the same set of route ids.
+and that the route ids called from api.ts (request/buildUrl call sites) match the JSON.
 
 Runs fully offline (no network, temp DB from backend/tests/conftest.py).
 """
@@ -33,6 +34,29 @@ HTTP_METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE"}
 WS_METHOD = "WS"
 PARAM_RE = re.compile(r"\{[^}/]+\}")
 INVESTOR_PROFILE_PREFIX = "investorProfile."
+
+# A route id passed as the first argument of request(...) or buildUrl(...), with optional
+# generic type args: request<T>('id', ...), request('id'), buildUrl('id', ...).
+CALL_ID_RE = re.compile(r"\b(?:request|buildUrl)\s*(?:<[^<>()]*>)?\s*\(\s*'([a-z][A-Za-z]*\.[A-Za-z]+)'")
+
+# Route ids that api.ts never passes to request()/buildUrl(). ws.live is opened through
+# getWsUrl("/ws/live") with a path, and appears in api.ts only in the RestRouteId type.
+NON_CALL_ROUTE_IDS = {"ws.live"}
+
+# Query parameter names api.ts actually sends, per route id (derived from the call sites
+# in api.ts). Each must be declared on the matched FastAPI route's dependant.query_params.
+QUERY_PARAMS = {
+    "chat.sentimentAnalyze": ["market"],
+    "markets.candles": ["interval", "range", "market"],
+    "fred.latestLive": ["series_ids"],
+    "fred.latestCached": ["series_ids"],
+    "sectors.treemapIndices": ["market"],
+    "sectors.treemapIndicesLive": ["market"],
+    "sectors.treemapIndex": ["market", "include_prices"],
+    "sectors.treemapStock": ["market"],
+    "peers.compare": ["limit"],
+    "news.live": ["query", "limit", "cached_only"],
+}
 
 
 def _load_routes() -> dict:
@@ -146,9 +170,29 @@ def test_investor_profile_routes_reject_missing_token():
         assert response.status_code == 401, f"{route_id}: expected 401 without a token, got {response.status_code}"
 
 
+@pytest.mark.parametrize("route_id", sorted(QUERY_PARAMS))
+def test_query_params_exist_on_backend_route(route_id):
+    assert route_id in ROUTES, f"{route_id}: QUERY_PARAMS key is not in api-routes.json"
+    entry = ROUTES[route_id]
+    route = _find_declared(entry["method"], entry["path"])
+    assert route is not None, route_id
+    declared_names = {field.name for field in route.dependant.query_params}
+    missing = [name for name in QUERY_PARAMS[route_id] if name not in declared_names]
+    assert not missing, (
+        f"{route_id}: api.ts sends query params {missing} that {entry['path']} does not declare "
+        f"(declared: {sorted(declared_names)})"
+    )
+
+
 def test_api_ts_and_routes_json_reference_the_same_ids():
     source = API_TS.read_text(encoding="utf-8")
-    referenced = set(re.findall(r"'([a-z][A-Za-z]*\.[a-z][A-Za-z]*)'", source))
+    # Only ids passed to request(...) or buildUrl(...) count as usages. A bare quoted
+    # dotted string elsewhere (types, comments) does not.
+    called = set(CALL_ID_RE.findall(source))
     declared = set(ROUTES)
-    assert referenced - declared == set(), f"api.ts uses ids missing from api-routes.json: {sorted(referenced - declared)}"
-    assert declared - referenced == set(), f"api-routes.json ids never used by api.ts: {sorted(declared - referenced)}"
+    assert called, "found no request()/buildUrl() calls with a route id in api.ts"
+    assert called - declared == set(), f"api.ts calls ids missing from api-routes.json: {sorted(called - declared)}"
+    unused = declared - called
+    assert unused == NON_CALL_ROUTE_IDS, f"api-routes.json ids never called by api.ts: {sorted(unused)}"
+    for route_id in NON_CALL_ROUTE_IDS:
+        assert f"'{route_id}'" in source, f"{route_id} is no longer referenced by api.ts at all"

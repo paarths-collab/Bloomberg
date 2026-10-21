@@ -12,9 +12,15 @@
  *   directly (it must include the "/api" segment, e.g. https://host/api).
  * - Investor-profile (paper portfolio) routes require `Authorization: Bearer
  *   <token>`. The token is an anonymous guest token from POST /api/auth/guest,
- *   cached in localStorage (all storage access is guarded). On a 401 the token
- *   is refreshed once and the request retried. `user_id` is never sent: the
- *   backend derives identity from the token.
+ *   cached in localStorage (all storage access is guarded). On a 401 the request
+ *   is retried once with the current cached token if another call already
+ *   refreshed it; only when the failing token is still the cached one is a new
+ *   guest token forced. `user_id` is never sent: the backend derives identity
+ *   from the token.
+ *   Known limitation (frontend follow-up): the backend has no token-refresh
+ *   endpoint, so a refresh (on expiry or a 401) mints a NEW guest identity via
+ *   POST /api/auth/guest. The previous paper portfolio becomes unreachable from
+ *   this client after that point.
  *
  * Route resolution notes (chosen from the BACKEND, not guessed):
  * - sentimentAPI.analyze(symbol, market) -> GET /api/chat/sentiment/analyze/{symbol}?market=
@@ -112,7 +118,14 @@ export function buildUrl(id: RestRouteId, params?: PathParams, query?: Query): s
   return `${API_BASE}${fillPath(def.path, params).slice(ROUTE_PREFIX.length)}${encodeQuery(query)}`
 }
 
-/** ws(s):// URL for a websocket path such as "/ws/live". */
+/**
+ * ws(s):// URL for a websocket path such as "/ws/live".
+ *
+ * Resolution: NEXT_PUBLIC_BACKEND_URL (http(s) is mapped to ws(s)) when set;
+ * otherwise the page's own origin, which only reaches the backend if the host
+ * proxies WebSocket upgrades. Next.js rewrites do not proxy upgrades, so on
+ * serverless hosts NEXT_PUBLIC_BACKEND_URL MUST be set for WebSockets to work.
+ */
 export function getWsUrl(path: string): string {
   const p = path.startsWith('/') ? path : `/${path}`
   const backend = process.env.NEXT_PUBLIC_BACKEND_URL
@@ -305,7 +318,14 @@ async function request<T>(id: RestRouteId, opts: RequestOptions = {}): Promise<T
   let res = await send(id, opts, token)
 
   if (res.status === 401 && opts.auth) {
-    token = await getGuestToken(true)
+    // Another call may already have refreshed the cached token; if so, retry with it
+    // instead of minting yet another guest identity. Force a new token only when the
+    // failing token is still the cached one.
+    const cached = memoryToken
+    token =
+      tokenIsFresh(cached) && cached.access_token !== token
+        ? cached.access_token
+        : await getGuestToken(true)
     res = await send(id, opts, token)
   }
 
