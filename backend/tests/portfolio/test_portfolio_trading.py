@@ -295,6 +295,7 @@ async def test_valuation_never_substitutes_cost_basis(client, new_user, prefix, 
 async def test_empty_portfolio_shape(client, new_user, prefix):
     _, hdr = await new_user()
     pf = await _portfolio(client, prefix, hdr)
+    assert pf.pop("valued_at")  # additive as-of timestamp, covered in test_valued_at.py
     assert pf == {
         "holdings": [], "total_invested": 0.0, "total_value": 0.0, "total_pl": 0.0,
         "total_pl_pct": 0, "valuation_complete": True, "unpriced_symbols": [],

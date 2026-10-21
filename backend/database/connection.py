@@ -4,7 +4,7 @@ import logging
 from contextlib import contextmanager
 from urllib.parse import unquote
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import sessionmaker, declarative_base
 
@@ -237,7 +237,7 @@ def get_db_session():
 # =====================================================
 
 def init_db():
-    """Create all tables"""
+    """Create all tables, then add any ORM columns missing from tables that already existed."""
     # Ensure models are imported so metadata is populated
     from backend.database import models  # noqa: F401
     try:
@@ -248,6 +248,114 @@ def init_db():
             Base.metadata.create_all(bind=get_engine())
         else:
             raise
+    ensure_schema_columns()
+
+
+def _scalar_default_literal(column, dialect):
+    """SQL literal for a plain Python scalar column default (int/float/str/bool), else None."""
+    default = column.default
+    if default is None or not getattr(default, "is_scalar", False):
+        return None
+    value = default.arg
+    if isinstance(value, bool) or isinstance(value, (int, float, str)):
+        try:
+            processor = column.type.literal_processor(dialect)
+            if processor is not None:
+                return processor(value)
+        except Exception:
+            return None
+    return None
+
+
+def _add_column_ddl(table, column, dialect):
+    """(ALTER TABLE ... ADD COLUMN statement, None) or (None, reason it cannot be added safely)."""
+    if column.primary_key:
+        return None, "primary key column cannot be added to an existing table"
+    preparer = dialect.identifier_preparer
+    spec = f"{preparer.format_column(column)} {column.type.compile(dialect=dialect)}"
+    if not column.nullable:
+        default_sql = None
+        if column.server_default is not None:
+            default_sql = dialect.ddl_compiler(dialect, None).get_column_default_string(column)
+        if default_sql is None:
+            default_sql = _scalar_default_literal(column, dialect)
+        if default_sql is None:
+            return None, "NOT NULL column without an expressible default"
+        if dialect.name == "sqlite" and default_sql.strip().upper().startswith(("CURRENT_", "(")):
+            return None, "SQLite cannot add a NOT NULL column with a non-constant default"
+        spec += f" DEFAULT {default_sql} NOT NULL"
+    if_not_exists = "IF NOT EXISTS " if dialect.name == "postgresql" else ""
+    return f"ALTER TABLE {preparer.format_table(table)} ADD COLUMN {if_not_exists}{spec}", None
+
+
+_warned_schema_columns = set()  # (table, column) pairs already warned about in this process
+
+
+def ensure_schema_columns(engine=None, metadata=None):
+    """Add ORM columns that are missing from tables which already exist in the database.
+
+    ``create_all`` never alters existing tables, so a column added to a model after its table was
+    first created (e.g. ``experiment_trials.result_hash``) would otherwise break queries.
+
+    Deliberately conservative:
+      * only ``ALTER TABLE ... ADD COLUMN``; nothing is dropped, retyped or otherwise altered, and
+        indexes, constraints and foreign keys of existing tables are left untouched (a newly added
+        column gets none of its model's index / unique / foreign-key declarations);
+      * nullable columns are added as plain nullable columns (existing rows get NULL);
+      * NOT NULL columns are added only when they have a server default or a plain scalar Python
+        default that can be expressed as a SQL literal; otherwise they are skipped with a WARNING
+        (as are primary-key columns), since existing rows could not satisfy the constraint;
+      * idempotent: a second run finds nothing to do, and a concurrent "column already exists" is
+        treated as success. Failures are logged (credentials redacted) and never raised, so a
+        migration problem cannot stop application startup.
+
+    ``engine`` / ``metadata`` default to the application's engine and ``Base.metadata``. Returns
+    ``{"added": ["table.column", ...], "skipped": [("table.column", reason), ...]}``.
+    """
+    summary = {"added": [], "skipped": []}
+    try:
+        engine = engine or get_engine()
+        metadata = metadata if metadata is not None else Base.metadata
+        dialect = engine.dialect
+        inspector = inspect(engine)
+        existing_tables = set(inspector.get_table_names())
+        for table in metadata.sorted_tables:
+            if table.name not in existing_tables:
+                continue
+            present = {c["name"] for c in inspector.get_columns(table.name)}
+            for column in table.columns:
+                if column.name in present:
+                    continue
+                label = f"{table.name}.{column.name}"
+                statement, reason = _add_column_ddl(table, column, dialect)
+                if statement is None:
+                    summary["skipped"].append((label, reason))
+                    if label not in _warned_schema_columns:  # init_db may run repeatedly
+                        _warned_schema_columns.add(label)
+                        logger.warning(
+                            "Schema migration: cannot add missing column %s (%s); add it manually.",
+                            redact_db_secrets(label), reason,
+                        )
+                    continue
+                try:
+                    with engine.begin() as connection:
+                        connection.exec_driver_sql(statement)
+                except Exception as exc:
+                    if _is_already_exists_error(exc):
+                        continue  # another process added it first
+                    summary["skipped"].append((label, "ALTER TABLE failed"))
+                    logger.warning(
+                        "Schema migration: adding column %s failed: %s [SQL: %s]",
+                        redact_db_secrets(label),
+                        redact_db_secrets(str(getattr(exc, "orig", None) or exc)),
+                        redact_db_secrets(statement),
+                    )
+                    continue
+                summary["added"].append(label)
+                logger.info("Schema migration: added column %s", redact_db_secrets(label))
+    except Exception as exc:
+        logger.warning("Schema migration check failed: %s", redact_db_secrets(f"{type(exc).__name__}: {exc}"))
+    return summary
 
 # --- init.sql statement splitting -------------------------------------------------------------
 

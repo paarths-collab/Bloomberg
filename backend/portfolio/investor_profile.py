@@ -427,6 +427,11 @@ def get_portfolio(user_id: Optional[str] = None, user: str = Depends(require_use
     Portfolio with live valuation and P/L. Holdings whose live price is unavailable are
     reported with null price/value/P&L and ``price_status: "unavailable"`` - cost basis is
     never substituted for a missing price - and portfolio totals are null in that case.
+
+    ``valued_at`` (UTC ISO-8601) is when the prices were fetched, i.e. the as-of time of the
+    whole valuation. Per-price timestamps are not provided: the price helper
+    (``market_service.get_current_price``) returns a bare number with no quote time, so none is
+    reported per holding.
     """
     _check_identity(user_id, user)
     try:
@@ -480,6 +485,8 @@ def get_portfolio(user_id: Optional[str] = None, user: str = Depends(require_use
             "price_status": "live",
         })
 
+    valued_at = _now_iso()  # prices were fetched in the loop above (also set when none were available)
+
     # Priced holdings first (largest value first), unpriced last by cost basis.
     holdings.sort(key=lambda h: (h["current_value"] is None, -(h["current_value"] if h["current_value"] is not None else h["total_invested"])))
 
@@ -493,6 +500,7 @@ def get_portfolio(user_id: Optional[str] = None, user: str = Depends(require_use
         "total_pl_pct": ((total_pl / total_invested * 100) if total_invested > 0 else 0) if complete else None,
         "valuation_complete": complete,
         "unpriced_symbols": unpriced,
+        "valued_at": valued_at,
     }
 
 
@@ -510,6 +518,10 @@ def get_portfolio_risk(
     holdings held statically over ``period``, computed from price history (see
     backend/portfolio/core/risk_metrics.py for the method). ``benchmark`` defaults to SPY, or ^NSEI
     when the profile's market is India. An empty portfolio returns 200 with unavailable metrics.
+
+    ``as_of`` and ``valued_at`` carry the same UTC ISO-8601 timestamp, taken once the price history
+    had been fetched (``as_of`` is the pre-existing field; ``valued_at`` matches GET /portfolio).
+    Per-price timestamps are not provided by the price helpers.
     """
     _check_identity(user_id, user)
     if benchmark is not None:
@@ -556,7 +568,8 @@ def get_portfolio_risk(
     except Exception:
         logger.exception("Risk computation failed")
         raise HTTPException(status_code=500, detail="Risk computation failed")
-    return {**result, "period": period, "as_of": _now_iso()}
+    valued_at = _now_iso()
+    return {**result, "period": period, "as_of": valued_at, "valued_at": valued_at}
 
 
 router.include_router(shared_router)

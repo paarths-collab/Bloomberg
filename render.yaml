@@ -21,6 +21,22 @@ services:
         value: "false"
       - key: AUTH_SECRET_KEY
         sync: false
+      # Guest-token rate limiting (POST /api/auth/guest); see DEPLOY_VERCEL_RENDER.md.
+      # Behind Render's proxy request.client is the proxy, so the client IP must come from
+      # X-Forwarded-For. HOPS "2" assumes the documented topology: browser -> Vercel (the Next
+      # rewrite adds the client IP) -> Render proxy -> app. That is UNVERIFIED until deployed.
+      # A client calling Render directly (no Vercel) needs "1". A wrong value is unsafe: too high
+      # lets clients spoof their key, too low collapses all users into one shared key.
+      - key: AUTH_TRUST_PROXY
+        value: "1"
+      - key: AUTH_TRUST_PROXY_HOPS
+        value: "2"
+      - key: AUTH_GUEST_RATE_LIMIT
+        value: "20"
+      - key: AUTH_GUEST_RATE_WINDOW_SECONDS
+        value: "3600"
+      - key: AUTH_GUEST_GLOBAL_LIMIT
+        value: "2000"
       - key: FMP_API_KEY
         sync: false
       - key: FINNHUB_API_KEY
