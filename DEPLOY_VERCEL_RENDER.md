@@ -16,6 +16,20 @@
 Health URL:
 - `https://<your-render-domain>/health`
 
+### Backend environment
+
+Set these in Render -> Environment (`render.yaml` declares the keys; secret values are entered in the dashboard only):
+
+- `DATABASE_URL`: database connection string. Defaults to a local SQLite file, which is ephemeral on Render. Set this to a persistent database.
+- `DB_FALLBACK_TO_SQLITE`: defaults to `false`. When `true`, a failing configured database silently switches to local SQLite. Not recommended in production.
+- `CORS_ORIGINS`: comma-separated list of frontend origins, merged with the localhost defaults. Wildcard `*` is ignored.
+- `AUTH_SECRET_KEY`: signs guest bearer tokens. Use a random value of at least 32 characters, and keep it the same across all instances. If unset, a per-process key is used and tokens stop working after a restart.
+- `AUTH_TOKEN_TTL_HOURS`: optional token lifetime in hours. Defaults to `720`.
+
+`/health` returns only `status`, `version`, `database_connected`, and `database_fallback_active`.
+
+Paper-portfolio routes require `Authorization: Bearer <token>`. Obtain the token from `POST /api/auth/guest`.
+
 ## 2) Deploy Frontend on Vercel
 
 1. In Vercel: Add New -> Project.

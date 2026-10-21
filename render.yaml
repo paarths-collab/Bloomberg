@@ -15,6 +15,12 @@ services:
         value: "false"
       - key: CORS_ORIGINS
         sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: DB_FALLBACK_TO_SQLITE
+        value: "false"
+      - key: AUTH_SECRET_KEY
+        sync: false
       - key: FMP_API_KEY
         sync: false
       - key: FINNHUB_API_KEY
