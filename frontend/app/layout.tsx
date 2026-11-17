@@ -2,15 +2,14 @@ import type { Metadata } from 'next'
 import './globals.css'
 import { Inter, Syne, DM_Mono } from 'next/font/google'
 import NavWrapper from '@/components/NavWrapper'
-import GlobalPageAnalyzer from '@/components/GlobalPageAnalyzer'
 
 const inter = Inter({ subsets: ['latin'], variable: '--font-inter' })
 const syne = Syne({ subsets: ['latin'], variable: '--font-syne' })
 const dmMono = DM_Mono({ weight: ['400', '500'], subsets: ['latin'], variable: '--font-mono' })
 
 export const metadata: Metadata = {
-  title: 'Bloomberg Quant — Intelligent Quantitative Finance',
-  description: 'Orchestrating a decentralized committee of AI Agents and institutional-grade mathematics to deliver explainable alpha.',
+  title: 'Investing workspace',
+  description: 'Explore investing, review a practice portfolio, and understand the tools available.',
 }
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
@@ -23,7 +22,6 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
             {children}
           </div>
         </NavWrapper>
-        <GlobalPageAnalyzer />
       </body>
     </html>
   )

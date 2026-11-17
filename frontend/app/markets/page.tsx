@@ -1,20 +1,22 @@
 'use client';
 
 import { useEffect, useState, useCallback } from 'react';
-import { AreaChart, Area, ResponsiveContainer } from 'recharts';
 import { marketAPI, fredAPI, extractErrorMessage } from '@/lib/api';
 
 // --- Constants & Styles ---
-const BLUE_ACCENT = '#4f46e5';
 const CARD_GLOW = "group relative rounded-2xl border border-white/[0.07] bg-white/[0.03] backdrop-blur-xl shadow-[0_0_24px_rgba(79,70,229,0.04)] hover:shadow-[0_0_32px_rgba(79,70,229,0.12)] hover:border-indigo-500/20 hover:bg-white/[0.05] transition-all duration-500 overflow-hidden hover:-translate-y-1";
-const CACHE_KEY = 'bloomberg_market_data_v1';
+// v2: v1 snapshots could contain hard-coded placeholder prices, so they are never read back.
+const CACHE_KEY = 'bloomberg_market_data_v2';
 const CACHE_TTL = 4 * 60 * 60 * 1000; // 4 hours
+const UNAVAILABLE = 'Unavailable';
 
 type MarketItem = {
   name: string;
   id: string;
-  change_percent: number;
-  price: number;
+  /** null when the provider returned no value (rendered as "Unavailable"). */
+  change_percent: number | null;
+  /** null when the provider returned no value (rendered as "Unavailable"). */
+  price: number | null;
   sym: string;
 };
 
@@ -25,6 +27,8 @@ type MarketsPayload = {
   macroRates: MarketItem[];
 };
 
+type MarketStatus = 'loading' | 'live' | 'cached' | 'unavailable';
+
 type QuotePoint = {
   value?: number;
   price?: number;
@@ -34,74 +38,145 @@ type QuotePoint = {
 const asQuotePoint = (value: unknown): QuotePoint =>
   typeof value === 'object' && value !== null ? (value as QuotePoint) : {};
 
-const STATIC_GLOBAL_INDICES: MarketItem[] = [
-  { name: 'S&P 500', id: 'SPX', change_percent: 0.82, price: 5842.47, sym: '$' },
-  { name: 'NASDAQ 100', id: 'NDX', change_percent: 1.14, price: 20378.92, sym: '$' },
-  { name: 'NIFTY 50', id: 'NIFTY', change_percent: 0.5, price: 22402.4, sym: '₹' },
-  { name: 'DOW JONES', id: 'DJI', change_percent: -0.12, price: 43192.05, sym: '$' },
-  { name: 'SENSEX', id: 'BSESN', change_percent: -0.13, price: 73877.3, sym: '₹' },
+const finiteNumber = (value: unknown): number | null =>
+  typeof value === 'number' && Number.isFinite(value) ? value : null;
+
+// Card labels only; no prices live here. A card without a real value renders "Unavailable".
+type CardDef = { name: string; id: string; sym: string };
+
+const INDEX_DEFS: CardDef[] = [
+  { name: 'S&P 500', id: 'SPX', sym: '$' },
+  { name: 'NASDAQ 100', id: 'NDX', sym: '$' },
+  { name: 'NIFTY 50', id: 'NIFTY', sym: '₹' },
+  { name: 'DOW JONES', id: 'DJI', sym: '$' },
+  { name: 'SENSEX', id: 'BSESN', sym: '₹' },
 ];
 
-const STATIC_COMMODITIES: MarketItem[] = [
-  { name: 'Gold Spot', id: 'GOLD', change_percent: 0.54, price: 2242.1, sym: '$' },
-  { name: 'WTI Crude', id: 'WTI', change_percent: 1.21, price: 81.42, sym: '$' },
-  { name: 'Brent Crude', id: 'BRENT', change_percent: 1.15, price: 86.5, sym: '$' },
-  { name: 'Silver Spot', id: 'SILVER', change_percent: -0.84, price: 25.14, sym: '$' },
+const COMMODITY_DEFS: CardDef[] = [
+  { name: 'Gold Spot', id: 'GOLD', sym: '$' },
+  { name: 'WTI Crude', id: 'WTI', sym: '$' },
+  { name: 'Brent Crude', id: 'BRENT', sym: '$' },
+  { name: 'Silver Spot', id: 'SILVER', sym: '$' },
 ];
 
-const STATIC_FX_PAIRS: MarketItem[] = [
-  { name: 'EUR / USD', id: 'EURUSD', change_percent: 0.12, price: 1.0842, sym: '' },
-  { name: 'USD / JPY', id: 'USDJPY', change_percent: -0.21, price: 149.85, sym: '' },
-  { name: 'GBP / USD', id: 'GBPUSD', change_percent: 0.08, price: 1.2741, sym: '' },
+const FX_DEFS: CardDef[] = [
+  { name: 'EUR / USD', id: 'EURUSD', sym: '' },
+  { name: 'USD / JPY', id: 'USDJPY', sym: '' },
+  { name: 'GBP / USD', id: 'GBPUSD', sym: '' },
 ];
 
-const STATIC_MACRO_RATES: MarketItem[] = [
-  { name: 'US 10Y Yield', id: 'US10Y', change_percent: 1.05, price: 4.24, sym: '%' },
-  { name: 'VIX Index', id: 'VIX', change_percent: -4.78, price: 16.31, sym: '' },
-  { name: 'DXY Index', id: 'DXY', change_percent: 0.14, price: 104.12, sym: '' },
+const MACRO_DEFS: CardDef[] = [
+  { name: 'US 10Y Yield', id: 'US10Y', sym: '%' },
+  { name: 'VIX Index', id: 'VIX', sym: '' },
+  { name: 'DXY Index', id: 'DXY', sym: '' },
 ];
 
-// --- Mock Data Generator ---
-function makeSpark(n = 20, up = true) {
-  const arr = [];
-  let v = 100;
-  for (let i = 0; i < n; i++) {
-    v += (Math.random() - (up ? 0.4 : 0.6)) * 4;
-    arr.push({ v: Math.max(70, v) });
-  }
-  return arr;
+const toItem = (def: CardDef, price: unknown, change: unknown, invertChange = false): MarketItem => {
+  const p = finiteNumber(price);
+  if (p === null || p <= 0) return { ...def, price: null, change_percent: null };
+  const c = finiteNumber(change);
+  return { ...def, price: p, change_percent: c === null ? null : invertChange && c !== 0 ? -c : c };
+};
+
+const emptyPayload = (): MarketsPayload => ({
+  globalIndices: INDEX_DEFS.map((d) => toItem(d, null, null)),
+  commodities: COMMODITY_DEFS.map((d) => toItem(d, null, null)),
+  fxPairs: FX_DEFS.map((d) => toItem(d, null, null)),
+  macroRates: MACRO_DEFS.map((d) => toItem(d, null, null)),
+});
+
+const payloadItems = (payload: MarketsPayload): MarketItem[] => [
+  ...payload.globalIndices, ...payload.commodities, ...payload.fxPairs, ...payload.macroRates,
+];
+
+const hasAnyPrice = (payload: MarketsPayload): boolean =>
+  payloadItems(payload).some((item) => item.price !== null);
+
+// Maps the FRED (value) and yfinance overview (price) responses onto the cards. Missing -> null.
+function buildPayload(fredData: Record<string, unknown>, overview: Record<string, unknown>): MarketsPayload {
+  const f = (id: string) => asQuotePoint(fredData[id]);
+  const o = (id: string) => asQuotePoint(overview[id]);
+  const gcf = o('GC=F');
+  const goldFromOverview = (finiteNumber(gcf.price) ?? 0) > 0;
+  const goldFred = f('GOLDAMGBD228NLBM');
+  return {
+    globalIndices: [
+      toItem(INDEX_DEFS[0], f('SP500').value, f('SP500').change_pct),
+      toItem(INDEX_DEFS[1], f('NASDAQ100').value, f('NASDAQ100').change_pct),
+      toItem(INDEX_DEFS[2], o('^NSEI').price, o('^NSEI').change_pct),
+      toItem(INDEX_DEFS[3], f('DJIA').value, f('DJIA').change_pct),
+      toItem(INDEX_DEFS[4], o('^BSESN').price, o('^BSESN').change_pct),
+    ],
+    commodities: [
+      goldFromOverview
+        ? toItem(COMMODITY_DEFS[0], gcf.price, gcf.change_pct)
+        : toItem(COMMODITY_DEFS[0], goldFred.value, goldFred.change_pct),
+      toItem(COMMODITY_DEFS[1], f('DCOILWTICO').value, f('DCOILWTICO').change_pct),
+      toItem(COMMODITY_DEFS[2], f('DCOILBRENTEU').value, f('DCOILBRENTEU').change_pct),
+      toItem(COMMODITY_DEFS[3], f('NASDAQQSLVO').value, f('NASDAQQSLVO').change_pct),
+    ],
+    fxPairs: [
+      toItem(FX_DEFS[0], f('DEXUSEU').value, f('DEXUSEU').change_pct),
+      toItem(FX_DEFS[1], f('DEXJPUS').value, f('DEXJPUS').change_pct, true),
+      toItem(FX_DEFS[2], f('DEXUSUK').value, f('DEXUSUK').change_pct),
+    ],
+    macroRates: [
+      toItem(MACRO_DEFS[0], f('DGS10').value, f('DGS10').change_pct),
+      toItem(MACRO_DEFS[1], f('VIXCLS').value, f('VIXCLS').change_pct),
+      toItem(MACRO_DEFS[2], f('DTWEXBGS').value, f('DTWEXBGS').change_pct),
+    ],
+  };
 }
+
+// Re-validates a stored snapshot against the card definitions; unknown/invalid values become null.
+function normalizePayload(payload: unknown): MarketsPayload | null {
+  if (!payload || typeof payload !== 'object') return null;
+  const obj = payload as Record<string, unknown>;
+  const section = (value: unknown, defs: CardDef[]): MarketItem[] => {
+    const stored = Array.isArray(value) ? value.filter((x): x is Record<string, unknown> => typeof x === 'object' && x !== null) : [];
+    return defs.map((def) => {
+      const hit = stored.find((x) => x.id === def.id);
+      return toItem(def, hit?.price, hit?.change_percent);
+    });
+  };
+  const normalized: MarketsPayload = {
+    globalIndices: section(obj.globalIndices, INDEX_DEFS),
+    commodities: section(obj.commodities, COMMODITY_DEFS),
+    fxPairs: section(obj.fxPairs, FX_DEFS),
+    macroRates: section(obj.macroRates, MACRO_DEFS),
+  };
+  return hasAnyPrice(normalized) ? normalized : null;
+}
+
+// Header badge. "live" only for a successful fetch that returned data; "cached" only when the
+// response says so explicitly or a stored snapshot is being shown; otherwise "unavailable".
+function deriveMarketStatus(input: { fetchOk: boolean; hasData: boolean; cachedFlag?: boolean; fromStoredSnapshot?: boolean }): MarketStatus {
+  if (input.fromStoredSnapshot) return 'cached';
+  if (!input.fetchOk || !input.hasData) return 'unavailable';
+  return input.cachedFlag === true ? 'cached' : 'live';
+}
+
+const STATUS_LABEL: Record<MarketStatus, string> = {
+  loading: 'Loading',
+  live: 'Live',
+  cached: 'Cached',
+  unavailable: 'Unavailable',
+};
+
+const formatPrice = (item: MarketItem, symbol: string): string => {
+  if (item.price === null) return UNAVAILABLE;
+  const digits = item.price < 10 ? 4 : 2;
+  return `${symbol}${item.price.toLocaleString('en-US', { minimumFractionDigits: digits, maximumFractionDigits: digits })}`;
+};
+
+const formatChange = (item: MarketItem): string => {
+  if (item.change_percent === null) return UNAVAILABLE;
+  return `${item.change_percent >= 0 ? '+' : ''}${item.change_percent.toFixed(2)}%`;
+};
 
 // --- Components ---
-function MarketSpark({ data, color, id, height = 40 }: { data: { v: number }[]; color: string; id: string; height?: number }) {
-  return (
-    <div className="mt-4" style={{ height, filter: `drop-shadow(0 0 6px ${color}55)` }}>
-      <ResponsiveContainer width="100%" height="100%">
-        <AreaChart data={data} margin={{ top: 0, right: 0, bottom: 0, left: 0 }}>
-          <defs>
-            <linearGradient id={`spark-${id}`} x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stopColor={color} stopOpacity={0.15} />
-              <stop offset="100%" stopColor={color} stopOpacity={0} />
-            </linearGradient>
-          </defs>
-          <Area 
-            type="monotone" 
-            dataKey="v" 
-            stroke={color} 
-            strokeWidth={2} 
-            fill={`url(#spark-${id})`} 
-            dot={false} 
-            isAnimationActive={true}
-          />
-        </AreaChart>
-      </ResponsiveContainer>
-    </div>
-  );
-}
-
 function MarketCard({ item, symbol, size = 'md' }: { item: MarketItem; symbol: string; size?: 'md' | 'lg' }) {
-  const isUp = (item.change_percent || 0) >= 0;
-  const sparkData = makeSpark(24, isUp);
+  const isUp = item.change_percent !== null && item.change_percent >= 0;
   const isLarge = size === 'lg';
 
   return (
@@ -113,19 +188,17 @@ function MarketCard({ item, symbol, size = 'md' }: { item: MarketItem; symbol: s
           </div>
         </div>
         <div className={`shrink-0 data-text text-[10px] font-semibold px-2.5 py-1 rounded border ${isUp ? 'border-indigo-500/20 bg-indigo-500/5 text-indigo-300' : 'border-white/5 bg-white/2 text-white/25'}`}>
-          {isUp ? '+' : ''}{item.change_percent?.toFixed(2)}%
+          {formatChange(item)}
         </div>
       </div>
 
       <div className={`metric-text glow-text text-white tabular-nums tracking-tight leading-none ${isLarge ? 'text-[30px] mt-4' : 'text-[26px] mt-3'}`}>
-        {symbol}{item.price?.toLocaleString(undefined, { minimumFractionDigits: item.price < 10 ? 4 : 2, maximumFractionDigits: item.price < 10 ? 4 : 2 })}
+        {formatPrice(item, symbol)}
       </div>
 
       <div className="flex items-center justify-between mt-2">
         <span className="data-text text-[10px] text-white/45 uppercase tracking-[0.28em]">{item.id}</span>
       </div>
-
-      <MarketSpark data={sparkData} color={isUp ? BLUE_ACCENT : 'rgba(255,255,255,0.25)'} id={item.id} height={isLarge ? 56 : 40} />
     </div>
   );
 }
@@ -148,39 +221,9 @@ function MarketSection({ title, items, symbol }: { title: string; items: MarketI
 export default function MarketsPage() {
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [status, setStatus] = useState<MarketStatus>('loading');
   const [cacheInfo, setCacheInfo] = useState<{ used: boolean; timestamp: number | null }>({ used: false, timestamp: null });
-  const [data, setData] = useState<MarketsPayload>({
-    globalIndices: [],
-    commodities: [],
-    fxPairs: [],
-    macroRates: []
-  });
-
-  const normalizePayload = (payload: unknown): MarketsPayload | null => {
-    if (!payload || typeof payload !== 'object') return null;
-
-    const asArray = (value: unknown): MarketItem[] => {
-      if (!Array.isArray(value)) return [];
-      return value
-        .filter((item): item is Partial<MarketItem> => typeof item === 'object' && item !== null)
-        .map((item) => ({
-          name: typeof item.name === 'string' ? item.name : '',
-          id: typeof item.id === 'string' ? item.id : '',
-          change_percent: typeof item.change_percent === 'number' ? item.change_percent : 0,
-          price: typeof item.price === 'number' ? item.price : 0,
-          sym: typeof item.sym === 'string' ? item.sym : '',
-        }))
-        .filter((item) => item.id.length > 0 && item.name.length > 0);
-    };
-
-    const payloadObj = payload as Record<string, unknown>;
-    return {
-      globalIndices: asArray(payloadObj.globalIndices),
-      commodities: asArray(payloadObj.commodities),
-      fxPairs: asArray(payloadObj.fxPairs),
-      macroRates: asArray(payloadObj.macroRates),
-    };
-  };
+  const [data, setData] = useState<MarketsPayload>(emptyPayload);
 
   const loadFromCache = useCallback((allowExpired = false) => {
     try {
@@ -197,6 +240,7 @@ export default function MarketsPage() {
       if (isFresh || allowExpired) {
         setData(payload);
         setCacheInfo({ used: true, timestamp });
+        setStatus(deriveMarketStatus({ fetchOk: true, hasData: true, fromStoredSnapshot: true }));
         return true;
       }
     } catch (e) {
@@ -211,7 +255,6 @@ export default function MarketsPage() {
         payload,
         timestamp: Date.now()
       }));
-      setCacheInfo({ used: true, timestamp: Date.now() });
     } catch (e) {
       console.error('Failed to save cache:', e);
       setError('Unable to persist market snapshot in local cache.');
@@ -229,53 +272,39 @@ export default function MarketsPage() {
       ];
 
       // 1. Fetch FRED Data
-      const fredResponse: any = force 
+      const fredResponse = force 
         ? await fredAPI.getLatestLive(fredSeries)
         : await fredAPI.getLatestCached(fredSeries);
       
-      const fredData = (fredResponse?.data as Record<string, QuotePoint> | undefined) || {};
+      const fredData = (fredResponse?.data as Record<string, unknown> | undefined) || {};
 
       // 2. Fetch yfinance Data (Indices + Gold)
-      const overviewRes: any = await marketAPI.getOverview();
-      const overviewIndices = (overviewRes?.indices as Record<string, QuotePoint> | undefined) || {};
+      const overviewRes = await marketAPI.getOverview();
+      const overviewIndices = (overviewRes?.indices as Record<string, unknown> | undefined) || {};
 
-      // 3. Mapping Logic
-      const newGlobalIndices = [
-        { name: 'S&P 500', id: 'SPX', change_percent: asQuotePoint(fredData.SP500).change_pct || 0, price: asQuotePoint(fredData.SP500).value || 0, sym: '$' },
-        { name: 'NASDAQ 100', id: 'NDX', change_percent: asQuotePoint(fredData.NASDAQ100).change_pct || 0, price: asQuotePoint(fredData.NASDAQ100).value || 0, sym: '$' },
-        { name: 'NIFTY 50', id: 'NIFTY', change_percent: asQuotePoint(overviewIndices['^NSEI']).change_pct || 0.50, price: asQuotePoint(overviewIndices['^NSEI']).price || 22402.40, sym: '₹' },
-        { name: 'DOW JONES', id: 'DJI', change_percent: asQuotePoint(fredData.DJIA).change_pct || 0, price: asQuotePoint(fredData.DJIA).value || 0, sym: '$' },
-        { name: 'SENSEX', id: 'BSESN', change_percent: asQuotePoint(overviewIndices['^BSESN']).change_pct || -0.13, price: asQuotePoint(overviewIndices['^BSESN']).price || 73877.30, sym: '₹' },
-      ].filter(x => x.price > 0);
+      // 3. Mapping Logic (missing values stay null and render as "Unavailable")
+      const payload = buildPayload(fredData, overviewIndices);
+      const hasData = hasAnyPrice(payload);
+      const cachedFlag = (fredResponse as { cached?: unknown } | undefined)?.cached === true
+        || (overviewRes as { cached?: unknown } | undefined)?.cached === true;
 
-      const newCommodities = [
-        { name: 'Gold Spot', id: 'GOLD', change_percent: asQuotePoint(overviewIndices['GC=F']).change_pct || (asQuotePoint(fredData.GOLDAMGBD228NLBM).change_pct || 0.54), price: asQuotePoint(overviewIndices['GC=F']).price || (asQuotePoint(fredData.GOLDAMGBD228NLBM).value || 2242.10), sym: '$' },
-        { name: 'WTI Crude', id: 'WTI', change_percent: asQuotePoint(fredData.DCOILWTICO).change_pct || 0, price: asQuotePoint(fredData.DCOILWTICO).value || 0, sym: '$' },
-        { name: 'Brent Crude', id: 'BRENT', change_percent: asQuotePoint(fredData.DCOILBRENTEU).change_pct || 0, price: asQuotePoint(fredData.DCOILBRENTEU).value || 0, sym: '$' },
-        { name: 'Silver Spot', id: 'SILVER', change_percent: asQuotePoint(fredData.NASDAQQSLVO).change_pct || 0, price: asQuotePoint(fredData.NASDAQQSLVO).value || 0, sym: '$' },
-      ].filter(x => x.price > 0);
-
-      const newFxPairs = [
-        { name: 'EUR / USD', id: 'EURUSD', change_percent: asQuotePoint(fredData.DEXUSEU).change_pct || 0, price: asQuotePoint(fredData.DEXUSEU).value || 0, sym: '' },
-        { name: 'USD / JPY', id: 'USDJPY', change_percent: (asQuotePoint(fredData.DEXJPUS).change_pct || 0) * -1, price: asQuotePoint(fredData.DEXJPUS).value || 0, sym: '' },
-        { name: 'GBP / USD', id: 'GBPUSD', change_percent: asQuotePoint(fredData.DEXUSUK).change_pct || 0, price: asQuotePoint(fredData.DEXUSUK).value || 0, sym: '' },
-      ].filter(x => x.price > 0);
-
-      const newMacroRates = [
-        { name: 'US 10Y Yield', id: 'US10Y', change_percent: asQuotePoint(fredData.DGS10).change_pct || 0, price: asQuotePoint(fredData.DGS10).value || 0, sym: '%' },
-        { name: 'VIX Index', id: 'VIX', change_percent: asQuotePoint(fredData.VIXCLS).change_pct || 0, price: asQuotePoint(fredData.VIXCLS).value || 16.31, sym: '' },
-        { name: 'DXY Index', id: 'DXY', change_percent: asQuotePoint(fredData.DTWEXBGS).change_pct || 0, price: asQuotePoint(fredData.DTWEXBGS).value || 104.12, sym: '' },
-      ].filter(x => x.price > 0);
-
-      const payload = {
-        globalIndices: newGlobalIndices.length > 0 ? newGlobalIndices : STATIC_GLOBAL_INDICES,
-        commodities: newCommodities.length > 0 ? newCommodities : STATIC_COMMODITIES,
-        fxPairs: newFxPairs.length > 0 ? newFxPairs : STATIC_FX_PAIRS,
-        macroRates: newMacroRates.length > 0 ? newMacroRates : STATIC_MACRO_RATES
-      };
+      if (!hasData) {
+        // Nothing real came back: show a stored snapshot (labelled as such) or Unavailable.
+        if (loadFromCache(true)) {
+          setError('Live refresh returned no data. Showing cached market snapshot.');
+          return;
+        }
+        setData(payload);
+        setCacheInfo({ used: false, timestamp: null });
+        setStatus(deriveMarketStatus({ fetchOk: true, hasData: false }));
+        setError('Market data is currently unavailable.');
+        return;
+      }
 
       setData(payload);
       saveToCache(payload);
+      setCacheInfo({ used: false, timestamp: null });
+      setStatus(deriveMarketStatus({ fetchOk: true, hasData: true, cachedFlag }));
       setError(null);
     } catch (err) {
       console.error('Fetch error:', err);
@@ -285,6 +314,7 @@ export default function MarketsPage() {
         setError('Live refresh failed. Showing cached market snapshot.');
         return;
       }
+      setStatus(deriveMarketStatus({ fetchOk: false, hasData: false }));
       setError(extractErrorMessage(err, 'Failed to fetch market data.'));
     }
   };
@@ -304,12 +334,7 @@ export default function MarketsPage() {
     void fetchAllData(!hasCache);
   }, [loadFromCache]);
 
-  const displayData = {
-    globalIndices: data.globalIndices.length > 0 ? data.globalIndices : STATIC_GLOBAL_INDICES,
-    commodities: data.commodities.length > 0 ? data.commodities : STATIC_COMMODITIES,
-    fxPairs: data.fxPairs.length > 0 ? data.fxPairs : STATIC_FX_PAIRS,
-    macroRates: data.macroRates.length > 0 ? data.macroRates : STATIC_MACRO_RATES,
-  };
+  const displayData = data;
 
   return (
     <div className="space-y-12 pb-20 relative">
@@ -328,12 +353,10 @@ export default function MarketsPage() {
         </div>
 
         <div className="flex items-center gap-4">
-          {refreshing && (
-            <div className="flex items-center gap-2">
-              <div className="w-1.5 h-1.5 rounded-full bg-indigo-500 animate-pulse" />
-              <span className="data-text text-[10px] text-indigo-400 uppercase tracking-widest">Live Syncing</span>
-            </div>
-          )}
+          <div className="flex items-center gap-2">
+            <div className={`w-1.5 h-1.5 rounded-full ${status === 'live' ? 'bg-indigo-500' : 'bg-white/30'} ${refreshing ? 'animate-pulse' : ''}`} />
+            <span className={`data-text text-[10px] uppercase tracking-widest ${status === 'live' ? 'text-indigo-400' : 'text-white/45'}`}>{STATUS_LABEL[status]}</span>
+          </div>
           <button 
             onClick={doRefresh}
             disabled={refreshing}

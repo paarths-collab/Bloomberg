@@ -1,4 +1,5 @@
 {
+  "auth.refresh": { "method": "POST", "path": "/api/auth/refresh" },
   "auth.guest": { "method": "POST", "path": "/api/auth/guest" },
 
   "chat.superAgent": { "method": "POST", "path": "/api/chat/super-agent" },
@@ -27,11 +28,11 @@
   "sectors.treemapStock": { "method": "GET", "path": "/api/sectors/treemap/stock/{symbol}" },
 
   "peers.compare": { "method": "GET", "path": "/api/peers/compare/{symbol}" },
-  "fundamentals.summary": { "method": "GET", "path": "/api/fundamentals/summary/{symbol}" },
+  "fundamentals.summary": { "method": "GET", "path": "/api/technical/fundamentals/summary/{symbol}" },
   "news.live": { "method": "GET", "path": "/api/news/live" },
 
-  "investorProfile.portfolio": { "method": "GET", "path": "/api/portfolio/api/investor-profile/portfolio" },
-  "investorProfile.risk": { "method": "GET", "path": "/api/portfolio/api/investor-profile/portfolio/risk" },
+  "investorProfile.portfolio": { "method": "GET", "path": "/api/profile/portfolio" },
+  "investorProfile.risk": { "method": "GET", "path": "/api/profile/portfolio/risk" },
 
   "ws.live": { "method": "WS", "path": "/ws/live" }
 }

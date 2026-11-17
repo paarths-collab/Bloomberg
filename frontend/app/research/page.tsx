@@ -12,17 +12,24 @@ import {
 import { API_BASE, researchAPI, sentimentAPI, extractErrorMessage, isLikelyNetworkError, type SentimentAnalysisResponse } from '@/lib/api'
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
-const sentimentColor = (score: number) =>
-  score >= 0.6 ? 'text-indigo-400' : score >= 0.4 ? 'text-white/50' : 'text-red-400'
+const sentimentColor = (score: number | null) =>
+  score === null ? 'text-white/40' : score >= 0.6 ? 'text-indigo-400' : score >= 0.4 ? 'text-white/50' : 'text-red-400'
 
-const sentimentBg = (score: number) =>
-  score >= 0.6 ? 'bg-indigo-400/10 border-indigo-400/20' : score >= 0.4 ? 'bg-white/5 border-white/10' : 'bg-red-400/10 border-red-400/20'
+const sentimentBg = (score: number | null) =>
+  score === null ? 'bg-white/5 border-white/10' : score >= 0.6 ? 'bg-indigo-400/10 border-indigo-400/20' : score >= 0.4 ? 'bg-white/5 border-white/10' : 'bg-red-400/10 border-red-400/20'
 
 const CARD = 'shine-surface group relative rounded-2xl border border-white/10 bg-white/[0.03] backdrop-blur-xl transition-all duration-500 overflow-hidden'
 const CARD_GLOW = 'shine-surface group relative rounded-2xl border border-white/10 bg-white/[0.03] backdrop-blur-xl shadow-[0_0_24px_rgba(79,70,229,0.08)] hover:shadow-[0_0_32px_rgba(79,70,229,0.16)] transition-all duration-500 overflow-hidden'
 const CONTROL_BTN = 'shine-btn relative overflow-hidden rounded-xl text-[12px] font-dm-mono font-bold tracking-widest uppercase transition-all duration-300'
 
+const numOrNullTop = (v: unknown): number | null =>
+  typeof v === 'number' && Number.isFinite(v) ? v : null
+
 const clamp = (value: number, min = 0, max = 100) => Math.min(max, Math.max(min, value))
+
+// A composite score needs every input; if any is missing there is no score (never a guessed default).
+const composite = (parts: Array<number | null>): number | null =>
+  parts.some((p) => p === null) ? null : clamp((parts as number[]).reduce((a, b) => a + b, 0))
 
 const riskTone = (value: number) => {
   if (value >= 70) return { label: 'HIGH', cls: 'text-red-400 border-red-500/30 bg-red-500/10' }
@@ -38,14 +45,14 @@ const formatDate = (raw: unknown) => {
 }
 
 const normalizeSentimentResponse = (raw: any): SentimentAnalysisResponse => {
-  const sentimentOverall =
+  const sentimentOverall: number | null =
     typeof raw?.sentiment?.overall === 'number'
       ? raw.sentiment.overall
       : typeof raw?.sentiment === 'number'
         ? raw.sentiment
         : typeof raw?.score === 'number'
           ? raw.score
-          : 0.5
+          : null
 
   const sentimentSummary =
     typeof raw?.sentiment?.summary === 'string'
@@ -54,7 +61,7 @@ const normalizeSentimentResponse = (raw: any): SentimentAnalysisResponse => {
         ? raw.outlook
         : typeof raw?.label === 'string'
           ? raw.label
-          : 'Neutral'
+          : 'Unavailable'
 
   const redditMentions =
     typeof raw?.reddit_sentiment?.mentions === 'number'
@@ -63,10 +70,10 @@ const normalizeSentimentResponse = (raw: any): SentimentAnalysisResponse => {
         ? raw.reddit_posts_count
         : 0
 
-  const redditScore =
+  const redditScore: number | null =
     typeof raw?.reddit_sentiment?.score === 'number'
       ? raw.reddit_sentiment.score
-      : sentimentOverall
+      : null
 
   const marketData =
     raw?.market_data && typeof raw.market_data === 'object'
@@ -85,8 +92,8 @@ const normalizeSentimentResponse = (raw: any): SentimentAnalysisResponse => {
       mentions: redditMentions,
     },
     market_data: marketData,
-    recommendation: raw?.recommendation || 'HOLD',
-    outlook: raw?.outlook || sentimentSummary || 'Neutral',
+    recommendation: raw?.recommendation || 'Unavailable',
+    outlook: raw?.outlook || sentimentSummary || 'Unavailable',
     news: raw?.news && typeof raw.news === 'object'
       ? raw.news
       : { articles: [] },
@@ -128,9 +135,9 @@ export default function ResearchPage() {
   const [expandedModalContent, setExpandedModalContent] = useState<string | null>(null)
 
   const marketData = data?.market_data || {}
-  const currentPrice = marketData.current_price ?? data?.price ?? 0
-  const dayChangePct = marketData.day_change_pct ?? data?.day_change_pct ?? 0
-  const dayChange = marketData.day_change ?? data?.day_change ?? 0
+  const currentPrice: number | null = numOrNullTop(marketData.current_price ?? data?.price)
+  const dayChangePct: number | null = numOrNullTop(marketData.day_change_pct ?? data?.day_change_pct)
+  const dayChange: number | null = numOrNullTop(marketData.day_change ?? data?.day_change)
   const companyName = data?.name || marketData.company_name || data?.symbol || ''
   const sym = market === 'us' ? '$' : '₹'
 
@@ -178,15 +185,17 @@ export default function ResearchPage() {
   const beta = numOrNull(marketData.beta)
   const debtToEq = numOrNull(marketData.debt_to_equity)
   const currentRatio = numOrNull(marketData.current_ratio)
-  const dayMoveAbs = Math.abs(dayChangePct || 0)
+  const dayMoveAbs = dayChangePct !== null ? Math.abs(dayChangePct) : null
 
-  const riskScore = clamp(
-    (beta !== null ? Math.min(40, Math.abs(beta - 1) * 35) : 10) +
-    (debtToEq !== null ? Math.min(30, debtToEq / 8) : 8) +
-    (currentRatio !== null ? (currentRatio < 1 ? 18 : 6) : 10) +
-    Math.min(20, dayMoveAbs * 2)
-  )
-  const riskMeta = riskTone(riskScore)
+  const riskScore = composite([
+    beta !== null ? Math.min(40, Math.abs(beta - 1) * 35) : null,
+    debtToEq !== null ? Math.min(30, debtToEq / 8) : null,
+    currentRatio !== null ? (currentRatio < 1 ? 18 : 6) : null,
+    dayMoveAbs !== null ? Math.min(20, dayMoveAbs * 2) : null,
+  ])
+  const riskMeta = riskScore === null
+    ? { label: 'UNAVAILABLE', cls: 'text-white/40 border-white/10 bg-white/5' }
+    : riskTone(riskScore)
 
   const earningsDate = typeof marketData.earnings_date === 'string' ? marketData.earnings_date : null
   const daysToEarnings = numOrNull(marketData.days_to_earnings)
@@ -200,13 +209,13 @@ export default function ResearchPage() {
   const operatingMarginPct = numOrNull(marketData.operating_margins)
   const fcf = numOrNull(marketData.free_cashflow)
 
-  const earningsQualityScore = clamp(
-    (revenueGrowthPct !== null ? Math.max(0, Math.min(35, revenueGrowthPct * 120)) : 12) +
-    (epsGrowthPct !== null ? Math.max(0, Math.min(30, epsGrowthPct * 100)) : 10) +
-    (operatingMarginPct !== null ? Math.max(0, Math.min(20, operatingMarginPct * 90)) : 8) +
-    (fcf !== null ? (fcf > 0 ? 15 : 4) : 8)
-  )
-  const earningsQualityTier = earningsQualityScore >= 70 ? 'STRONG' : earningsQualityScore >= 45 ? 'MODERATE' : 'WEAK'
+  const earningsQualityScore = composite([
+    revenueGrowthPct !== null ? Math.max(0, Math.min(35, revenueGrowthPct * 120)) : null,
+    epsGrowthPct !== null ? Math.max(0, Math.min(30, epsGrowthPct * 100)) : null,
+    operatingMarginPct !== null ? Math.max(0, Math.min(20, operatingMarginPct * 90)) : null,
+    fcf !== null ? (fcf > 0 ? 15 : 4) : null,
+  ])
+  const earningsQualityTier = earningsQualityScore === null ? 'Unavailable' : earningsQualityScore >= 70 ? 'STRONG' : earningsQualityScore >= 45 ? 'MODERATE' : 'WEAK'
 
   const trendTag = (() => {
     if (!currentPrice || fiftyDayAvg === null || twoHundredDayAvg === null) return 'Insufficient trend data'
@@ -223,29 +232,31 @@ export default function ResearchPage() {
     targetHigh !== null && targetLow !== null && currentPrice
       ? ((targetHigh - targetLow) / currentPrice) * 100
       : null
-  const analystConfidence = clamp(
-    (analystCount !== null ? Math.min(60, analystCount * 4) : 12) +
-    (targetSpreadPct !== null ? Math.max(0, 40 - targetSpreadPct) : 12)
-  )
+  const analystConfidence = composite([
+    analystCount !== null ? Math.min(60, analystCount * 4) : null,
+    targetSpreadPct !== null ? Math.max(0, 40 - targetSpreadPct) : null,
+  ])
 
   const quickRatio = numOrNull(marketData.quick_ratio)
   const interestCoverage = numOrNull(marketData.interest_coverage)
-  const balanceSheetSafety = clamp(
-    (currentRatio !== null ? Math.min(35, currentRatio * 18) : 12) +
-    (quickRatio !== null ? Math.min(25, quickRatio * 14) : 10) +
-    (debtToEq !== null ? Math.max(0, 30 - debtToEq / 6) : 12) +
-    (interestCoverage !== null ? Math.min(10, Math.max(0, interestCoverage)) : 6)
-  )
-  const balanceSheetTier = balanceSheetSafety >= 70 ? 'SAFE' : balanceSheetSafety >= 45 ? 'WATCH' : 'FRAGILE'
+  const balanceSheetSafety = composite([
+    currentRatio !== null ? Math.min(35, currentRatio * 18) : null,
+    quickRatio !== null ? Math.min(25, quickRatio * 14) : null,
+    debtToEq !== null ? Math.max(0, 30 - debtToEq / 6) : null,
+    interestCoverage !== null ? Math.min(10, Math.max(0, interestCoverage)) : null,
+  ])
+  const balanceSheetTier = balanceSheetSafety === null ? 'Unavailable' : balanceSheetSafety >= 70 ? 'SAFE' : balanceSheetSafety >= 45 ? 'WATCH' : 'FRAGILE'
 
   const eventRiskLevel = (() => {
-    if (daysToEarnings === null) return 'MEDIUM'
+    if (daysToEarnings === null) return 'Unavailable'
     if (daysToEarnings >= 0 && daysToEarnings <= 7) return 'HIGH'
     if (daysToEarnings >= 8 && daysToEarnings <= 21) return 'MEDIUM'
     return 'LOW'
   })()
   const eventRiskCls =
-    eventRiskLevel === 'HIGH'
+    eventRiskLevel === 'Unavailable'
+      ? 'text-white/50 border-white/10 bg-white/5'
+      : eventRiskLevel === 'HIGH'
       ? 'text-red-300 border-red-500/40 bg-red-500/10'
       : eventRiskLevel === 'MEDIUM'
         ? 'text-amber-300 border-amber-400/40 bg-amber-400/10'
@@ -458,6 +469,11 @@ export default function ResearchPage() {
       {/* Results */}
       {data && !isLoading && (
         <div className="space-y-5">
+          {(data.analysis_status === 'heuristic' || data.analysis_status === 'heuristic_no_signal') && (
+            <p role="status" className="rounded-xl border border-amber-400/30 bg-amber-400/10 p-4 text-sm text-amber-200">
+              This analysis uses simple market-data rules because AI analysis is unavailable. Its signals are not model confidence or personalized investment advice.
+            </p>
+          )}
           {/* Symbol Header */}
           <div className={`${CARD_GLOW} p-5`}>
             <div className="flex items-start justify-between">
@@ -466,11 +482,15 @@ export default function ResearchPage() {
                 <p className="text-white/40 text-sm mt-0.5">{companyName}</p>
               </div>
               <div className="text-right">
-                <div className="text-3xl font-mono font-bold text-white">{sym}{currentPrice.toFixed(2)}</div>
-                <div className={`flex items-center justify-end gap-1 text-sm font-mono mt-0.5 ${dayChangePct >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
-                  {dayChangePct >= 0 ? <TrendingUp size={14} /> : <TrendingDown size={14} />}
-                  {dayChangePct >= 0 ? '+' : ''}{dayChangePct.toFixed(2)}%
-                </div>
+                <div className="text-3xl font-mono font-bold text-white">{currentPrice === null ? 'Unavailable' : `${sym}${currentPrice.toFixed(2)}`}</div>
+                {dayChangePct === null ? (
+                  <div className="flex items-center justify-end gap-1 text-sm font-mono mt-0.5 text-white/40">Unavailable</div>
+                ) : (
+                  <div className={`flex items-center justify-end gap-1 text-sm font-mono mt-0.5 ${dayChangePct >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+                    {dayChangePct >= 0 ? <TrendingUp size={14} /> : <TrendingDown size={14} />}
+                    {dayChangePct >= 0 ? '+' : ''}{dayChangePct.toFixed(2)}%
+                  </div>
+                )}
               </div>
             </div>
             <div className="flex items-center gap-3 mt-4">
@@ -550,25 +570,25 @@ export default function ResearchPage() {
           {/* Sentiment Cards */}
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
             {[
-              { label: 'AI Sentiment', score: data.sentiment?.overall ?? 0.5, sub: data.sentiment?.summary ?? 'Neutral' },
+              { label: 'AI Sentiment', score: data.sentiment?.overall ?? null, sub: data.sentiment?.summary ?? 'Unavailable' },
               {
                 label: 'Reddit Sentiment',
-                score: data.reddit_sentiment?.score ?? 0.5,
+                score: data.reddit_sentiment?.score ?? null,
                 sub: (data.reddit_sentiment?.mentions ?? 0) > 0 ? `${data.reddit_sentiment?.mentions ?? 0} mentions` : '-',
               },
             ].map(card => (
               <div key={card.label} className={`${CARD} p-4 ${sentimentBg(card.score)}`}>
                 <div className="text-[10px] font-mono text-white/30 uppercase tracking-widest mb-2">{card.label}</div>
                 <div className={`text-3xl font-mono font-bold ${sentimentColor(card.score)}`}>
-                  {(card.score * 100).toFixed(0)}%
+                  {card.score === null ? 'Unavailable' : `${(card.score * 100).toFixed(0)}%`}
                 </div>
                 <div className="text-[11px] text-white/40 mt-0.5">{card.sub}</div>
               </div>
             ))}
             <div className={`${CARD} p-4`}>
               <div className="text-[10px] font-mono text-white/30 uppercase tracking-widest mb-2">Recommendation</div>
-              <div className="text-2xl font-mono font-bold text-white uppercase">{data.recommendation ?? 'HOLD'}</div>
-              <div className="text-[11px] text-white/40 mt-0.5">{data.outlook ?? 'Neutral'}</div>
+              <div className="text-2xl font-mono font-bold text-white uppercase">{data.recommendation ?? 'Unavailable'}</div>
+              <div className="text-[11px] text-white/40 mt-0.5">{data.outlook ?? 'Unavailable'}</div>
             </div>
           </div>
 
@@ -627,7 +647,7 @@ export default function ResearchPage() {
               <div className="space-y-3">
                 <div className="flex items-baseline justify-between">
                   <span className="text-[11px] text-white/45">Current</span>
-                  <span className="font-dm-mono text-white">{sym}{fmt(currentPrice)}</span>
+                  <span className="font-dm-mono text-white">{currentPrice === null ? 'Unavailable' : `${sym}${fmt(currentPrice)}`}</span>
                 </div>
                 <div className="flex items-baseline justify-between">
                   <span className="text-[11px] text-white/45">Target Mean</span>
@@ -658,11 +678,11 @@ export default function ResearchPage() {
                 <span className={`px-2 py-1 text-[10px] font-dm-mono rounded border uppercase tracking-widest ${riskMeta.cls}`}>{riskMeta.label}</span>
               </div>
               <div className="space-y-3">
-                <div className="flex items-baseline justify-between"><span className="text-[11px] text-white/45">Risk Score</span><span className="font-dm-mono text-white">{riskScore.toFixed(0)}/100</span></div>
+                <div className="flex items-baseline justify-between"><span className="text-[11px] text-white/45">Risk Score</span><span className="font-dm-mono text-white">{riskScore === null ? 'Unavailable' : `${riskScore.toFixed(0)}/100`}</span></div>
                 <div className="flex items-baseline justify-between"><span className="text-[11px] text-white/45">Beta</span><span className="font-dm-mono text-white">{fmt(beta)}</span></div>
                 <div className="flex items-baseline justify-between"><span className="text-[11px] text-white/45">Debt / Equity</span><span className="font-dm-mono text-white">{fmt(debtToEq)}</span></div>
                 <div className="flex items-baseline justify-between"><span className="text-[11px] text-white/45">Current Ratio</span><span className="font-dm-mono text-white">{fmt(currentRatio)}</span></div>
-                <div className="flex items-baseline justify-between"><span className="text-[11px] text-white/45">1D Volatility</span><span className="font-dm-mono text-white">{Math.abs(dayChangePct).toFixed(2)}%</span></div>
+                <div className="flex items-baseline justify-between"><span className="text-[11px] text-white/45">1D Volatility</span><span className="font-dm-mono text-white">{dayChangePct === null ? 'Unavailable' : `${Math.abs(dayChangePct).toFixed(2)}%`}</span></div>
               </div>
             </div>
 
@@ -691,7 +711,7 @@ export default function ResearchPage() {
               <div className="space-y-3">
                 <div className="flex items-baseline justify-between"><span className="text-[11px] text-white/45">Earnings Date</span><span className="font-dm-mono text-white">{formatDate(earningsDate)}</span></div>
                 <div className="flex items-baseline justify-between"><span className="text-[11px] text-white/45">Days to Earnings</span><span className="font-dm-mono text-white">{daysToEarnings === null ? 'N/A' : daysToEarnings === 0 ? 'Today' : String(daysToEarnings)}</span></div>
-                <div className="flex items-baseline justify-between"><span className="text-[11px] text-white/45">Quality Score</span><span className="font-dm-mono text-white">{earningsQualityScore.toFixed(0)}/100</span></div>
+                <div className="flex items-baseline justify-between"><span className="text-[11px] text-white/45">Quality Score</span><span className="font-dm-mono text-white">{earningsQualityScore === null ? 'Unavailable' : `${earningsQualityScore.toFixed(0)}/100`}</span></div>
                 <div className="flex items-baseline justify-between"><span className="text-[11px] text-white/45">Revenue Growth</span><span className="font-dm-mono text-white">{fmt(revenueGrowthPct !== null ? revenueGrowthPct * 100 : null, '%')}</span></div>
                 <div className="flex items-baseline justify-between"><span className="text-[11px] text-white/45">EPS Growth</span><span className="font-dm-mono text-white">{fmt(epsGrowthPct !== null ? epsGrowthPct * 100 : null, '%')}</span></div>
                 <div className="flex items-baseline justify-between"><span className="text-[11px] text-white/45">Operating Margin</span><span className="font-dm-mono text-white">{fmt(operatingMarginPct !== null ? operatingMarginPct * 100 : null, '%')}</span></div>
@@ -705,7 +725,7 @@ export default function ResearchPage() {
                 <span className="text-[10px] font-dm-mono uppercase tracking-widest text-indigo-300">{trendTag}</span>
               </div>
               <div className="space-y-3">
-                <div className="flex items-baseline justify-between"><span className="text-[11px] text-white/45">Current Price</span><span className="font-dm-mono text-white">{sym}{fmt(currentPrice)}</span></div>
+                <div className="flex items-baseline justify-between"><span className="text-[11px] text-white/45">Current Price</span><span className="font-dm-mono text-white">{currentPrice === null ? 'Unavailable' : `${sym}${fmt(currentPrice)}`}</span></div>
                 <div className="flex items-baseline justify-between"><span className="text-[11px] text-white/45">50D Average</span><span className="font-dm-mono text-white">{sym}{fmt(fiftyDayAvg)}</span></div>
                 <div className="flex items-baseline justify-between"><span className="text-[11px] text-white/45">200D Average</span><span className="font-dm-mono text-white">{sym}{fmt(twoHundredDayAvg)}</span></div>
                 <div className="flex items-baseline justify-between"><span className="text-[11px] text-white/45">30D Volatility</span><span className="font-dm-mono text-white">{fmt(volatility30d !== null ? volatility30d * 100 : null, '%')}</span></div>
@@ -715,7 +735,7 @@ export default function ResearchPage() {
             <div className={`${CARD_GLOW} p-5`}>
               <div className="flex items-center justify-between mb-4">
                 <div className="text-[11px] font-dm-mono text-white/30 uppercase tracking-[0.2em]">Analyst Dispersion</div>
-                <span className="text-[10px] font-dm-mono uppercase tracking-widest text-indigo-300">{analystConfidence.toFixed(0)}% confidence</span>
+                <span className="text-[10px] font-dm-mono uppercase tracking-widest text-indigo-300">{analystConfidence === null ? 'Analyst data score unavailable' : `${analystConfidence.toFixed(0)}/100 analyst data score (heuristic)`}</span>
               </div>
               <div className="space-y-3">
                 <div className="flex items-baseline justify-between"><span className="text-[11px] text-white/45">Analyst Count</span><span className="font-dm-mono text-white">{fmt(analystCount)}</span></div>
@@ -732,7 +752,7 @@ export default function ResearchPage() {
                 <span className="text-[10px] font-dm-mono uppercase tracking-widest text-indigo-300">{balanceSheetTier}</span>
               </div>
               <div className="space-y-3">
-                <div className="flex items-baseline justify-between"><span className="text-[11px] text-white/45">Safety Score</span><span className="font-dm-mono text-white">{balanceSheetSafety.toFixed(0)}/100</span></div>
+                <div className="flex items-baseline justify-between"><span className="text-[11px] text-white/45">Safety Score</span><span className="font-dm-mono text-white">{balanceSheetSafety === null ? 'Unavailable' : `${balanceSheetSafety.toFixed(0)}/100`}</span></div>
                 <div className="flex items-baseline justify-between"><span className="text-[11px] text-white/45">Debt / Equity</span><span className="font-dm-mono text-white">{fmt(debtToEq)}</span></div>
                 <div className="flex items-baseline justify-between"><span className="text-[11px] text-white/45">Current Ratio</span><span className="font-dm-mono text-white">{fmt(currentRatio)}</span></div>
                 <div className="flex items-baseline justify-between"><span className="text-[11px] text-white/45">Quick Ratio</span><span className="font-dm-mono text-white">{fmt(quickRatio)}</span></div>

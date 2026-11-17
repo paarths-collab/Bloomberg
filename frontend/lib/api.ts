@@ -14,13 +14,13 @@
  *   <token>`. The token is an anonymous guest token from POST /api/auth/guest,
  *   cached in localStorage (all storage access is guarded). On a 401 the request
  *   is retried once with the current cached token if another call already
- *   refreshed it; only when the failing token is still the cached one is a new
- *   guest token forced. `user_id` is never sent: the backend derives identity
+ *   refreshed it; only when the failing token is still the cached one is its
+ *   credential renewed. `user_id` is never sent: the backend derives identity
  *   from the token.
- *   Known limitation (frontend follow-up): the backend has no token-refresh
- *   endpoint, so a refresh (on expiry or a 401) mints a NEW guest identity via
- *   POST /api/auth/guest. The previous paper portfolio becomes unreachable from
- *   this client after that point.
+ *   Access expiry renews the same identity using a durable refresh credential.
+ *   Legacy access-only credentials can migrate even after expiry. Failed
+ *   renewal preserves saved credentials and surfaces an error; it never silently
+ *   replaces an existing identity with an empty portfolio.
  *
  * Route resolution notes (chosen from the BACKEND, not guessed):
  * - sentimentAPI.analyze(symbol, market) -> GET /api/chat/sentiment/analyze/{symbol}?market=
@@ -29,17 +29,9 @@
  *   india); POST /analyze takes just {symbol}, /quick/{symbol} returns a minimal
  *   shape without market_data/news/supply_chain. The GET response (and the
  *   service's fallback payload) contains exactly the keys the page normalises.
- * - investorProfileAPI.getPortfolio() -> GET /api/portfolio/api/investor-profile/portfolio
- *   /api/profile/portfolio is a thin alias of the same shared handler (see
- *   backend/profile/main.py), so either matches the shape the dashboard and
- *   portfolio pages read (holdings[], total_value, total_invested, total_pl,
- *   total_pl_pct). The nested path is the primary implementation.
- * - fundamentalsAPI.getOverview(symbol) -> GET /api/fundamentals/summary/{symbol}
- *   The peers page reads name/price/marketCap/exchange/sector/industry/currency/
- *   website/description/metrics.{peRatio,...}: the shape of
- *   get_fundamentals_summary(). backend/main.py declares this top-level route as
- *   the compatibility alias for the frontend's /api/fundamentals/* calls
- *   (/api/technical/fundamentals/summary/{symbol} is the same handler).
+ * - investorProfileAPI -> /api/profile/portfolio and /portfolio/risk.
+ *   Authenticated paper holdings use one canonical profile router.
+ * - fundamentalsAPI -> /api/technical/fundamentals/summary/{symbol}.
  * - socialAPI.getNews(query, limit) / getNewsCached(query, limit)
  *   -> GET /api/news/live?query=&limit= (and &cached_only=true).
  *   The news page reads `res.articles`; /api/news/latest returns a bare list,
@@ -50,9 +42,8 @@
  *   The sectors page calls it twice: false (fast constituent skeleton) then true
  *   (live prices), matching the handler's `include_prices: bool` query param.
  * - fredAPI -> /api/fred/latest-live | latest-cached?series_ids=A,B (top-level
- *   mount, per the comment in backend/main.py); /api/markets/fred/* duplicates it.
- * - researchAPI -> /api/research/* (backend/research). /api/chat/api/research/*
- *   is an accidental duplicate mount of the legacy router and is not used.
+ *   mount in backend/main.py).
+ * - researchAPI -> /api/research/* (backend/research).
  *   The report endpoints return downloadUrl WITHOUT the "/api" prefix
  *   (e.g. "/research/report/download/x.html"), which is why pages build
  *   `${API_BASE}${downloadUrl}` and why API_BASE must end in "/api".
@@ -211,7 +202,7 @@ export function extractErrorMessage(err: unknown, fallback = 'Something went wro
 const TOKEN_STORAGE_KEY = 'boomerang.guestToken.v1'
 const TOKEN_EXPIRY_SKEW_MS = 60_000
 
-type StoredToken = { access_token: string; expires_at?: string }
+type StoredToken = { access_token: string; expires_at?: string; refresh_token?: string }
 
 let memoryToken: StoredToken | null = null
 let tokenInflight: Promise<string> | null = null
@@ -245,30 +236,82 @@ function writeStoredToken(t: StoredToken | null): void {
   }
 }
 
+function isMissingToken(data: StoredToken | null | undefined): boolean {
+  return !data || typeof data.access_token !== 'string' || !data.access_token
+}
+
+/** Accurate, user-facing text for a refresh failure that does NOT invalidate the saved credential. */
+function renewalFailure(err: unknown): unknown {
+  if (!(err instanceof ApiError)) return err // network failure: extractErrorMessage already explains it
+  const kept = 'Your saved session was kept.'
+  if (err.status === 429) {
+    return new ApiError(`Too many session renewal attempts. Wait a moment and try again. ${kept}`, 429, err.detail)
+  }
+  if (err.status >= 500) {
+    return new ApiError(`The server could not renew your session right now. Try again shortly. ${kept}`, err.status, err.detail)
+  }
+  return err
+}
+
+/** Accurate text when the saved credential was rejected (and discarded) but a new guest could not be created. */
+function replacementFailure(err: unknown): unknown {
+  if (!(err instanceof ApiError)) return err
+  const lead = 'Your saved session is no longer valid and a new one could not be started.'
+  if (err.status === 429) {
+    return new ApiError(`${lead} Too many new sessions were requested from your network; wait a while and try again.`, 429, err.detail)
+  }
+  if (err.status >= 500) {
+    return new ApiError(`${lead} The server had a problem; try again shortly.`, err.status, err.detail)
+  }
+  return new ApiError(`${lead} ${err.message}`.trim(), err.status, err.detail)
+}
+
 /**
  * Bearer token for the current anonymous guest identity. Issues one via
- * POST /api/auth/guest the first time (or when forceRefresh is set / the cached
- * token is expired) and caches it in memory + localStorage.
+ * POST /api/auth/guest for a first-time client. Later access expiry or a forced
+ * renewal uses /api/auth/refresh and preserves the saved identity.
+ *
+ * A 401/403 from /refresh is permanent (for example AUTH_SECRET_KEY was rotated, so the
+ * signature no longer verifies): the stored credential is discarded and ONE new guest is
+ * minted. That happens inside the single in-flight promise, so concurrent callers share one
+ * refresh and one /guest call, and a failing /guest never loops. Network errors, 5xx and 429
+ * are transient: the credential is kept, the error surfaces, and no new guest is created.
  */
 export async function getGuestToken(forceRefresh = false): Promise<string> {
-  if (!forceRefresh) {
-    if (tokenIsFresh(memoryToken)) return memoryToken.access_token
-    const stored = readStoredToken()
-    if (tokenIsFresh(stored)) {
-      memoryToken = stored
-      return stored.access_token
-    }
+  const existing = memoryToken || readStoredToken()
+  if (!forceRefresh && tokenIsFresh(existing)) {
+    memoryToken = existing
+    return existing.access_token
   }
   if (tokenInflight) return tokenInflight
 
   tokenInflight = (async () => {
-    memoryToken = null
-    writeStoredToken(null)
-    const data = await request<{ access_token?: string; expires_at?: string }>('auth.guest', { auth: false })
-    if (!data || typeof data.access_token !== 'string' || !data.access_token) {
+    let data: StoredToken | null | undefined
+    if (existing?.access_token) {
+      try {
+        data = await request<StoredToken>('auth.refresh', {
+          body: { refresh_token: existing.refresh_token || existing.access_token },
+        })
+      } catch (err) {
+        if (!(err instanceof ApiError) || (err.status !== 401 && err.status !== 403)) {
+          throw renewalFailure(err)
+        }
+        // Definitive rejection: the saved credential can never work again.
+        memoryToken = null
+        writeStoredToken(null)
+        try {
+          data = await request<StoredToken>('auth.guest')
+        } catch (guestErr) {
+          throw replacementFailure(guestErr)
+        }
+      }
+    } else {
+      data = await request<StoredToken>('auth.guest')
+    }
+    if (isMissingToken(data)) {
       throw new ApiError('Guest token response was missing access_token', 502, data)
     }
-    const token: StoredToken = { access_token: data.access_token, expires_at: data.expires_at }
+    const token = data as StoredToken
     memoryToken = token
     writeStoredToken(token)
     return token.access_token
@@ -319,7 +362,7 @@ async function request<T>(id: RestRouteId, opts: RequestOptions = {}): Promise<T
 
   if (res.status === 401 && opts.auth) {
     // Another call may already have refreshed the cached token; if so, retry with it
-    // instead of minting yet another guest identity. Force a new token only when the
+    // instead of renewing twice. Renew the saved identity only when the
     // failing token is still the cached one.
     const cached = memoryToken
     token =
@@ -381,7 +424,8 @@ export type AgentPov = {
   agent: string
   provider: string
   verdict: string
-  confidence: number
+  confidence: number | null
+  confidence_status?: string
   reasoning: string
   key_factors: string[]
 }
@@ -405,8 +449,8 @@ export type SentimentAnalysisResponse = {
   day_change_pct?: number | null
   recommendation: string
   outlook: string
-  sentiment: { overall: number; summary: string; [key: string]: unknown }
-  reddit_sentiment: { score: number; mentions: number; [key: string]: unknown }
+  sentiment: { overall: number | null; summary: string; [key: string]: unknown }
+  reddit_sentiment: { score: number | null; mentions: number; [key: string]: unknown }
   market_data: Record<string, any>
   news: { articles: any[]; [key: string]: unknown }
   supply_chain: { customers: any[]; suppliers: any[]; [key: string]: unknown }

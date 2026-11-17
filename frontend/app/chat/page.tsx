@@ -130,17 +130,17 @@ const buildFinalVerdict = (bull?: Record<string, unknown>, bear?: Record<string,
   ]
     .map(item => {
       const verdict = typeof item.payload?.verdict === 'string' ? item.payload.verdict.toUpperCase() : 'HOLD'
-      const confidence = typeof item.payload?.confidence === 'number' ? item.payload.confidence : 0.5
+      const confidence = typeof item.payload?.confidence === 'number' ? item.payload.confidence : null
       const provider = typeof item.payload?.provider === 'string' ? item.payload.provider : 'N/A'
       return { ...item, verdict, confidence, provider }
     })
 
   const ranked = options
     .filter(item => item.verdict === 'BUY' || item.verdict === 'SELL')
-    .sort((a, b) => b.confidence - a.confidence)
+    .sort((a, b) => (b.confidence ?? -1) - (a.confidence ?? -1))
 
   const winner = ranked[0] || options.find(item => item.label === 'Neutral') || options[0]
-  const confidencePct = `${(winner.confidence * 100).toFixed(0)}%`
+  const confidencePct = winner.confidence === null ? 'confidence unavailable' : `${(winner.confidence * 100).toFixed(0)}%`
 
   return `## Final Verdict\n\n${winner.verdict} (${confidencePct}) based on the ${winner.label.toLowerCase()} signal from ${winner.provider}.`
 }

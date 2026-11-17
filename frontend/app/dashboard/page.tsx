@@ -2,98 +2,40 @@
 
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { marketAPI, fredAPI, investorProfileAPI, extractErrorMessage } from '@/lib/api'
-import {
-  LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, AreaChart, Area
-} from 'recharts'
 
 // ─── Constants ────────────────────────────────────────────────────────────────
-const INDIGO_ACCENT = '#6366f1' // Unified indigo accent
-const SILVER = '#c4c4cc'
 
 const CARD = "system-card group relative p-6 rounded-2xl border border-white/20 bg-white/[0.03] backdrop-blur-xl hover:border-indigo-400/40 hover:bg-white/5 transition-all duration-500 overflow-hidden hover:-translate-y-1"
 const CARD_GLOW = "system-card group relative p-6 rounded-2xl border border-white/25 bg-white/[0.035] backdrop-blur-xl shadow-[0_0_24px_rgba(99,102,241,0.06)] hover:shadow-[0_0_32px_rgba(99,102,241,0.12)] hover:border-indigo-400/50 hover:bg-white/8 transition-all duration-500 overflow-hidden hover:-translate-y-1"
 
 // ─── Market Data ──────────────────────────────────────────────────────────────
 const INDICES_US = [
-  { symbol: 'SPY', name: 'S&P 500', price: 5842.47, change: 23.14, pct: 0.40 },
-  { symbol: 'QQQ', name: 'NASDAQ', price: 20378.92, change: 87.33, pct: 0.43 },
-  { symbol: 'DJI', name: 'Dow Jones', price: 43192.05, change: -45.12, pct: -0.10 },
-  { symbol: 'VIX', name: 'Volatility', price: 16.31, change: -0.82, pct: -4.78 },
+  { symbol: 'SPY', name: 'S&P 500', price: null as number | null, change: null as number | null, pct: null as number | null },
+  { symbol: 'QQQ', name: 'NASDAQ', price: null as number | null, change: null as number | null, pct: null as number | null },
+  { symbol: 'DJI', name: 'Dow Jones', price: null as number | null, change: null as number | null, pct: null as number | null },
+  { symbol: 'VIX', name: 'Volatility', price: null as number | null, change: null as number | null, pct: null as number | null },
 ]
 
 const INDICES_IN = [
-  { symbol: 'NIFTY', name: 'Nifty 50', price: 22402.40, change: 112.30, pct: 0.50 },
-  { symbol: 'SENSEX', name: 'Sensex', price: 73877.30, change: -95.20, pct: -0.13 },
-  { symbol: 'BANK', name: 'Bank Nifty', price: 48210.55, change: 230.10, pct: 0.48 },
-  { symbol: 'MIDCAP', name: 'Midcap 100', price: 49382.10, change: -180.40, pct: -0.36 },
-]
-
-const HOLDINGS_US = [
-  { symbol: 'NVDA', qty: 50, avg: 420.0, ltp: 897.5, value: 44875, pl: 23875, pct: 113.69 },
-  { symbol: 'MSFT', qty: 30, avg: 310.0, ltp: 415.8, value: 12474, pl: 3174, pct: 34.13 },
-  { symbol: 'AAPL', qty: 40, avg: 155.0, ltp: 189.4, value: 7576, pl: 1376, pct: 22.19 },
-  { symbol: 'TSLA', qty: 20, avg: 200.0, ltp: 171.0, value: 3420, pl: -580, pct: -14.5 },
-]
-
-const HOLDINGS_IN = [
-  { symbol: 'RELIANCE', qty: 100, avg: 2400.0, ltp: 2872.5, value: 287250, pl: 47250, pct: 19.69 },
-  { symbol: 'TCS', qty: 50, avg: 3600.0, ltp: 4012.3, value: 200615, pl: 20615, pct: 11.43 },
-  { symbol: 'INFY', qty: 80, avg: 1500.0, ltp: 1389.4, value: 111152, pl: -8848, pct: -7.37 },
-  { symbol: 'HDFCBANK', qty: 120, avg: 1550.0, ltp: 1621.0, value: 194520, pl: 8520, pct: 4.58 },
-]
-
-const WATCHLIST_US = [
-  { symbol: 'NVDA', price: 897.50, change: 12.40, pct: 1.40, vol: '42.3M' },
-  { symbol: 'AAPL', price: 189.40, change: -1.20, pct: -0.63, vol: '55.1M' },
-  { symbol: 'TSLA', price: 171.05, change: 4.32, pct: 2.59, vol: '91.2M' },
-  { symbol: 'MSFT', price: 415.82, change: 2.14, pct: 0.52, vol: '18.4M' },
-  { symbol: 'META', price: 502.30, change: -3.10, pct: -0.61, vol: '11.7M' },
-  { symbol: 'AMZN', price: 187.90, change: 1.85, pct: 0.99, vol: '33.5M' },
-]
-
-const WATCHLIST_IN = [
-  { symbol: 'RELIANCE', price: 2872.50, change: 34.20, pct: 1.21, vol: '8.4M' },
-  { symbol: 'TCS', price: 4012.30, change: -22.10, pct: -0.55, vol: '2.1M' },
-  { symbol: 'WIPRO', price: 480.15, change: 5.30, pct: 1.11, vol: '15.2M' },
-  { symbol: 'BAJFINANCE', price: 7121.45, change: -61.30, pct: -0.85, vol: '1.8M' },
-  { symbol: 'HDFCBANK', price: 1621.00, change: 12.80, pct: 0.80, vol: '9.3M' },
-  { symbol: 'ICICIBANK', price: 1089.70, change: 18.40, pct: 1.72, vol: '14.1M' },
+  { symbol: 'NIFTY', name: 'Nifty 50', price: null as number | null, change: null as number | null, pct: null as number | null },
+  { symbol: 'SENSEX', name: 'Sensex', price: null as number | null, change: null as number | null, pct: null as number | null },
+  { symbol: 'BANK', name: 'Bank Nifty', price: null as number | null, change: null as number | null, pct: null as number | null },
+  { symbol: 'MIDCAP', name: 'Midcap 100', price: null as number | null, change: null as number | null, pct: null as number | null },
 ]
 
 const FRED = [
-  { id: 'FEDFUNDS', title: 'Fed Funds Rate', value: 5.33, unit: '%' },
-  { id: 'CPIAUCSL', title: 'CPI Inflation', value: 3.2, unit: '%' },
-  { id: 'UNRATE', title: 'Unemployment', value: 3.7, unit: '%' },
-  { id: 'DGS10', title: '10Y Treasury', value: 4.71, unit: '%' },
+  { id: 'FEDFUNDS', title: 'Fed Funds Rate', value: null as number | null, unit: '%' },
+  { id: 'CPIAUCSL', title: 'CPI Inflation', value: null as number | null, unit: '%' },
+  { id: 'UNRATE', title: 'Unemployment', value: null as number | null, unit: '%' },
+  { id: 'DGS10', title: '10Y Treasury', value: null as number | null, unit: '%' },
 ]
 
 const RBI = [
-  { id: 'REPO', title: 'Repo Rate', value: 6.50, unit: '%' },
-  { id: 'INDIA_CPI', title: 'India CPI', value: 5.1, unit: '%' },
-  { id: 'INDIA_GDP', title: 'GDP Growth', value: 7.2, unit: '%' },
-  { id: 'USD_INR', title: 'USD/INR', value: 83.47, unit: '' },
+  { id: 'REPO', title: 'Repo Rate', value: null as number | null, unit: '%' },
+  { id: 'INDIA_CPI', title: 'India CPI', value: null as number | null, unit: '%' },
+  { id: 'INDIA_GDP', title: 'GDP Growth', value: null as number | null, unit: '%' },
+  { id: 'USD_INR', title: 'USD/INR', value: null as number | null, unit: '' },
 ]
-
-function makeSpark(n = 24, up = true) {
-  const arr = []
-  let v = 100
-  for (let i = 0; i < n; i++) {
-    v += (Math.random() - (up ? 0.35 : 0.65)) * 3
-    arr.push({ v: Math.max(85, v) })
-  }
-  return arr
-}
-
-function makeFred(base: number, vol: number, n = 18) {
-  const arr = []
-  let v = base * 0.7
-  for (let i = 0; i < n; i++) {
-    v += (Math.random() - 0.45) * vol
-    arr.push({ v: Math.max(0, +v.toFixed(2)) })
-  }
-  arr.push({ v: base })
-  return arr
-}
 
 function TimeDisplay() {
   const [time, setTime] = useState<string | null>(null)
@@ -142,42 +84,6 @@ function useCountUp(value: number, duration = 700) {
   return display
 }
 
-function NeonSpark({ data, color, id }: { data: { v: number }[]; color: string; id: string }) {
-  return (
-    <div className="h-11" style={{ filter: `drop-shadow(0 0 5px ${color}60)` }}>
-      <ResponsiveContainer width="100%" height="100%">
-        <AreaChart data={data} margin={{ top: 0, right: 0, bottom: 0, left: 0 }}>
-          <defs>
-            <linearGradient id={`ng-${id}`} x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stopColor={color} stopOpacity={0.14} />
-              <stop offset="100%" stopColor={color} stopOpacity={0} />
-            </linearGradient>
-          </defs>
-          <Area type="monotone" dataKey="v" stroke={color} strokeWidth={1.5} fill={`url(#ng-${id})`} dot={false} />
-        </AreaChart>
-      </ResponsiveContainer>
-    </div>
-  )
-}
-
-function NeonLine({ data, color, id, unit }: { data: { v: number }[]; color: string; id: string; unit: string }) {
-  return (
-    <div className="h-12" style={{ filter: `drop-shadow(0 0 4px ${color}50)` }}>
-      <ResponsiveContainer width="100%" height="100%">
-        <LineChart data={data} margin={{ top: 0, right: 0, bottom: 0, left: 0 }}>
-          <Line type="monotone" dataKey="v" stroke={color} strokeWidth={1.5} dot={false} />
-          <Tooltip
-            contentStyle={{ background: '#06060a', border: '1px solid rgba(255,255,255,0.07)', borderRadius: 8, fontSize: 11, fontFamily: 'var(--font-mono)', backdropFilter: 'blur(8px)' }}
-            itemStyle={{ color }}
-            formatter={(v: any) => [`${Number(v).toFixed(2)}${unit}`, '']}
-          />
-        </LineChart>
-      </ResponsiveContainer>
-    </div>
-  )
-}
-
-// Price-dependent fields are null when the backend has no live price (price_status === 'unavailable').
 type BackendHolding = {
   symbol: string
   quantity: number
@@ -199,10 +105,10 @@ type HoldingRow = {
 }
 
 const UNAVAILABLE = 'Unavailable'
+const quoteValue = (v: unknown): number | null => typeof v === 'number' && Number.isFinite(v) ? v : null
 
 function IndexCard({ idx, symbol }: { idx: typeof INDICES_US[0]; symbol: string }) {
-  const isUp = idx.pct >= 0
-  const spark = makeSpark(24, isUp)
+  const isUp = idx.pct !== null && idx.pct >= 0
 
   return (
     <div className={CARD_GLOW}>
@@ -212,32 +118,31 @@ function IndexCard({ idx, symbol }: { idx: typeof INDICES_US[0]; symbol: string 
           <div className="data-text text-[13px] tracking-[0.12em] text-white/55 uppercase">{idx.name}</div>
         </div>
         <div className={`data-text text-[11px] font-medium px-2 py-1 rounded border ${isUp ? 'border-indigo-500/25 bg-indigo-500/8 text-indigo-400' : 'border-white/8 bg-white/3 text-white/35'}`}>
-          {isUp ? '+' : ''}{idx.pct.toFixed(2)}%
+          {idx.pct === null ? UNAVAILABLE : `${isUp ? '+' : ''}${idx.pct.toFixed(2)}%`}
         </div>
       </div>
 
       <div className="metric-text glow-text primary-text text-[32px] tabular-nums tracking-tight mb-5 leading-none">
-        {symbol}{idx.price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+        {idx.price === null ? UNAVAILABLE : `${symbol}${idx.price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
       </div>
 
-      <NeonSpark data={spark} color={INDIGO_ACCENT} id={idx.symbol} />
+
     </div>
   )
 }
 
 function FredCard({ m }: { m: typeof FRED[0] }) {
-  const data = makeFred(m.value, m.value * 0.08)
   return (
     <div className={CARD_GLOW}>
       <div className="flex items-center justify-between mb-1.5">
         <span className="data-text text-[10px] text-white/25 tracking-[0.28em] uppercase">{m.id}</span>
-        <span className="data-text text-[9px] text-indigo-400/60">SYNC_OK</span>
+        <span className="data-text text-[9px] text-indigo-400/60">{m.value === null ? 'UNAVAILABLE' : 'CACHED'}</span>
       </div>
       <div className="data-text text-[13px] text-white/50 mb-2">{m.title}</div>
       <div className="metric-text glow-text primary-text text-[28px] mb-4 tabular-nums tracking-tight leading-none">
-        {m.value.toFixed(2)}<span className="text-[16px] text-white/35 ml-0.5">{m.unit}</span>
+        {m.value === null ? UNAVAILABLE : m.value.toFixed(2)}<span className="text-[16px] text-white/35 ml-0.5">{m.unit}</span>
       </div>
-      <NeonLine data={data} color={INDIGO_ACCENT} id={m.id} unit={m.unit} />
+
     </div>
   )
 }
@@ -248,8 +153,9 @@ export default function DashboardPage() {
   const [market, setMarket] = useState<Market>('us')
   const [refreshing, setRefreshing] = useState(false)
   const [indices, setIndices] = useState(market === 'us' ? INDICES_US : INDICES_IN)
-  const [holdings, setHoldings] = useState<HoldingRow[]>(market === 'us' ? HOLDINGS_US : HOLDINGS_IN)
-  const [watchlist, setWatchlist] = useState(market === 'us' ? WATCHLIST_US : WATCHLIST_IN)
+  const [holdings, setHoldings] = useState<HoldingRow[]>([])
+  const [portfolioStatus, setPortfolioStatus] = useState<'loading' | 'ready' | 'error'>('loading')
+  const watchlist: { symbol: string; price: number; change: number; pct: number; vol: string }[] = []
   const [macro, setMacro] = useState(market === 'us' ? FRED : RBI)
   const [error, setError] = useState<string | null>(null)
   // Beta / Sharpe of the current holdings from GET .../portfolio/risk (null = unavailable).
@@ -264,6 +170,7 @@ export default function DashboardPage() {
 
   const loadBackendData = useCallback(async () => {
     setRefreshing(true)
+    setPortfolioStatus('loading')
     setError(null)
     try {
       const [overview, portfolio, fredSnapshot]: [any, any, any] = await Promise.all([
@@ -285,15 +192,16 @@ export default function DashboardPage() {
         setRisk({ status: 'done', beta: null, sharpe: null })
       }
 
+      setPortfolioStatus('ready')
       const overviewIndices = overview?.indices || {}
       const fredData = fredSnapshot?.data || {}
 
       if (market === 'us') {
         setIndices([
-          { symbol: 'SPY', name: 'S&P 500', price: Number(overviewIndices.SP500?.price ?? INDICES_US[0].price), change: Number(overviewIndices.SP500?.change_pct ?? INDICES_US[0].change), pct: Number(overviewIndices.SP500?.change_pct ?? INDICES_US[0].pct) },
-          { symbol: 'QQQ', name: 'NASDAQ', price: Number(overviewIndices.NASDAQ100?.price ?? INDICES_US[1].price), change: Number(overviewIndices.NASDAQ100?.change_pct ?? INDICES_US[1].change), pct: Number(overviewIndices.NASDAQ100?.change_pct ?? INDICES_US[1].pct) },
-          { symbol: 'DJI', name: 'Dow Jones', price: Number(overviewIndices.DJIA?.price ?? INDICES_US[2].price), change: Number(overviewIndices.DJIA?.change_pct ?? INDICES_US[2].change), pct: Number(overviewIndices.DJIA?.change_pct ?? INDICES_US[2].pct) },
-          { symbol: 'VIX', name: 'Volatility', price: Number(overviewIndices.VIXCLS?.price ?? INDICES_US[3].price), change: Number(overviewIndices.VIXCLS?.change_pct ?? INDICES_US[3].change), pct: Number(overviewIndices.VIXCLS?.change_pct ?? INDICES_US[3].pct) },
+          { symbol: 'SPY', name: 'S&P 500', price: quoteValue(overviewIndices.SP500?.price), change: quoteValue(overviewIndices.SP500?.change_pct), pct: quoteValue(overviewIndices.SP500?.change_pct) },
+          { symbol: 'QQQ', name: 'NASDAQ', price: quoteValue(overviewIndices.NASDAQ100?.price), change: quoteValue(overviewIndices.NASDAQ100?.change_pct), pct: quoteValue(overviewIndices.NASDAQ100?.change_pct) },
+          { symbol: 'DJI', name: 'Dow Jones', price: quoteValue(overviewIndices.DJIA?.price), change: quoteValue(overviewIndices.DJIA?.change_pct), pct: quoteValue(overviewIndices.DJIA?.change_pct) },
+          { symbol: 'VIX', name: 'Volatility', price: quoteValue(overviewIndices.VIXCLS?.price), change: quoteValue(overviewIndices.VIXCLS?.change_pct), pct: quoteValue(overviewIndices.VIXCLS?.change_pct) },
         ])
         setHoldings(Array.isArray(portfolio?.holdings) && portfolio.holdings.length ? portfolio.holdings.map((h: BackendHolding) => ({
           symbol: h.symbol,
@@ -303,20 +211,19 @@ export default function DashboardPage() {
           value: h.current_value,
           pl: h.pl,
           pct: h.pl_pct,
-        })) : HOLDINGS_US)
-        setWatchlist(WATCHLIST_US)
+        })) : [])
         setMacro([
-          { id: 'FEDFUNDS', title: 'Fed Funds Rate', value: Number(fredData.FEDFUNDS?.value ?? FRED[0].value), unit: '%' },
-          { id: 'CPIAUCSL', title: 'CPI Inflation', value: Number(fredData.CPIAUCSL?.value ?? FRED[1].value), unit: '%' },
-          { id: 'UNRATE', title: 'Unemployment', value: Number(fredData.UNRATE?.value ?? FRED[2].value), unit: '%' },
-          { id: 'DGS10', title: '10Y Treasury', value: Number(fredData.DGS10?.value ?? FRED[3].value), unit: '%' },
+          { id: 'FEDFUNDS', title: 'Fed Funds Rate', value: quoteValue(fredData.FEDFUNDS?.value), unit: '%' },
+          { id: 'CPIAUCSL', title: 'CPI Inflation', value: quoteValue(fredData.CPIAUCSL?.value), unit: '%' },
+          { id: 'UNRATE', title: 'Unemployment', value: quoteValue(fredData.UNRATE?.value), unit: '%' },
+          { id: 'DGS10', title: '10Y Treasury', value: quoteValue(fredData.DGS10?.value), unit: '%' },
         ])
       } else {
         setIndices([
-          { symbol: 'NIFTY', name: 'Nifty 50', price: Number(overviewIndices['^NSEI']?.price ?? INDICES_IN[0].price), change: Number(overviewIndices['^NSEI']?.change_pct ?? INDICES_IN[0].change), pct: Number(overviewIndices['^NSEI']?.change_pct ?? INDICES_IN[0].pct) },
-          { symbol: 'SENSEX', name: 'Sensex', price: Number(overviewIndices['^BSESN']?.price ?? INDICES_IN[1].price), change: Number(overviewIndices['^BSESN']?.change_pct ?? INDICES_IN[1].change), pct: Number(overviewIndices['^BSESN']?.change_pct ?? INDICES_IN[1].pct) },
-          { symbol: 'BANK', name: 'Bank Nifty', price: Number(overviewIndices['^NSEBANK']?.price ?? INDICES_IN[2].price), change: Number(overviewIndices['^NSEBANK']?.change_pct ?? INDICES_IN[2].change), pct: Number(overviewIndices['^NSEBANK']?.change_pct ?? INDICES_IN[2].pct) },
-          { symbol: 'MIDCAP', name: 'Midcap 100', price: Number(overviewIndices['^NIFTYMCAP100']?.price ?? INDICES_IN[3].price), change: Number(overviewIndices['^NIFTYMCAP100']?.change_pct ?? INDICES_IN[3].change), pct: Number(overviewIndices['^NIFTYMCAP100']?.change_pct ?? INDICES_IN[3].pct) },
+          { symbol: 'NIFTY', name: 'Nifty 50', price: quoteValue(overviewIndices['^NSEI']?.price), change: quoteValue(overviewIndices['^NSEI']?.change_pct), pct: quoteValue(overviewIndices['^NSEI']?.change_pct) },
+          { symbol: 'SENSEX', name: 'Sensex', price: quoteValue(overviewIndices['^BSESN']?.price), change: quoteValue(overviewIndices['^BSESN']?.change_pct), pct: quoteValue(overviewIndices['^BSESN']?.change_pct) },
+          { symbol: 'BANK', name: 'Bank Nifty', price: quoteValue(overviewIndices['^NSEBANK']?.price), change: quoteValue(overviewIndices['^NSEBANK']?.change_pct), pct: quoteValue(overviewIndices['^NSEBANK']?.change_pct) },
+          { symbol: 'MIDCAP', name: 'Midcap 100', price: quoteValue(overviewIndices['^NIFTYMCAP100']?.price), change: quoteValue(overviewIndices['^NIFTYMCAP100']?.change_pct), pct: quoteValue(overviewIndices['^NIFTYMCAP100']?.change_pct) },
         ])
         setHoldings(Array.isArray(portfolio?.holdings) && portfolio.holdings.length ? portfolio.holdings.map((h: BackendHolding) => ({
           symbol: h.symbol,
@@ -326,11 +233,14 @@ export default function DashboardPage() {
           value: h.current_value,
           pl: h.pl,
           pct: h.pl_pct,
-        })) : HOLDINGS_IN)
-        setWatchlist(WATCHLIST_IN)
+        })) : [])
         setMacro(RBI)
       }
     } catch (err) {
+      setPortfolioStatus('error')
+      setHoldings([])
+      setIndices(market === 'us' ? INDICES_US : INDICES_IN)
+      setMacro(market === 'us' ? FRED : RBI)
       setRisk({ status: 'done', beta: null, sharpe: null })
       setError(extractErrorMessage(err, 'Failed to load dashboard data from backend.'))
     } finally {
@@ -343,11 +253,11 @@ export default function DashboardPage() {
   }, [loadBackendData])
 
   // Totals only exist when every holding could be priced; otherwise they are unavailable (never 0).
-  const valuationComplete = HOLDINGS.every(h => h.value !== null && h.pl !== null)
+  const valuationComplete = portfolioStatus === 'ready' && HOLDINGS.every(h => h.value !== null && h.pl !== null)
   const portfolioVal: number | null = valuationComplete ? HOLDINGS.reduce((a, h) => a + (h.value ?? 0), 0) : null
   const portfolioPL: number | null = valuationComplete ? HOLDINGS.reduce((a, h) => a + (h.pl ?? 0), 0) : null
   const portfolioPct = portfolioVal !== null && portfolioPL !== null
-    ? ((portfolioPL / (portfolioVal - portfolioPL)) * 100).toFixed(2)
+    ? (portfolioVal === portfolioPL ? '0.00' : ((portfolioPL / (portfolioVal - portfolioPL)) * 100).toFixed(2))
     : null
   const animatedPortfolioVal = useCountUp(portfolioVal ?? 0, 800)
   const animatedPortfolioPL = useCountUp(portfolioPL ?? 0, 800)
@@ -389,10 +299,10 @@ export default function DashboardPage() {
             <span className="data-text text-[10px] text-white/60 uppercase tracking-[0.24em]">System Status</span>
           </div>
           <div className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full border border-white/10 bg-white/[0.015]">
-            <span className="data-text text-[10px] text-indigo-200/90 uppercase tracking-[0.22em]">AI_ACTIVE</span>
+            <span className="data-text text-[10px] text-indigo-200/90 uppercase tracking-[0.22em]">AI STATUS UNAVAILABLE</span>
           </div>
           <div className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full border border-white/10 bg-white/[0.015]">
-            <span className="data-text text-[10px] text-white/55 uppercase tracking-[0.22em]">CONFIDENCE 87.5%</span>
+            <span className="data-text text-[10px] text-white/55 uppercase tracking-[0.22em]">CONFIDENCE UNAVAILABLE</span>
           </div>
           <div className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full border border-white/10 bg-white/[0.015]">
             <span className="data-text text-[10px] text-white/55 uppercase tracking-[0.22em]">
@@ -407,11 +317,11 @@ export default function DashboardPage() {
               Analytics Terminal
               <span className="inline-flex items-center gap-2 px-2.5 py-1 text-[10px] border border-indigo-400/40 rounded-full text-indigo-200/90 bg-indigo-500/10">
                 <span className="w-1.5 h-1.5 rounded-full bg-indigo-300 animate-pulse" />
-                LIVE FEED
+                LATEST SNAPSHOT
               </span>
             </h1>
             <p className="data-text text-[11px] meta-text mt-2 tracking-[0.18em] uppercase">
-              <TimeDisplay /> · SERVER NYC_DC_01 · STREAM {isUS ? 'FRED' : 'RBI/NSE'}
+              <TimeDisplay /> · STREAM {isUS ? 'FRED' : 'RBI/NSE'}
             </p>
           </div>
 
@@ -481,6 +391,7 @@ export default function DashboardPage() {
           <span className="metric-text primary-text text-[15px] tabular-nums">{portfolioVal === null ? UNAVAILABLE : fmtVal(portfolioVal)}</span>
         </div>
         <div className="p-4 space-y-1.5">
+          {portfolioStatus === 'ready' && !HOLDINGS.length && <p className="p-4 text-sm text-white/50">No positions yet.</p>}
           {HOLDINGS.map(h => (
             <div key={h.symbol} className="flex items-center justify-between px-4 py-3 rounded-xl border border-white/[0.03] hover:border-white/[0.1] hover:bg-white/[0.03] transition-all cursor-default">
               <div>
@@ -519,6 +430,7 @@ export default function DashboardPage() {
               </tr>
             </thead>
             <tbody>
+              {!WATCHLIST.length && <tr><td colSpan={5} className="px-6 py-4 text-white/50">Watchlist data unavailable.</td></tr>}
               {WATCHLIST.map(row => {
                 const up = row.pct >= 0
                 return (
@@ -561,10 +473,10 @@ export default function DashboardPage() {
       {/* ── System Footer ── */}
       <div className="relative z-10 flex flex-wrap items-center gap-10 py-8 border-t border-white/[0.04]">
         {[
-          { label: 'Agents', status: 'ONLINE' },
-          { label: 'Market Feed', status: 'STABLE' },
-          { label: 'Risk Engine', status: 'ACTIVE' },
-          { label: 'Latency', status: '<24ms' },
+          { label: 'Agents', status: UNAVAILABLE },
+          { label: 'Market Feed', status: error ? UNAVAILABLE : 'SNAPSHOT' },
+          { label: 'Risk Engine', status: risk.status === 'loading' ? 'Loading' : 'Computed where available' },
+          { label: 'Latency', status: UNAVAILABLE },
         ].map(s => (
           <div key={s.label} className="flex flex-col gap-1 opacity-25">
             <span className="data-text text-[10px] text-white/50 uppercase tracking-widest font-medium">{s.label}</span>
