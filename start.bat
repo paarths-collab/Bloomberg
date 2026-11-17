@@ -53,6 +53,16 @@ if not exist ".venv\.installed" (
     echo. > ".venv\.installed"
 )
 
+REM Next.js requires Node.js and installed frontend dependencies.
+call npm --version >nul 2>&1
+if errorlevel 1 exit /b 1
+if not exist "frontend\node_modules" (
+    pushd frontend
+    call npm ci
+    if errorlevel 1 (popd & exit /b 1)
+    popd
+)
+
 REM Start Backend
 echo 📡 Starting Backend Server...
 echo ✓ Starting FastAPI server on http://localhost:%PORT%
@@ -67,21 +77,23 @@ echo 🌐 Starting Frontend Server...
 cd frontend
 
 REM Start frontend server in a new window
-echo ✓ Starting frontend on http://localhost:8080
-start "Boomerang Frontend" cmd /k "python -m http.server 8080"
+echo ✓ Starting frontend on http://localhost:3000
+set BACKEND_URL=http://127.0.0.1:%PORT%
+set NEXT_PUBLIC_BACKEND_URL=%BACKEND_URL%
+start "Boomerang Frontend" cmd /k "npm run dev -- --port 3000"
 
 cd ..
 
 REM Open browser
 timeout /t 2 /nobreak >nul
-start http://localhost:8080
+start http://localhost:3000
 
 echo.
 echo ========================================
 echo ✓ Boomerang is now running!
 echo ========================================
 echo.
-echo 📊 Frontend:  http://localhost:8080
+echo 📊 Frontend:  http://localhost:3000
 echo 📡 Backend:   http://localhost:%PORT%
 echo 📚 API Docs:  http://localhost:%PORT%/docs
 echo.

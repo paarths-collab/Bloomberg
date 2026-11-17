@@ -27,3 +27,7 @@ instead of being deleted so it stays easy to browse and recover.
   `ChatSidebar`), unused `animations/LaserFlow` components, an old
   `.checkpoints/` snapshot, and unreferenced `public/world-map*` images.
 - `test_output.txt`, `test_output_full.txt` - old captured test logs.
+- `outputs/` - generated KPI/Q-table result files (JSON/TXT) written by
+  `scripts/bloomberg_kpi_test.py` and `train_rl_qtable.py` (their default output
+  directory is `outputs/` at the repo root). Nothing reads them; the scripts
+  regenerate them on demand.

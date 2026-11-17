@@ -43,6 +43,17 @@ if [ ! -f ".venv/.installed" ]; then
     touch .venv/.installed
 fi
 
+# Next.js must run the frontend source and proxy /api requests to this backend.
+if ! command -v npm &> /dev/null; then
+    echo "Node.js and npm are required to start the frontend."
+    exit 1
+fi
+if [ ! -d frontend/node_modules ]; then
+    (cd frontend && npm ci) || exit 1
+fi
+export BACKEND_URL="http://127.0.0.1:${PORT}"
+export NEXT_PUBLIC_BACKEND_URL="$BACKEND_URL"
+
 # Start Backend
 echo -e "${BLUE}📡 Starting Backend Server...${NC}"
 echo -e "${GREEN}✓ Starting FastAPI server on http://localhost:${PORT}${NC}"
@@ -52,8 +63,8 @@ BACKEND_PID=$!
 # Start Frontend
 echo ""
 echo -e "${BLUE}🌐 Starting Frontend Server...${NC}"
-echo -e "${GREEN}✓ Starting frontend on http://localhost:8080${NC}"
-(cd frontend && exec python3 -m http.server 8080) &
+echo -e "${GREEN}✓ Starting frontend on http://localhost:3000${NC}"
+(cd frontend && exec npm run dev -- --port 3000) &
 FRONTEND_PID=$!
 
 echo ""
@@ -61,7 +72,7 @@ echo -e "${GREEN}========================================${NC}"
 echo -e "${GREEN}✓ Boomerang is now running!${NC}"
 echo -e "${GREEN}========================================${NC}"
 echo ""
-echo -e "📊 Frontend:  ${BLUE}http://localhost:8080${NC}"
+echo -e "📊 Frontend:  ${BLUE}http://localhost:3000${NC}"
 echo -e "📡 Backend:   ${BLUE}http://localhost:${PORT}${NC}"
 echo -e "📚 API Docs:  ${BLUE}http://localhost:${PORT}/docs${NC}"
 echo ""

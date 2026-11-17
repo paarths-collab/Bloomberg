@@ -9,7 +9,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Correctly locate backend/.env
-# This script is at the root: c:\Users\Paarth\Github\Boomerang - agentic\run_migration.py
+# BASE_DIR is the directory containing this script.
 BASE_DIR = Path(__file__).parent
 ENV_PATH = BASE_DIR / "backend" / ".env"
 SQL_PATH = BASE_DIR / "backend" / "init.sql"
