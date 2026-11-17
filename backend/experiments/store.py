@@ -20,12 +20,12 @@ from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from sqlalchemy import func
+from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from backend.backtest import service as bt
-from backend.database.models import DatasetVersion, ExperimentTrial
+from backend.database.models import DatasetVersion, ExperimentTrial, ExperimentQuota
 from backend.experiments import datasets as ds
 from backend.experiments.datasets import DatasetError, canonical_json, json_safe, sha256_hex
 
@@ -157,7 +157,14 @@ def _frame_from_row(row: DatasetVersion) -> pd.DataFrame:
         rows = json.loads(row.rows_json)
     except ValueError:
         rows = None
-    if not isinstance(rows, list) or ds.rows_hash(rows) != row.content_hash:
+    hashes = set()
+    if isinstance(rows, list):
+        hashes = {ds.rows_hash(rows), ds.snapshot_hash(rows, **{
+            key: getattr(row, key) for key in ds.IDENTITY_FIELDS
+        })}
+    # Legacy rows used a bars-only hash. Keep existing trials readable without
+    # rewriting their immutable data or identifiers.
+    if row.content_hash not in hashes:
         logger.error("Stored dataset %s failed its integrity check", row.content_hash)
         raise DatasetError("invalid_dataset", "The stored dataset failed its integrity check.")
     return ds.rows_to_df(rows)
@@ -225,9 +232,31 @@ def _run_engine(frame: pd.DataFrame, spec: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def check_trial_quota(db: Session, user_id: str) -> None:
-    count = db.query(func.count(ExperimentTrial.id)).filter(ExperimentTrial.user_id == user_id).scalar()
-    if count >= MAX_TRIALS_PER_USER:
+    """Atomically reserve a slot, including existing trials when migrating a user.
+
+    INSERT/UPDATE serialize on the user's primary key on SQLite and Postgres.
+    Commit before provider/engine work, whose dataset storage also commits.
+    """
+    db.execute(text("""
+        INSERT INTO experiment_quotas (user_id, allocated)
+        VALUES (:uid, (SELECT COUNT(*) FROM experiment_trials WHERE user_id = :uid))
+        ON CONFLICT (user_id) DO NOTHING
+    """), {"uid": user_id})
+    reserved = db.execute(text("""
+        UPDATE experiment_quotas SET allocated = allocated + 1
+        WHERE user_id = :uid AND allocated < :cap
+    """), {"uid": user_id, "cap": MAX_TRIALS_PER_USER}).rowcount
+    if not reserved:
+        db.rollback()
         raise TrialLimitError()
+    db.commit()
+
+
+def _release_trial_slot(db, user_id):
+    db.rollback()
+    db.query(ExperimentQuota).filter(ExperimentQuota.user_id == user_id).update(
+        {ExperimentQuota.allocated: ExperimentQuota.allocated - 1})
+    db.commit()
 
 
 def run_and_record_trial(
@@ -241,6 +270,16 @@ def run_and_record_trial(
     the row when that hash can no longer be resolved, so the trial still says which data it needed.
     """
     check_trial_quota(db, user_id)
+    try:
+        return _run_reserved_trial(db, user_id, spec, spec_json, spec_hash, dataset_ref,
+                                   label, parent_trial_id, known_dataset_hash)
+    except Exception:
+        _release_trial_slot(db, user_id)
+        raise
+
+
+def _run_reserved_trial(db, user_id, spec, spec_json, spec_hash, dataset_ref, label,
+                        parent_trial_id, known_dataset_hash):
     trial = ExperimentTrial(
         id=uuid.uuid4().hex, user_id=user_id, label=label, parent_trial_id=parent_trial_id,
         spec_json=spec_json, spec_hash=spec_hash, dataset_hash=None,

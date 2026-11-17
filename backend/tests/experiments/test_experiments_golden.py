@@ -3,19 +3,19 @@ from backend.backtest import service as bt
 from backend.experiments import datasets as ds
 from backend.experiments import store
 
-GOLDEN_ENGINE_VERSION = "2.1.0"
+GOLDEN_ENGINE_VERSION = "2.2.0"
 GOLDEN_FIXTURES = {  # name -> (fixture version, content_hash)
-    "synthetic-gbm-504": (1, "dc4a9c5c3f93777bbf8fcc695c2816176854e1c48871f45dd5c9df8395f18ed0"),
-    "synthetic-flat-60": (1, "9b53d191c4288ed893e8f2a84e02de657b3c498714596131765c86b96fdc322b"),
+    "synthetic-gbm-504": (1, "91732abf19250dd6f03106234ea2033c7e7b664d6931b4b713e0fafef3f7e3bc"),
+    "synthetic-flat-60": (1, "5cf3fd7e78097015afb1918b57ab6dc0e716eb0aa8fda2b212132440bc1aa007"),
 }
 # synthetic-gbm-504, sma_crossover fast 10 / slow 30, commission_bps 5, slippage_bps 3, default seed (42)
 GOLDEN_SPEC = {"strategy": "sma_crossover", "params": {"fast_period": 10, "slow_period": 30}, "symbol": "SYN",
                "commission_bps": 5, "slippage_bps": 3}
 GOLDEN_LEDGER_HASH = "0a378d328e9c8278f681342ebb2b9f0fa81c93428255d9eb6977e8318a799217"
-GOLDEN_MONTE_CARLO_HASH = "9237e9d272731404e7c337ce192624b02936388ebf101fbd955ba56f0241f32d"
-GOLDEN_RESULT_HASH = "383d56dd0f0a4adf7cdca43a0c2e8cf2d5891beee0723dc9d5ba1cd957aa69d0"
+GOLDEN_MONTE_CARLO_HASH = "ad53b598800c3bd20302206d9b275cb4e54c05f3b9e415453d003c442a5143e7"
+GOLDEN_RESULT_HASH = "f09c142d40aa9c53e330276f720d64440e2cd191dc8654ddd0bf2b2253f0ec54"
 
-CHANGED = "engine/fixture output changed — bump ENGINE_VERSION (and fixture version) deliberately and update the golden values"
+CHANGED = "engine/fixture output changed — bump ENGINE_VERSION or the snapshot hash schema (fixture version only if its generator changes) deliberately and update the golden values"
 
 
 def test_fixture_content_hashes_and_versions_are_pinned():

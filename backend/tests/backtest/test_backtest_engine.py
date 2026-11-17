@@ -490,5 +490,5 @@ def test_monte_carlo_handles_paths_that_lose_everything():
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         mc = service._run_monte_carlo(returns, simulations=20, seed=1)
-    assert mc["riskMetrics"]["medianMaxDrawdown"] == 0.0  # peak 0 -> defined as no drawdown, not NaN
+    assert mc["riskMetrics"]["medianMaxDrawdown"] == -100.0  # measured from starting capital, including an immediate wipe-out
     assert mc["percentiles"]["p50"] == -100.0

@@ -6,10 +6,7 @@ from .core.emotion_agent import EmotionAnalysisAgent
 from .core.insider_agent import InsiderAgent
 from .core.sentiment_utils import calculate_headline_sentiment
 
-try:
-    from .core.news_fetcher import NewsFetcher
-except ImportError:
-    NewsFetcher = None
+from backend.news.service import NewsService
 
 logger = logging.getLogger(__name__)
 _EMOTION_AGENT = EmotionAnalysisAgent()
@@ -29,9 +26,13 @@ def get_market_sentiment(message: str, tickers: Optional[List[str]] = None, mark
     return {
         "text": message,
         "market": market,
-        "sentiment": analysis.get("sentiment", "Neutral"),
-        "confidence": analysis.get("confidence", 0.5),
-        "emotion": analysis.get("dominant_emotion", "Neutral"),
+        "sentiment": "negative" if analysis.get("dominant_bias") == "panic_selling" else "positive" if analysis.get("dominant_bias") in {"fomo_buying", "overconfidence"} else "neutral",
+        "confidence": None,
+        "emotion": analysis["emotion_label"],
+        "emotion_intensity": analysis["emotion_intensity"],
+        "dominant_bias": analysis["dominant_bias"],
+        "biases": analysis["biases"],
+        "method": "keyword_heuristic",
         "tickers": tickers or []
     }
 
@@ -62,7 +63,11 @@ def analyze_crowd_insight(
         news_component=news_component,
     )
 
+    available = insider_component.available or news_component.available
+    # No defensible confidence metric exists for this signal, so none is reported.
     confidence = _estimate_confidence(insider_component, news_component)
+    if not available:
+        combined_score, combined_label = None, "unavailable"
 
     return {
         "timestamp": datetime.utcnow().isoformat(),
@@ -76,6 +81,7 @@ def analyze_crowd_insight(
             "score": combined_score,
             "label": combined_label,
             "confidence": confidence,
+            "confidence_status": "not_computed",
         },
     }
 
@@ -95,12 +101,13 @@ def _build_insider_component(ticker: str, include_insider: bool, finnhub_key: Op
         return SignalComponent(None, "error", False, {"reason": "insider signal unavailable"})
 
 def _build_news_component(ticker: str, include_news: bool) -> SignalComponent:
-    if not include_news or not NewsFetcher:
+    if not include_news:
         return SignalComponent(None, "unavailable", False, {"reason": "news disabled or fetcher missing"})
     try:
-        fetcher = NewsFetcher()
-        items = fetcher.get_stock_news(ticker, limit=6)
-        headlines = [t.get("title", "") for t in items]
+        items = NewsService().search_news(f"{ticker} stock news")[:6]
+        headlines = [t.get("title", "") for t in items if t.get("title")]
+        if not headlines:
+            return SignalComponent(None, "unavailable", False, {"reason": "no news available"})
         score = calculate_headline_sentiment(headlines)
         return SignalComponent(score, _label_from_score(score), True, {"headlines": headlines[:3]})
     except Exception:
@@ -119,8 +126,9 @@ def _combine_components(insider_component: SignalComponent, news_component: Sign
     avg = sum(scores) / len(scores) if scores else 0
     return round(avg, 3), _label_from_score(avg)
 
-def _estimate_confidence(insider_component: SignalComponent, news_component: SignalComponent) -> float:
-    return 0.7 if insider_component.available and news_component.available else 0.4
+def _estimate_confidence(insider_component: SignalComponent, news_component: SignalComponent) -> Optional[float]:
+    """Signal confidence is not computed: the former 0.7/0.4 values were hard-coded, not derived from data."""
+    return None
 
 def _component_payload(component: SignalComponent) -> Dict[str, Any]:
     return {"available": component.available, "label": component.label, "score": component.score, "details": component.details}

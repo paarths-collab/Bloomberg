@@ -76,14 +76,16 @@ SERIES_ALIASES = {
 }
 
 
+class FredUnavailable(ValueError):
+    """A live data request cannot run without configured credentials."""
+
+
 class FredDataService:
     """Service for fetching and managing FRED data"""
     
     def __init__(self, api_key: Optional[str] = None):
         self.api_key = api_key or os.getenv("FRED_API_KEY")
-        if not self.api_key:
-            raise ValueError("FRED_API_KEY not found in environment")
-        self.fred = Fred(api_key=self.api_key)
+        self.fred = Fred(api_key=self.api_key) if self.api_key else None
     
     def fetch_series(
         self,
@@ -92,6 +94,8 @@ class FredDataService:
         end_date: Optional[date] = None
     ) -> pd.Series:
         """Fetch series data from FRED API"""
+        if self.fred is None:
+            raise FredUnavailable("FRED service is not configured")
         try:
             data = self.fred.get_series(
                 series_id,
@@ -243,8 +247,8 @@ class FredDataService:
             
             # Check if data exists and is fresh
             if latest and latest.updated_at: # pyright: ignore[reportGeneralTypeIssues]
-                age = datetime.utcnow() - latest.updated_at
-                if age < timedelta(hours=max_age_hours): # type: ignore
+                age = datetime.utcnow() - latest.updated_at.replace(tzinfo=None)
+                if age < timedelta(hours=max_age_hours) or not self.api_key: # type: ignore
                     # Return cached data
                     data = repo.get_series(series_id) # pyright: ignore[reportAttributeAccessIssue]
                     return [d.to_dict() for d in data]

@@ -1,10 +1,7 @@
 """
 Investor Profile & paper-portfolio API (single shared implementation).
 
-The handlers live on ``shared_router`` (no prefix) and are exposed at two places so
-existing clients keep working:
-  - /api/portfolio/api/investor-profile/{save,load,trade,portfolio}   (``router`` below)
-  - /api/profile/{save,load,trade,portfolio}                           (backend/profile/main.py)
+The handlers are mounted once, at /api/profile, by backend/profile/main.py.
 
 Every route requires a bearer token (see backend/auth). The acting user is the
 token's subject; a client-supplied ``user_id`` is ignored when it matches and
@@ -50,7 +47,6 @@ RISK_PERIODS = ("6mo", "1y", "2y", "5y")
 
 
 shared_router = APIRouter(tags=["Investor Profile"], route_class=StrictJSONRoute)
-router = APIRouter(prefix="/api/investor-profile", tags=["Investor Profile"])
 
 
 # ---------------------------------------------------------------------------
@@ -236,6 +232,32 @@ def _live_price(symbol: str) -> Optional[float]:
     except Exception:
         logger.warning("Price lookup failed for %s", symbol, exc_info=True)
         return None
+
+
+# Provider price source -> holding ``price_status``. "live" is reserved for a genuine current quote.
+_PRICE_STATUS_BY_SOURCE = {
+    "live": "live",
+    "previous_close": "previous_close",
+    "last_close_5d": "stale",
+}
+
+
+def _price_quote(symbol: str) -> Tuple[Optional[float], str, Optional[str]]:
+    """(price, price_status, as_of) for valuation; (None, "unavailable", None) when no usable price.
+
+    ``as_of`` is the quote/bar time when the provider reports one, else None.
+    """
+    try:
+        quote = market_service.get_price_quote(symbol)
+    except Exception:
+        logger.warning("Price lookup failed for %s", symbol, exc_info=True)
+        return None, "unavailable", None
+    price = _valid_price(quote.get("price")) if isinstance(quote, dict) else None
+    if price is None:
+        return None, "unavailable", None
+    status = _PRICE_STATUS_BY_SOURCE.get(quote.get("source"), "stale")  # unknown source: not "live"
+    as_of = quote.get("as_of")
+    return price, status, as_of if isinstance(as_of, str) else None
 
 
 def _apply_trade(
@@ -439,9 +461,17 @@ def get_portfolio(user_id: Optional[str] = None, user: str = Depends(require_use
     never substituted for a missing price - and portfolio totals are null in that case.
 
     ``valued_at`` (UTC ISO-8601) is when the prices were fetched, i.e. the as-of time of the
-    whole valuation. Per-price timestamps are not provided: the price helper
-    (``market_service.get_current_price``) returns a bare number with no quote time, so none is
-    reported per holding.
+    whole valuation.
+
+    Each holding's ``price_status`` says where its price came from
+    (``market_service.get_price_quote`` -> ``safe_yfinance.safe_get_price_quote``):
+    ``"live"`` - the provider's current quote; ``"previous_close"`` - the provider only had a
+    previous close; ``"stale"`` - the last close of the 5-day history; ``"unavailable"`` - no
+    usable price. ``price_as_of`` (UTC ISO-8601 or null) is that price's own timestamp when the
+    provider reports one (quote time for "live", bar date for "stale"; null for
+    "previous_close"/"unavailable"). "live" means the provider's current-quote field, which outside
+    market hours is the last traded price. Totals are computed from every available price,
+    whatever its status, so a ``previous_close``/``stale`` row still counts toward them.
     """
     _check_identity(user_id, user)
     try:
@@ -464,7 +494,7 @@ def get_portfolio(user_id: Optional[str] = None, user: str = Depends(require_use
         invested = data["total_invested"]
         total_invested += invested
 
-        price = _live_price(symbol)
+        price, price_status, price_as_of = _price_quote(symbol)
         if price is None:
             unpriced.append(symbol)
             holdings.append({
@@ -477,6 +507,7 @@ def get_portfolio(user_id: Optional[str] = None, user: str = Depends(require_use
                 "pl": None,
                 "pl_pct": None,
                 "price_status": "unavailable",
+                "price_as_of": None,
             })
             continue
 
@@ -492,7 +523,8 @@ def get_portfolio(user_id: Optional[str] = None, user: str = Depends(require_use
             "current_value": current_val,
             "pl": pl,
             "pl_pct": (pl / invested * 100) if invested > 0 else 0,
-            "price_status": "live",
+            "price_status": price_status,
+            "price_as_of": price_as_of,
         })
 
     valued_at = _now_iso()  # prices were fetched in the loop above (also set when none were available)
@@ -584,6 +616,3 @@ def get_portfolio_risk(
         raise HTTPException(status_code=500, detail="Risk computation failed")
     valued_at = _now_iso()
     return {**result, "period": period, "as_of": valued_at, "valued_at": valued_at}
-
-
-router.include_router(shared_router)

@@ -371,7 +371,158 @@ def test_limiter_is_thread_safe():
     assert len(allowed) == 20
 
 
-async def test_successful_response_shape_unchanged(limited, clock):
+async def test_successful_response_includes_identity_recovery(limited, clock):
     async with make_client() as c:
         body = (await c.post(URL)).json()
-    assert set(body) == {"access_token", "token_type", "user_id", "expires_at"}
+    assert set(body) == {"access_token", "token_type", "user_id", "expires_at", "refresh_token"}
+
+
+# --- POST /api/auth/refresh has its own limiter ------------------------------------------------
+
+REFRESH = "/api/auth/refresh"
+REFRESH_ENV = ("AUTH_REFRESH_RATE_LIMIT", "AUTH_REFRESH_RATE_WINDOW_SECONDS", "AUTH_REFRESH_GLOBAL_LIMIT")
+
+
+@pytest.fixture
+def refresh_limited(monkeypatch, limited):
+    monkeypatch.setenv("AUTH_REFRESH_RATE_LIMIT", "120")
+    monkeypatch.setenv("AUTH_REFRESH_RATE_WINDOW_SECONDS", "3600")
+    monkeypatch.setenv("AUTH_REFRESH_GLOBAL_LIMIT", "20000")
+
+
+async def _guest(c):
+    return (await c.post(URL)).json()
+
+
+async def test_refresh_does_not_consume_guest_quota(refresh_limited, clock):
+    async with make_client() as c:
+        creds = await _guest(c)
+        for _ in range(60):
+            r = await c.post(REFRESH, json={"refresh_token": creds["refresh_token"]})
+            assert r.status_code == 200
+        # 19 more guests still allowed: only 1 guest slot was used above
+        codes = [(await c.post(URL)).status_code for _ in range(20)]
+    assert codes == [200] * 19 + [429]
+
+
+async def test_guest_does_not_consume_refresh_quota(monkeypatch, refresh_limited, clock):
+    monkeypatch.setenv("AUTH_REFRESH_RATE_LIMIT", "3")
+    async with make_client() as c:
+        creds = await _guest(c)
+        for _ in range(19):
+            assert (await c.post(URL)).status_code == 200
+        assert (await c.post(URL)).status_code == 429  # guest bucket exhausted
+        codes = [
+            (await c.post(REFRESH, json={"refresh_token": creds["refresh_token"]})).status_code
+            for _ in range(4)
+        ]
+    assert codes == [200, 200, 200, 429]
+
+
+async def test_exhausted_guest_global_ceiling_does_not_block_refresh(monkeypatch, refresh_limited, clock):
+    async with make_client("198.51.100.1") as existing:
+        creds = await _guest(existing)
+    monkeypatch.setenv("AUTH_GUEST_GLOBAL_LIMIT", "3")
+    for i in range(2):
+        async with make_client(f"198.51.100.{10 + i}") as c:
+            assert (await c.post(URL)).status_code == 200
+    async with make_client("198.51.100.50") as c:
+        assert (await c.post(URL)).status_code == 429  # new guests are blocked...
+        r = await c.post(REFRESH, json={"refresh_token": creds["refresh_token"]})
+    assert r.status_code == 200  # ...but an existing holder can still renew
+
+
+async def test_refresh_limit_returns_429_with_retry_after(monkeypatch, refresh_limited, clock):
+    monkeypatch.setenv("AUTH_REFRESH_RATE_LIMIT", "5")
+    async with make_client() as c:
+        creds = await _guest(c)
+        body = {"refresh_token": creds["refresh_token"]}
+        for _ in range(5):
+            assert (await c.post(REFRESH, json=body)).status_code == 200
+        blocked = await c.post(REFRESH, json=body)
+        assert blocked.status_code == 429
+        assert blocked.json() == {"detail": "Too many requests. Please try again later."}
+        assert int(blocked.headers["Retry-After"]) == 3600
+        clock.advance(3600)
+        assert (await c.post(REFRESH, json=body)).status_code == 200
+
+
+async def test_invalid_refresh_attempts_are_counted_on_refresh_bucket_only(monkeypatch, refresh_limited, clock):
+    monkeypatch.setenv("AUTH_REFRESH_RATE_LIMIT", "4")
+    async with make_client() as c:
+        codes = [(await c.post(REFRESH, json={"refresh_token": "junk"})).status_code for _ in range(5)]
+        assert codes == [401] * 4 + [429]  # spamming bad tokens is not free
+        # /guest quota untouched
+        assert [(await c.post(URL)).status_code for _ in range(20)] == [200] * 20
+
+
+async def test_refresh_global_ceiling_and_per_client_independence(monkeypatch, refresh_limited, clock):
+    monkeypatch.setenv("AUTH_REFRESH_GLOBAL_LIMIT", "3")
+    async with make_client("198.51.100.1") as a:
+        creds = await _guest(a)
+        body = {"refresh_token": creds["refresh_token"]}
+        for _ in range(3):
+            assert (await a.post(REFRESH, json=body)).status_code == 200
+    async with make_client("198.51.100.2") as b:
+        resp = await b.post(REFRESH, json=body)
+    assert resp.status_code == 429 and int(resp.headers["Retry-After"]) >= 1
+
+
+async def test_refresh_uses_same_proxy_aware_client_key(monkeypatch, refresh_limited, clock):
+    monkeypatch.setenv("AUTH_TRUST_PROXY", "1")
+    monkeypatch.setenv("AUTH_REFRESH_RATE_LIMIT", "3")
+    body = {"refresh_token": "junk"}
+    async with make_client("10.9.9.9") as proxy:
+        for i in range(3):
+            # rotating spoofed leading entries must not buy fresh quota
+            hdr = {"X-Forwarded-For": f"10.0.0.{i}, 198.51.100.1"}
+            assert (await proxy.post(REFRESH, json=body, headers=hdr)).status_code == 401
+        assert (await proxy.post(REFRESH, json=body, headers={"X-Forwarded-For": "10.0.1.1, 198.51.100.1"})).status_code == 429
+        assert (await proxy.post(REFRESH, json=body, headers={"X-Forwarded-For": "198.51.100.2"})).status_code == 401
+
+
+async def test_refresh_config_is_read_at_request_time(monkeypatch, refresh_limited, clock):
+    body = {"refresh_token": "junk"}
+    async with make_client() as c:
+        monkeypatch.setenv("AUTH_REFRESH_RATE_LIMIT", "2")
+        assert [(await c.post(REFRESH, json=body)).status_code for _ in range(3)] == [401, 401, 429]
+        monkeypatch.setenv("AUTH_REFRESH_RATE_LIMIT", "3")
+        assert (await c.post(REFRESH, json=body)).status_code == 401
+
+
+async def test_refresh_zero_disables_both(monkeypatch, clock):
+    monkeypatch.setenv("AUTH_REFRESH_RATE_LIMIT", "0")
+    monkeypatch.setenv("AUTH_REFRESH_GLOBAL_LIMIT", "0")
+    async with make_client() as c:
+        for _ in range(150):
+            assert (await c.post(REFRESH, json={"refresh_token": "junk"})).status_code == 401
+
+
+async def test_refresh_defaults_are_on_without_env(monkeypatch, clock):
+    for name in REFRESH_ENV + ("AUTH_GUEST_RATE_LIMIT", "AUTH_GUEST_RATE_WINDOW_SECONDS",
+                               "AUTH_GUEST_GLOBAL_LIMIT", "AUTH_TRUST_PROXY"):
+        monkeypatch.delenv(name, raising=False)
+    assert rate_limit.refresh_rate_limit_config() == (120, 3600, 20000)
+    assert rate_limit.guest_rate_limit_config() == (20, 3600, 2000)  # /guest defaults unchanged
+    async with make_client() as c:
+        codes = [(await c.post(REFRESH, json={"refresh_token": "junk"})).status_code for _ in range(121)]
+    assert codes[:120] == [401] * 120 and codes[120] == 429
+
+
+@pytest.mark.parametrize("value", ["abc", "-5", "", "1.5"])
+def test_refresh_invalid_config_falls_back_to_defaults(monkeypatch, value):
+    for name in REFRESH_ENV:
+        monkeypatch.setenv(name, value)
+    assert rate_limit.refresh_rate_limit_config() == (120, 3600, 20000)
+
+
+def test_reset_clears_both_limiters_and_applies_clock():
+    clk = FakeClock()
+    reset_guest_limiter(clock=clk)
+    rate_limit.get_guest_limiter().check("a", 5, 3600, 10)
+    rate_limit.get_refresh_limiter().check("a", 5, 3600, 10)
+    assert rate_limit.get_refresh_limiter()._clock is clk
+    reset_guest_limiter()
+    assert rate_limit.get_guest_limiter().tracked_keys() == 0
+    assert rate_limit.get_refresh_limiter().tracked_keys() == 0
+    assert rate_limit.get_refresh_limiter() is not rate_limit.get_guest_limiter()

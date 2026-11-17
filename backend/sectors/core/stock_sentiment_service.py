@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
 from concurrent.futures import ThreadPoolExecutor
 import json
+import math
 import re
 
 import yfinance as yf
@@ -50,6 +51,26 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 # Gemini configuration removed - deprecated
 # if GEMINI_AVAILABLE and GEMINI_API_KEY:
 #     genai.configure(api_key=GEMINI_API_KEY)
+
+
+def _finite_or_none(value: Any) -> Optional[float]:
+    """Return ``value`` as a finite float, or None (bools, NaN/inf and junk -> None)."""
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return out if math.isfinite(out) else None
+
+
+def _analysis_status(source: Any, status: Any = None) -> str:
+    """Label the analysis by the path that actually produced it, never by which fields are set."""
+    if source == "heuristic":
+        return "heuristic_no_signal" if status == "heuristic_no_signal" else "heuristic"
+    if isinstance(source, str) and source and source != "unknown":
+        return "model"
+    return "unavailable"
 
 
 # =====================================================
@@ -129,9 +150,12 @@ def fetch_stock_data(symbol: str) -> Dict:
     latest = hist.iloc[-1]
     oldest = hist.iloc[0]
 
+    # With a single observation (or a zero base) there is no genuine change to report.
     price_change_pct = (
-        (latest["Close"] - oldest["Close"]) / oldest["Close"]
-    ) * 100 if oldest["Close"] else 0
+        ((latest["Close"] - oldest["Close"]) / oldest["Close"]) * 100
+        if len(hist) >= 2 and oldest["Close"]
+        else None
+    )
 
     # Realized volatility (annualized) from daily returns over ~30 sessions.
     volatility_30d = None
@@ -145,12 +169,13 @@ def fetch_stock_data(symbol: str) -> Dict:
         volatility_30d = None
 
     # Get 1-day change
-    day_change = 0
-    day_change_pct = 0
+    day_change = None
+    day_change_pct = None
     if len(hist) >= 2:
         prev_close = hist.iloc[-2]["Close"]
-        day_change = latest["Close"] - prev_close
-        day_change_pct = (day_change / prev_close) * 100 if prev_close else 0
+        if prev_close:
+            day_change = latest["Close"] - prev_close
+            day_change_pct = (day_change / prev_close) * 100
 
     ex_dividend_raw = info.get("exDividendDate")
     ex_dividend_date = None
@@ -273,9 +298,9 @@ def fetch_stock_data(symbol: str) -> Dict:
         "currency": currency_sym,
         "current_price": round(latest["Close"], 2),
         "previous_close": round(hist.iloc[-2]["Close"], 2) if len(hist) >= 2 else None,
-        "day_change": round(day_change, 2),
-        "day_change_pct": round(day_change_pct, 2),
-        "price_change_6m_pct": round(price_change_pct, 2),
+        "day_change": round(day_change, 2) if day_change is not None else None,
+        "day_change_pct": round(day_change_pct, 2) if day_change_pct is not None else None,
+        "price_change_6m_pct": round(price_change_pct, 2) if price_change_pct is not None else None,
         "volume": int(latest["Volume"]),
         "avg_volume": info.get("averageVolume"),
         "market_cap": info.get("marketCap"),
@@ -329,7 +354,7 @@ def fetch_stock_data(symbol: str) -> Dict:
         "target_high_price": info.get("targetHighPrice"),
         "target_low_price": info.get("targetLowPrice"),
         "target_median_price": info.get("targetMedianPrice"),
-        "recommendation_key": info.get("recommendationKey", "").upper(),
+        "recommendation_key": (info.get("recommendationKey") or "").upper(),
         "analyst_count": info.get("numberOfAnalystOpinions"),
         # Quarterly snapshot
         **quarterly,
@@ -512,41 +537,60 @@ Respond in this exact JSON format:
 
 def generate_fallback_analysis(stock_data: Dict, reddit_summary: Dict) -> Dict:
     """
-    Generate analysis without AI API (rule-based)
+    Generate analysis without AI API (rule-based).
+
+    Everything returned here is derived from the inputs. The only price target is a real
+    analyst consensus from ``stock_data["target_mean_price"]``; otherwise it is None. No
+    generic risks/catalysts are invented.
     """
-    sentiment_score = 0.5
-    
-    # Factor in price momentum
-    change_6m = stock_data.get("price_change_6m_pct", 0)
-    if change_6m > 20:
-        sentiment_score += 0.2
-    elif change_6m > 10:
-        sentiment_score += 0.1
-    elif change_6m < -20:
-        sentiment_score -= 0.2
-    elif change_6m < -10:
-        sentiment_score -= 0.1
-    
+    sentiment_score = 0.5  # neutral baseline; only reported if at least one rule fires
+    rules_fired = 0
+
+    # Factor in price momentum (only when a genuine 6-month change exists)
+    change_6m = _finite_or_none(stock_data.get("price_change_6m_pct"))
+    if change_6m is not None:
+        if change_6m > 20:
+            sentiment_score += 0.2
+            rules_fired += 1
+        elif change_6m > 10:
+            sentiment_score += 0.1
+            rules_fired += 1
+        elif change_6m < -20:
+            sentiment_score -= 0.2
+            rules_fired += 1
+        elif change_6m < -10:
+            sentiment_score -= 0.1
+            rules_fired += 1
+
     # Factor in analyst recommendation
-    rec = stock_data.get("recommendation_key", "").lower()
+    rec = (stock_data.get("recommendation_key") or "").lower()
     if rec in ("buy", "strong_buy", "outperform"):
         sentiment_score += 0.15
+        rules_fired += 1
     elif rec in ("sell", "underperform"):
         sentiment_score -= 0.15
-    
+        rules_fired += 1
+
     # Factor in Reddit sentiment (if available)
     if reddit_summary.get("post_count", 0) > 10:
         avg_score = reddit_summary.get("avg_score", 0)
         if avg_score > 100:
             sentiment_score += 0.1
+            rules_fired += 1
         elif avg_score < 10:
             sentiment_score -= 0.05
-    
+            rules_fired += 1
+
     # Clamp to 0-1
     sentiment_score = max(0, min(1, sentiment_score))
-    
+
     # Determine outlook
-    if sentiment_score >= 0.6:
+    if rules_fired == 0:
+        # No rule had any data to act on: there is no result, not a "neutral" one.
+        outlook = None
+        recommendation = None
+        sentiment_score = None
+    elif sentiment_score >= 0.6:
         outlook = "Bullish"
         recommendation = "BUY"
     elif sentiment_score >= 0.4:
@@ -555,44 +599,42 @@ def generate_fallback_analysis(stock_data: Dict, reddit_summary: Dict) -> Dict:
     else:
         outlook = "Bearish"
         recommendation = "SELL"
-    
-    # Calculate target price
-    current_price = stock_data.get("current_price", 0)
-    analyst_target = stock_data.get("target_mean_price")
-    if analyst_target:
-        target_price = round(analyst_target, 2)
-    else:
-        # Estimate based on sentiment
-        multiplier = 1 + (sentiment_score - 0.5) * 0.2
-        target_price = round(current_price * multiplier, 2)
-    
+
+    # Target price: only a real analyst consensus; never extrapolated from sentiment.
+    analyst_target = _finite_or_none(stock_data.get("target_mean_price"))
+    target_price = round(analyst_target, 2) if analyst_target and analyst_target > 0 else None
+
     # Generate summary
     company = stock_data.get("company_name", stock_data.get("symbol"))
-    sector = stock_data.get("sector", "N/A")
-    summary = f"{company} in the {sector} sector shows {outlook.lower()} signals. "
-    summary += f"6-month price change of {change_6m:.1f}%. "
+    sector = stock_data.get("sector") or "N/A"
+    if outlook is None:
+        summary = f"{company} in the {sector} sector: no rule-based signal could be derived from the available data."
+    else:
+        summary = f"{company} in the {sector} sector shows {outlook.lower()} signals."
+    if change_6m is not None:
+        summary += f" 6-month price change of {change_6m:.1f}%."
     if reddit_summary.get("post_count", 0) > 0:
-        summary += f"Reddit discussion activity: {reddit_summary['post_count']} posts."
-    
-    # Generate risks and catalysts based on sector
-    risks = ["Market volatility", "Sector headwinds", "Macroeconomic uncertainty"]
-    catalysts = ["Strong fundamentals", "Sector tailwinds", "Growth potential"]
-    
-    if change_6m < 0:
-        risks.insert(0, "Negative price momentum")
-    if change_6m > 15:
-        catalysts.insert(0, "Strong price momentum")
-    
+        summary += f" Reddit discussion activity: {reddit_summary['post_count']} posts."
+
+    # Only data-derived notes; no canned "market volatility"/"growth potential" filler.
+    risks: List[str] = []
+    catalysts: List[str] = []
+    if change_6m is not None and change_6m < 0:
+        risks.append("Negative price momentum")
+    if change_6m is not None and change_6m > 15:
+        catalysts.append("Strong price momentum")
+
     return {
         "source": "heuristic",
         "outlook": outlook,
-        "sentiment_score": round(sentiment_score, 2),
+        "status": "heuristic_no_signal" if rules_fired == 0 else "heuristic",
+        "sentiment_score": round(sentiment_score, 2) if sentiment_score is not None else None,
         "recommendation": recommendation,
         "target_price": target_price,
         "summary": summary,
-        "risks": risks[:3],
-        "catalysts": catalysts[:3],
-        "confidence": 0.65
+        "risks": risks,
+        "catalysts": catalysts,
+        "confidence": None
     }
 
 
@@ -661,18 +703,19 @@ def analyze_stock_sentiment(symbol: str) -> Dict:
         "price": stock_data.get("current_price"),
         "day_change": stock_data.get("day_change"),
         "day_change_pct": stock_data.get("day_change_pct"),
-        "recommendation": ai_analysis.get("recommendation", "HOLD"),
-        "targetPrice": ai_analysis.get("target_price"),
-        "sentiment": ai_analysis.get("sentiment_score", 0.5),
-        "outlook": ai_analysis.get("outlook", "Neutral"),
-        "summary": ai_analysis.get("summary", ""),
+        "recommendation": ai_analysis.get("recommendation") or None,
+        "targetPrice": _finite_or_none(ai_analysis.get("target_price")),
+        "sentiment": _finite_or_none(ai_analysis.get("sentiment_score")),
+        "outlook": ai_analysis.get("outlook") or None,
+        "summary": ai_analysis.get("summary") or "",
         "metrics": metrics,
         "risks": ai_analysis.get("risks", []),
         "catalysts": ai_analysis.get("catalysts", []),
-        "confidence": ai_analysis.get("confidence", 0.5),
+        "confidence": _finite_or_none(ai_analysis.get("confidence")),
         "reddit_posts_count": reddit_summary.get("post_count", 0),
         "reddit_top_posts": reddit_summary.get("top_posts", []),
         "analysis_source": ai_analysis.get("source", "unknown"),
+        "analysis_status": _analysis_status(ai_analysis.get("source"), ai_analysis.get("status")),
         "market_data": stock_data,
         "news": news,
         "supply_chain": supply_chain,

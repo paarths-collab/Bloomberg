@@ -1,4 +1,5 @@
 import math
+import re
 import matplotlib
 from fastapi import APIRouter, HTTPException, Body, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, Response
@@ -20,6 +21,9 @@ from .service import (
     validate_range,
     BacktestInputError,
     MarketDataError,
+    resolve_report_file,
+    safe_filename_symbol,
+    sweep_reports,
     DEFAULT_FILL_TIMING,
     DEFAULT_INITIAL_CAPITAL,
     DEFAULT_MONTE_CARLO_SEED,
@@ -71,6 +75,31 @@ def _normalize_strategy_name(strategy: Any) -> str:
     if strategy is not None and not isinstance(strategy, str):
         raise HTTPException(status_code=400, detail="strategy must be a string")
     return (strategy or "").strip().lower()
+
+
+MAX_RUN_STRATEGIES = 5
+MAX_HEATMAP_CELLS = 100
+MAX_REPORT_STRATEGIES = 20
+
+
+def _required_text(value: Any, name: str) -> str:
+    """A non-empty string (stripped), else 400."""
+    if not isinstance(value, str) or not value.strip():
+        raise HTTPException(status_code=400, detail=f"{name} must be a non-empty string")
+    return value.strip()
+
+
+def _optional_text(value: Any, name: str, default: str) -> str:
+    """A string (or the default when absent/null), else 400."""
+    if value is None:
+        return default
+    if not isinstance(value, str):
+        raise HTTPException(status_code=400, detail=f"{name} must be a string")
+    return value
+
+
+def _is_real_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
 def _validated_strategy_params(strategy: str, params: Dict[str, Any]) -> Dict[str, Any]:
@@ -304,6 +333,7 @@ def interpret_backtest(payload: Dict[str, Any] = Body(...)):
     llm = GroqAgent()
     analysis = llm.generate_response(prompt=prompt, model="llama-3.3-70b-versatile", temperature=0.3)
     if not analysis or analysis.lower().startswith("error"):
+        logger.warning("Backtest interpretation provider error: %s", analysis)
         raise HTTPException(status_code=502, detail="AI interpretation failed. Check GROQ_API_KEY and try again.")
 
     return {"analysis": analysis}
@@ -322,6 +352,20 @@ def interpret_backtest_image(payload: Dict[str, Any] = Body(...)):
         raise HTTPException(status_code=400, detail="Symbol is required")
     if not image_data_url:
         raise HTTPException(status_code=400, detail="imageDataUrl is required")
+    symbol = _required_text(symbol, "symbol")
+    market = _optional_text(market, "market", "US")
+    if selected_strategies is None:
+        selected_strategies = []
+    if not isinstance(selected_strategies, list) or not all(isinstance(x, str) for x in selected_strategies):
+        raise HTTPException(status_code=400, detail="selectedStrategies must be a list of strings")
+    if len(selected_strategies) > 50:
+        raise HTTPException(status_code=400, detail="selectedStrategies has too many entries")
+    if context is None:
+        context = {}
+    if not isinstance(context, dict):
+        raise HTTPException(status_code=400, detail="context must be an object")
+    if not isinstance(image_data_url, str):
+        raise HTTPException(status_code=400, detail="imageDataUrl must be a string")
 
     prompt = (
         "You are a professional quantitative research analyst reviewing a backtest dashboard screenshot. "
@@ -440,9 +484,10 @@ def interpret_backtest_image(payload: Dict[str, Any] = Body(...)):
         last_error = analysis or "Unknown model failure"
 
     if not analysis or analysis.lower().startswith("error"):
+        logger.warning("Backtest image interpretation failed (last model %s): %s", used_model, last_error)
         raise HTTPException(
             status_code=502,
-            detail=f"AI image interpretation failed. Last model tried: {used_model}. Error: {last_error}",
+            detail="AI image interpretation failed. Check GROQ_API_KEY and try again.",
         )
 
     return {"analysis": analysis, "model": used_model}
@@ -566,6 +611,9 @@ def _sanitize_floats(obj):
         except Exception:
             return str(obj)
 
+    if isinstance(obj, bool):  # before int: bool is an int subclass and must not become 1/0
+        return bool(obj)
+
     if isinstance(obj, float):
         if math.isnan(obj) or math.isinf(obj):
             return None
@@ -573,9 +621,6 @@ def _sanitize_floats(obj):
 
     if isinstance(obj, int):
         return int(obj)
-
-    if isinstance(obj, bool):
-        return bool(obj)
 
     return obj
 
@@ -616,18 +661,37 @@ def run_simulation(
         symbol = payload.get("symbol")
         if not symbol:
             raise HTTPException(status_code=400, detail="Symbol is required")
+        symbol = _required_text(symbol, "symbol")
         
         range_period = payload.get("range", "1y")
         interval = payload.get("interval", "1d")
-        market = payload.get("market", "us")
+        market = _optional_text(payload.get("market", "us"), "market", "us")
         start_date = payload.get("start")
         end_date = payload.get("end")
+        for _name, _value in (("start", start_date), ("end", end_date)):
+            if _value is not None and not isinstance(_value, str):
+                raise HTTPException(status_code=400, detail=f"{_name} must be a string")
         run_options = _resolve_run_options(payload)
         
-        # Check for multiple strategies
+        # Check for multiple strategies (de-duplicated by normalised name, in request order)
         strategies = payload.get("strategies")
+        if strategies is not None and not isinstance(strategies, list):
+            raise HTTPException(status_code=400, detail="strategies must be a list")
+        if strategies:
+            unique: Dict[str, Any] = {}
+            for raw_strategy in strategies:
+                normalized_strategy = _normalize_strategy_name(raw_strategy)
+                if not normalized_strategy:
+                    raise HTTPException(status_code=400, detail="strategy names must be non-empty strings")
+                unique.setdefault(normalized_strategy, raw_strategy)
+            if len(unique) > MAX_RUN_STRATEGIES:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"At most {MAX_RUN_STRATEGIES} distinct strategies can be run at once",
+                )
+            strategies = list(unique.values())
         
-        if strategies and isinstance(strategies, list) and len(strategies) > 1:
+        if strategies and len(strategies) > 1:
             # Multiple strategies mode
             raw_params_dict = payload.get("params", {})
             normalized_strategies: List[str] = []
@@ -747,6 +811,8 @@ def run_heatmap(payload: Dict[str, Any] = Body(...)):
         strategy = payload.get("strategy")
         if not symbol or not strategy:
             raise HTTPException(status_code=400, detail="Symbol and strategy are required")
+        symbol = _required_text(symbol, "symbol")
+        strategy = _normalize_strategy_name(strategy)
 
         range_period = payload.get("range", "1y")
         run_options = _resolve_run_options(payload)
@@ -804,6 +870,22 @@ def run_heatmap(payload: Dict[str, Any] = Body(...)):
         param_y = payload.get("param_y", config["param_y"])
         x_values = payload.get("x_values", config["x_values"])
         y_values = payload.get("y_values", config["y_values"])
+        if not isinstance(param_x, str) or not isinstance(param_y, str) or not param_x or not param_y:
+            raise HTTPException(status_code=400, detail="param_x and param_y must be non-empty strings")
+        for axis, axis_values in (("x_values", x_values), ("y_values", y_values)):
+            if not isinstance(axis_values, list) or not axis_values:
+                raise HTTPException(status_code=400, detail=f"{axis} must be a non-empty list of numbers")
+        if len(x_values) * len(y_values) > MAX_HEATMAP_CELLS:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Heatmap grid too large: {len(x_values)} x {len(y_values)} cells; "
+                    f"at most {MAX_HEATMAP_CELLS} cells are allowed"
+                ),
+            )
+        for axis, axis_values in (("x_values", x_values), ("y_values", y_values)):
+            if not all(_is_real_number(v) for v in axis_values):
+                raise HTTPException(status_code=400, detail=f"{axis} must contain only finite numbers")
 
         _validated_range(range_period)
         try:
@@ -823,12 +905,15 @@ def run_heatmap(payload: Dict[str, Any] = Body(...)):
                 params = {param_x: x, param_y: y}
 
                 if strategy in ["ema_crossover", "macd"]:
-                    if params.get("fast") >= params.get("slow"):
+                    fast, slow = params.get("fast"), params.get("slow")
+                    if fast is not None and slow is not None and fast >= slow:
                         row.append(None)
                         continue
-                if strategy == "rsi_reversal" and params.get("lower") >= params.get("upper"):
-                    row.append(None)
-                    continue
+                if strategy == "rsi_reversal":
+                    lower, upper = params.get("lower"), params.get("upper")
+                    if lower is not None and upper is not None and lower >= upper:
+                        row.append(None)
+                        continue
 
                 try:
                     res_df = run_backtest_on_df(
@@ -858,6 +943,59 @@ def run_heatmap(payload: Dict[str, Any] = Body(...)):
         raise _internal_error("generating the heatmap")
 
 
+REPORT_RESULT_METRIC_KEYS = (
+    "totalReturn", "maxDrawdown", "sharpeRatio", "winRate", "totalTrades", "finalEquity", "finalValue",
+)
+
+
+def _clean_numbers(container: Any, keys, where: str) -> Dict[str, Any]:
+    """Copy of a metrics-like dict where the listed keys are finite numbers or null. A missing or null
+    value is kept as is (the report shows it as N/A / an empty cell, never as 0); anything else that is
+    not a finite number is a 400."""
+    if not isinstance(container, dict):
+        raise HTTPException(status_code=400, detail=f"{where} must be an object")
+    cleaned = dict(container)
+    for key in keys:
+        if key not in cleaned:
+            continue
+        value = cleaned[key]
+        if value is not None and not _is_real_number(value):
+            raise HTTPException(status_code=400, detail=f"{where}.{key} must be a finite number")
+    return cleaned
+
+
+def _validated_report_results(results: Any) -> Dict[str, Any]:
+    """Validate (and shallow-clean) the /run results sent back for a report. Raises HTTPException(400)."""
+    if not isinstance(results, dict):
+        raise HTTPException(status_code=400, detail="results must be an object")
+    cleaned = _clean_numbers(results, ("initialCapital",), "results")
+    if results.get("mode") == "multi_strategy":
+        strategies = results.get("strategies", {})
+        if not isinstance(strategies, dict):
+            raise HTTPException(status_code=400, detail="results.strategies must be an object")
+        cleaned_strategies: Dict[str, Any] = {}
+        for strat_id, strat_data in strategies.items():
+            if not isinstance(strat_data, dict):
+                raise HTTPException(status_code=400, detail="results.strategies entries must be objects")
+            entry = dict(strat_data)
+            if entry.get("metrics"):
+                entry["metrics"] = _clean_numbers(entry["metrics"], REPORT_RESULT_METRIC_KEYS, "results.strategies.metrics")
+            cleaned_strategies[strat_id] = entry
+        cleaned["strategies"] = cleaned_strategies
+        ranking = results.get("ranking", [])
+        if not isinstance(ranking, list):
+            raise HTTPException(status_code=400, detail="results.ranking must be a list")
+        cleaned_ranking = []
+        for rank in ranking:
+            if not isinstance(rank, dict) or not isinstance(rank.get("strategy"), str) or not _is_real_number(rank.get("return")):
+                raise HTTPException(status_code=400, detail="results.ranking entries need a strategy and a numeric return")
+            cleaned_ranking.append(rank)
+        cleaned["ranking"] = cleaned_ranking
+    else:
+        cleaned["metrics"] = _clean_numbers(results.get("metrics", {}), REPORT_RESULT_METRIC_KEYS, "results.metrics")
+    return cleaned
+
+
 @router.post("/report")
 def generate_report(payload: Dict[str, Any] = Body(...)):
     """
@@ -871,12 +1009,29 @@ def generate_report(payload: Dict[str, Any] = Body(...)):
         "format": "html" | "csv"
     }
     """
+    symbol = payload.get("symbol", "UNKNOWN")
+    if symbol is None:
+        symbol = "UNKNOWN"
+    if not isinstance(symbol, str):
+        raise HTTPException(status_code=400, detail="symbol must be a string")
+    strategies = payload.get("strategies", [])
+    if strategies is None:
+        strategies = []
+    if (
+        not isinstance(strategies, list)
+        or len(strategies) > MAX_REPORT_STRATEGIES
+        or not all(isinstance(x, str) for x in strategies)
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=f"strategies must be a list of at most {MAX_REPORT_STRATEGIES} strings",
+        )
+    results = _validated_report_results(payload.get("results", {}))
+    report_format = payload.get("format", "html")
+    if not isinstance(report_format, str) or report_format.strip().lower() not in ("html", "csv"):
+        raise HTTPException(status_code=400, detail="unsupported format; use 'html' or 'csv'")
+
     try:
-        symbol = payload.get("symbol", "UNKNOWN")
-        strategies = payload.get("strategies", [])
-        results = payload.get("results", {})
-        report_format = payload.get("format", "html")
-        
         report = generate_backtest_report(
             symbol=symbol,
             strategies=strategies,
@@ -891,6 +1046,8 @@ def generate_report(payload: Dict[str, Any] = Body(...)):
         
     except HTTPException:
         raise
+    except BacktestInputError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception:
         raise _internal_error("generating the report")
 
@@ -900,9 +1057,8 @@ def download_report(filename: str):
     """
     Downloads a generated backtest report file.
     """
-    file_path = REPORTS_DIR / filename
-
-    if not file_path.exists():
+    file_path = resolve_report_file(REPORTS_DIR, filename)
+    if file_path is None:
         raise HTTPException(status_code=404, detail="Report not found")
     
     if filename.endswith(".html"):
@@ -919,7 +1075,9 @@ def download_report(filename: str):
         path=str(file_path),
         filename=filename,
         media_type=media_type,
-        headers={"Content-Disposition": f'{disposition}; filename="{filename}"'}
+        headers={"Content-Disposition": f'{disposition}; filename="{filename}"',
+                 "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; img-src data:",
+                 "X-Content-Type-Options": "nosniff"}
     )
 
 
@@ -941,16 +1099,13 @@ def generate_quantstats_report(payload: Dict[str, Any] = Body(...)):
     strategy_name = payload.get("strategy")
     if not symbol or not strategy_name:
         raise HTTPException(status_code=400, detail="symbol and strategy are required")
+    symbol = _required_text(symbol, "symbol")
 
     range_period = payload.get("range", "1y")
     strategy_name = _normalize_strategy_name(strategy_name)
     params = _extract_single_strategy_params(strategy_name, payload)
     run_options = {k: v for k, v in _resolve_run_options(payload).items() if k != "seed"}
-    benchmark = payload.get("benchmark", "SPY")
-
-    # Heavy imports only after the request has been validated.
-    import quantstats as qs
-    import pandas as pd
+    benchmark = _required_text(payload.get("benchmark") or "SPY", "benchmark")
 
     try:
         # 1. Fetch candles and prepare DataFrame
@@ -962,6 +1117,17 @@ def generate_quantstats_report(payload: Dict[str, Any] = Body(...)):
         if not candles:
             raise HTTPException(status_code=400, detail="No market data found")
 
+        # The benchmark is fetched here (not inside quantstats) so that a provider failure is a clear 502.
+        # A benchmark with no data is not an error: the report is then produced without one.
+        try:
+            benchmark_candles = fetch_candles(benchmark, "1d", range_period)
+        except MarketDataError:
+            raise _market_data_unavailable()
+
+        # Report dependencies are unnecessary for provider-error/no-data responses.
+        import quantstats as qs
+        import pandas as pd
+
         df = prepare_candles_df(candles)
 
         # 2. Run backtest to get strategy returns
@@ -970,7 +1136,7 @@ def generate_quantstats_report(payload: Dict[str, Any] = Body(...)):
         # 3. Extract daily strategy returns as a proper pandas Series
         returns = res_df["strategy_returns"].copy()
         returns.index = pd.to_datetime(res_df["Date"])
-        returns.name = f"{strategy_name} ({symbol})"
+        returns.name = f"{strategy_name} ({_title_symbol(symbol)})"
 
         # Drop NaN/inf values
         returns = returns.replace([np.inf, -np.inf], np.nan).dropna()
@@ -978,19 +1144,32 @@ def generate_quantstats_report(payload: Dict[str, Any] = Body(...)):
         if returns.empty or len(returns) < 5:
             raise HTTPException(status_code=400, detail="Not enough return data to generate report")
 
+        benchmark_returns = None
+        if benchmark_candles:
+            bench_df = prepare_candles_df(benchmark_candles)
+            bench_close = pd.Series(
+                pd.to_numeric(bench_df["Close"], errors="coerce").to_numpy(),
+                index=pd.to_datetime(bench_df["Date"]),
+            )
+            benchmark_returns = bench_close.pct_change().replace([np.inf, -np.inf], np.nan).dropna()
+            benchmark_returns.name = _title_symbol(benchmark)
+            if benchmark_returns.empty:
+                benchmark_returns = None
+
         # 4. Generate QuantStats HTML report
-        safe_symbol = symbol.replace(".", "_")
+        safe_symbol = safe_filename_symbol(symbol)
         timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
         filename = f"quantstats_{safe_symbol}_{strategy_name}_{timestamp}.html"
         filepath = REPORTS_DIR / filename
 
         qs.reports.html(
             returns,
-            benchmark=benchmark,
+            benchmark=benchmark_returns,
             output=str(filepath),
-            title=f"{strategy_name.replace('_', ' ').title()} — {symbol}",
+            title=f"{strategy_name.replace('_', ' ').title()} — {_title_symbol(symbol)}",
             download_filename=filename,
         )
+        sweep_reports(REPORTS_DIR)
 
         return {
             "success": True,
@@ -1002,3 +1181,8 @@ def generate_quantstats_report(payload: Dict[str, Any] = Body(...)):
         raise
     except Exception:
         raise _internal_error("generating the QuantStats report")
+
+
+def _title_symbol(symbol: str) -> str:
+    """Symbol for display in report titles: only characters that are inert in HTML."""
+    return re.sub(r"[^A-Za-z0-9_.^=-]", "_", str(symbol))[:40] or "UNKNOWN"

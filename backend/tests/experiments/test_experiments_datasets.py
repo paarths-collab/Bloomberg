@@ -38,10 +38,11 @@ def test_fixture_shapes():
 def test_hash_changes_when_one_close_changes():
     base = ds.get_fixture("synthetic-gbm-504")
     rows = json.loads(json.dumps(base.rows))
+    metadata = {k: getattr(base, k) for k in ds.IDENTITY_FIELDS}
     rows[100][4] += 0.0001
-    assert ds.rows_hash(rows) != base.content_hash
+    assert ds.snapshot_hash(rows, **metadata) != base.content_hash
     rows[100][4] -= 0.0001
-    assert ds.rows_hash(rows) == base.content_hash  # and it is reversible: the hash depends only on content
+    assert ds.snapshot_hash(rows, **metadata) == base.content_hash  # and it is reversible: the hash depends only on content
 
 
 def test_hash_depends_on_row_order():
@@ -57,7 +58,7 @@ def test_stored_rows_round_trip_to_identical_frame(db):
     db.expire_all()
     stored = json.loads(db.get(type(row), fixture.content_hash).rows_json)
     assert stored == fixture.rows
-    assert ds.rows_hash(stored) == fixture.content_hash
+    assert ds.snapshot_hash(stored, **{k: getattr(fixture, k) for k in ds.IDENTITY_FIELDS}) == fixture.content_hash
     pd.testing.assert_frame_equal(ds.rows_to_df(stored), ds.rows_to_df(fixture.rows))
     direct = pd.DataFrame(ds.FIXTURES["synthetic-gbm-504"]["generator"]())
     assert direct["close"].tolist() == ds.rows_to_df(stored)["Close"].tolist()

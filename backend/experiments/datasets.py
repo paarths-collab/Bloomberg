@@ -2,7 +2,7 @@
 Dataset versions for experiment trials.
 
 A dataset version is an immutable snapshot of OHLCV bars identified by the sha256 of its canonical
-rows. Two sources exist: deterministic synthetic fixtures generated in code (no data files) and
+rows and interpretation/provenance metadata. Two sources exist: deterministic synthetic fixtures generated in code (no data files) and
 provider snapshots fetched through the backtest service's own fetch helpers.
 
 Everything here is pure except `fetch_provider_dataset`, which calls the provider through
@@ -33,6 +33,7 @@ logger = logging.getLogger(__name__)
 
 MAX_BARS = 5000
 COLUMNS = ["date", "open", "high", "low", "close", "volume"]
+IDENTITY_FIELDS = ("source", "symbol", "interval", "timezone", "adjustment", "rights_note")
 SYMBOL_RE = re.compile(r"^[A-Za-z0-9.\-^=]{1,20}$")
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -110,6 +111,12 @@ def rows_hash(rows: List[List[Any]]) -> str:
     return sha256_hex(canonical_json({"schema": COLUMNS, "rows": rows}))
 
 
+def snapshot_hash(rows, **metadata):
+    """Version 2 identity includes provenance and interpretation, not just bars."""
+    return sha256_hex(canonical_json({"version": 2, "schema": COLUMNS, "rows": rows,
+                                     "metadata": metadata}))
+
+
 def rows_to_df(rows: List[List[Any]]) -> pd.DataFrame:
     """Stored rows -> the frame the engine runs on (same path for first run and reproduction)."""
     candles = [dict(zip(COLUMNS, r)) for r in rows]
@@ -161,7 +168,10 @@ def build_dataset(
     timezone: str, adjustment: str, rights_note: str,
 ) -> Dataset:
     rows = canonicalize_rows(candles)
-    return Dataset(rows_hash(rows), rows, source, symbol, interval, timezone, adjustment, rights_note)
+    interval = "1h" if interval == "60m" else interval
+    metadata = dict(source=source, symbol=symbol, interval=interval, timezone=timezone,
+                    adjustment=adjustment, rights_note=rights_note)
+    return Dataset(snapshot_hash(rows, **metadata), rows, **metadata)
 
 
 # ---------------------------------------------------------------------------
@@ -229,7 +239,7 @@ def get_fixture(name: str) -> Dataset:
 def fixture_by_hash(content_hash: str) -> Optional[Dataset]:
     for name in FIXTURES:
         ds = get_fixture(name)
-        if ds.content_hash == content_hash:
+        if content_hash in (ds.content_hash, rows_hash(ds.rows)):
             return ds
     return None
 

@@ -37,8 +37,10 @@ class BatchSentimentRequest(BaseModel):
     symbols: List[str]
 
 
+# These handlers do blocking market-data / LLM I/O and contain no awaits, so they are plain `def`:
+# FastAPI runs them in its threadpool instead of stalling the event loop.
 @router.get("/analyze/{symbol}")
-async def get_sentiment_analysis(
+def get_sentiment_analysis(
     symbol: str,
     market: Optional[str] = Query(None, description="Market: 'india' or 'us'")
 ):
@@ -67,7 +69,7 @@ async def get_sentiment_analysis(
 
 
 @router.post("/analyze")
-async def post_sentiment_analysis(request: SentimentRequest):
+def post_sentiment_analysis(request: SentimentRequest):
     """
     POST endpoint for sentiment analysis
     """
@@ -86,7 +88,7 @@ async def post_sentiment_analysis(request: SentimentRequest):
 
 
 @router.post("/batch")
-async def batch_sentiment_analysis(request: BatchSentimentRequest):
+def batch_sentiment_analysis(request: BatchSentimentRequest):
     """
     Analyze multiple stocks at once (max 10)
     """
@@ -105,7 +107,7 @@ async def batch_sentiment_analysis(request: BatchSentimentRequest):
 
 
 @router.get("/quick/{symbol}")
-async def get_quick_sentiment(
+def get_quick_sentiment(
     symbol: str,
     market: Optional[str] = Query(None, description="Market: 'india' or 'us'")
 ):
@@ -132,6 +134,8 @@ async def get_quick_sentiment(
             "sentiment": result.get("sentiment"),
             "recommendation": result.get("recommendation"),
             "targetPrice": result.get("targetPrice"),
+            "analysis_source": result.get("analysis_source", "unknown"),
+            "analysis_status": result.get("analysis_status", "unavailable"),
         })
     except HTTPException:
         raise

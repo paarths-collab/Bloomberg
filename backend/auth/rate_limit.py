@@ -1,13 +1,21 @@
 """
-In-memory sliding-window rate limiting for guest-token issuance (POST /api/auth/guest).
+In-memory sliding-window rate limiting for POST /api/auth/guest (identity issuance) and
+POST /api/auth/refresh (credential renewal).
 
-The endpoint is unauthenticated, so without a limit anyone can mint unlimited identities and
-thereby sidestep every per-user quota (for example the experiment trial cap).
+Both endpoints are unauthenticated. Without a limit on /guest anyone can mint unlimited identities
+and thereby sidestep every per-user quota (for example the experiment trial cap). Renewal gets its
+OWN limiter instance (separate key space, separate global ceiling, more generous defaults), so a
+busy period of new guests can never block existing users from renewing their credentials and
+renewals never consume guest-issuance quota.
 
 Environment (read at request time, so it can be changed without re-importing):
   AUTH_GUEST_RATE_LIMIT            Max tokens per client key per window (default 20; 0 disables).
   AUTH_GUEST_RATE_WINDOW_SECONDS   Window length in seconds (default 3600).
   AUTH_GUEST_GLOBAL_LIMIT          Max tokens across ALL clients per window (default 2000; 0 disables).
+  AUTH_REFRESH_RATE_LIMIT          Max /refresh calls per client key per window (default 120; 0 disables).
+  AUTH_REFRESH_RATE_WINDOW_SECONDS Window length in seconds for /refresh (default 3600).
+  AUTH_REFRESH_GLOBAL_LIMIT        Max /refresh calls across ALL clients per window (default 20000;
+                                   0 disables).
   AUTH_TRUST_PROXY                 Set to 1 to take the client key from X-Forwarded-For instead of
                                    the socket peer. Set it ONLY when the app sits behind proxies
                                    that append the address they saw to that header (Render,
@@ -30,6 +38,13 @@ the IPv4 address, and IPv6 addresses are keyed on their /64 (a single subscriber
 whole /64, so per-address keys would be trivially rotated).
 Invalid or negative values fall back to the defaults (the limiter stays ON).
 
+Refresh counting policy: every /refresh ATTEMPT is counted (including ones rejected with 401), on
+the refresh bucket only. Counting only successes would let an attacker hammer the endpoint with
+invalid tokens for free; counting attempts on a separate, generous bucket bounds that abuse without
+touching /guest quota. A legitimate client renews about once per access-token lifetime (plus at
+most one retry after a 401), so 120/hour per client is far above normal use. The attempt is
+counted before the token is verified, so a rejected token still uses one slot.
+
 Limitations
   * State is PER PROCESS. With several workers or instances each one counts separately, so the
     effective limits are multiplied by the number of processes, and counters reset on restart.
@@ -39,7 +54,8 @@ Limitations
     global ceiling still applies if an attacker churns through many client keys.
   * The global ceiling is a blunt instrument: roughly 100 clients (default 20 each; or one IPv6 /64
     if keys were mis-derived) can exhaust 2000/hour and block NEW guests. Holders of existing
-    tokens are unaffected. Alert on 429 responses from this endpoint.
+    tokens can still renew: /refresh has its own bucket (see above). Alert on 429 responses from
+    both endpoints.
   * If the request has no client address, the per-client limit is skipped (key "unknown" would
     otherwise be one shared bucket) and only the global ceiling applies; one warning is logged.
   * An attacker can only evict other clients' keys by creating more than MAX_TRACKED_KEYS new keys
@@ -65,6 +81,8 @@ logger = logging.getLogger(__name__)
 DEFAULT_PER_CLIENT_LIMIT = 20
 DEFAULT_WINDOW_SECONDS = 3600
 DEFAULT_GLOBAL_LIMIT = 2000
+DEFAULT_REFRESH_PER_CLIENT_LIMIT = 120
+DEFAULT_REFRESH_GLOBAL_LIMIT = 20000
 MAX_TRACKED_KEYS = 10_000
 _UNKNOWN_CLIENT = "unknown"
 
@@ -158,16 +176,22 @@ class SlidingWindowLimiter:
 
 
 _limiter = SlidingWindowLimiter()
+_refresh_limiter = SlidingWindowLimiter()  # separate key space + global ceiling for /refresh
 
 
 def reset_guest_limiter(clock: Optional[Callable[[], float]] = None) -> None:
-    """Clear all limiter state (tests). Optionally replace the time function (default: monotonic)."""
-    _limiter._clock = clock or time.monotonic
-    _limiter.reset()
+    """Clear all limiter state, guest and refresh (tests). Optionally replace the time function."""
+    for lim in (_limiter, _refresh_limiter):
+        lim._clock = clock or time.monotonic
+        lim.reset()
 
 
 def get_guest_limiter() -> SlidingWindowLimiter:
     return _limiter
+
+
+def get_refresh_limiter() -> SlidingWindowLimiter:
+    return _refresh_limiter
 
 
 def _normalize_ip(raw: str) -> Optional[str]:
@@ -217,12 +241,22 @@ def client_key(request: Request) -> str:
 
 
 def guest_rate_limit_config() -> Tuple[int, int, int]:
-    """(per-client limit, window seconds, global limit), read from the environment now."""
+    """(per-client limit, window seconds, global limit) for /guest, read from the environment now."""
     window = _env_int("AUTH_GUEST_RATE_WINDOW_SECONDS", DEFAULT_WINDOW_SECONDS) or DEFAULT_WINDOW_SECONDS
     return (
         _env_int("AUTH_GUEST_RATE_LIMIT", DEFAULT_PER_CLIENT_LIMIT),
         window,
         _env_int("AUTH_GUEST_GLOBAL_LIMIT", DEFAULT_GLOBAL_LIMIT),
+    )
+
+
+def refresh_rate_limit_config() -> Tuple[int, int, int]:
+    """(per-client limit, window seconds, global limit) for /refresh, read from the environment now."""
+    window = _env_int("AUTH_REFRESH_RATE_WINDOW_SECONDS", DEFAULT_WINDOW_SECONDS) or DEFAULT_WINDOW_SECONDS
+    return (
+        _env_int("AUTH_REFRESH_RATE_LIMIT", DEFAULT_REFRESH_PER_CLIENT_LIMIT),
+        window,
+        _env_int("AUTH_REFRESH_GLOBAL_LIMIT", DEFAULT_REFRESH_GLOBAL_LIMIT),
     )
 
 
@@ -234,14 +268,18 @@ def _warn_unknown_client_once() -> None:
     if not _warned_unknown_client:
         _warned_unknown_client = True
         logger.warning(
-            "Guest token request without a client address: per-client limit skipped, "
+            "Auth request without a client address: per-client limit skipped, "
             "only the global ceiling applies."
         )
 
 
-def enforce_guest_rate_limit(request: Request) -> None:
-    """FastAPI helper: raise 429 + Retry-After when the caller (or the whole service) is over limit."""
-    limit, window, global_limit = guest_rate_limit_config()
+def _enforce(
+    request: Request,
+    limiter: SlidingWindowLimiter,
+    config: Tuple[int, int, int],
+    label: str,
+) -> None:
+    limit, window, global_limit = config
     if limit <= 0 and global_limit <= 0:
         return
     key = client_key(request)
@@ -250,11 +288,21 @@ def enforce_guest_rate_limit(request: Request) -> None:
         limit = 0  # no identity to key on: rely on the global ceiling alone
         if global_limit <= 0:
             return
-    retry = _limiter.check(key, limit, window, global_limit)
+    retry = limiter.check(key, limit, window, global_limit)
     if retry is not None:
-        logger.warning("Guest token issuance throttled (retry in %ss)", retry)
+        logger.warning("%s throttled (retry in %ss)", label, retry)
         raise HTTPException(
             status_code=429,
             detail="Too many requests. Please try again later.",
             headers={"Retry-After": str(retry)},
         )
+
+
+def enforce_guest_rate_limit(request: Request) -> None:
+    """FastAPI helper for /guest: raise 429 + Retry-After when the caller (or the service) is over limit."""
+    _enforce(request, _limiter, guest_rate_limit_config(), "Guest token issuance")
+
+
+def enforce_refresh_rate_limit(request: Request) -> None:
+    """FastAPI helper for /refresh: same rules, but its own buckets and more generous defaults."""
+    _enforce(request, _refresh_limiter, refresh_rate_limit_config(), "Guest token renewal")

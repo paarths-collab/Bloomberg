@@ -18,22 +18,6 @@ from backend.main import app as main_app
 SECRET = "secret-token-XYZ"
 
 
-# --------------------------------------------------------------------------- peers compare
-
-def test_peers_compare_hides_exception_text(monkeypatch):
-    from backend.technical import main as technical_main
-
-    def boom(symbol, limit=12):
-        raise RuntimeError(SECRET)
-
-    monkeypatch.setattr(technical_main, "fetch_peer_comparison", boom)
-    with TestClient(main_app) as c:
-        r = c.get("/api/technical/peers/compare/AAPL")
-    assert r.status_code == 200
-    assert SECRET not in r.text
-    assert r.json() == {"symbol": "AAPL", "error": "Peer comparison failed", "rows": []}
-
-
 # --------------------------------------------------------------------------- stock advisor
 
 def test_stock_advisor_recommend_hides_exception_text(monkeypatch):

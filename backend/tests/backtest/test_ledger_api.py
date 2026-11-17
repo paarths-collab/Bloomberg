@@ -21,7 +21,7 @@ def test_single_run_reports_ledger_and_new_assumptions(served):
     body = r.json()
     a = body["assumptions"]
     assert a["sizingSpec"] == FIXED and a["fee_per_fill"] == 2 and a["fill_timing"] == "next_close"
-    assert a["engineVersion"] == "2.1.0" and "next bar close" in a["execution"] and "50" in a["sizing"]
+    assert a["engineVersion"] == "2.2.0" and "next bar close" in a["execution"] and "50" in a["sizing"]
     ledger = body["ledger"]
     assert ledger and ledger[0]["kind"] == "fill" and ledger[-1]["kind"] in {"close_at_end", "fill", "liquidation"}
     closes = {p["date"]: p["close"] for p in body["chartData"]}

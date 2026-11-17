@@ -4,7 +4,7 @@ from httpx import ASGITransport, AsyncClient
 from backend.main import app
 from backend.services.market_data import market_service
 
-PREFIXES = ["/api/portfolio/api/investor-profile", "/api/profile"]
+PREFIXES = ["/api/profile"]
 
 
 @pytest.fixture(autouse=True)
@@ -19,6 +19,13 @@ def prices(monkeypatch):
         return value
 
     monkeypatch.setattr(market_service, "get_current_price", fake_get_current_price)
+
+    def fake_get_price_quote(ticker):
+        # Delegates at call time so tests that re-patch get_current_price still take effect.
+        value = market_service.get_current_price(ticker)
+        return {"price": value, "source": "live" if value else None, "as_of": None}
+
+    monkeypatch.setattr(market_service, "get_price_quote", fake_get_price_quote)
     return table
 
 
@@ -33,6 +40,6 @@ async def new_user(client):
     return _new
 
 
-@pytest.fixture(params=PREFIXES, ids=["portfolio-prefix", "profile-prefix"])
+@pytest.fixture(params=PREFIXES, ids=["profile-prefix"])
 def prefix(request):
     return request.param

@@ -217,10 +217,21 @@ class SectorScore(Base):
 # EXPERIMENT TRIALS (reproducible backtest runs)
 # =====================================================
 
+class ExperimentQuota(Base):
+    """Durable allocated slots: recorded trials plus in-flight runs.
+
+    Reservations survive a process crash conservatively; administrators can reconcile
+    abandoned slots after confirming that no runs for that user remain active.
+    """
+    __tablename__ = "experiment_quotas"
+    user_id = Column(String(128), primary_key=True)
+    allocated = Column(Integer, nullable=False, default=0)
+
+
 class DatasetVersion(Base):
     """
     Immutable, content-addressed snapshot of the OHLCV bars a trial ran on.
-    The primary key is the sha256 of the canonical rows, so the same data is stored once and a
+    The primary key hashes canonical rows and their provenance/interpretation metadata, so a
     trial can be reopened (and its ledger reproduced) offline.
     """
     __tablename__ = "dataset_versions"

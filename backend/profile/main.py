@@ -1,9 +1,4 @@
-"""
-Profile routes mounted at /api/profile (save, load, trade, portfolio).
-
-This is a thin alias: the implementation is shared with
-/api/portfolio/api/investor-profile/* and lives in backend/portfolio/investor_profile.py.
-"""
+"""Canonical authenticated profile and paper-portfolio routes at /api/profile."""
 from fastapi import APIRouter
 
 from backend.portfolio.investor_profile import (  # noqa: F401  (re-exported for compatibility)

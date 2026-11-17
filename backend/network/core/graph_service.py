@@ -1,5 +1,5 @@
 from typing import Dict, Any, List
-from .peers_service import fetch_stock_peers
+from backend.peers.service import fetch_stock_peers
 
 def get_network_graph(symbol: str) -> Dict[str, Any]:
     """
@@ -9,6 +9,8 @@ def get_network_graph(symbol: str) -> Dict[str, Any]:
     
     # 1. Fetch Competitors (Nodes)
     competitors = fetch_stock_peers(symbol)
+    competitors = [{"symbol": p} if isinstance(p, str) else p for p in competitors]
+    competitors = [p for p in competitors if isinstance(p, dict) and p.get("symbol") and p["symbol"] != symbol]
     
     # 2. Construct Nodes
     # Root Node
@@ -41,6 +43,8 @@ def get_network_graph(symbol: str) -> Dict[str, Any]:
     # Future: Add Supplier/Customer nodes here if data source available
     
     return {
+        "comparison_basis": "sector comparables" if any(p.get("source") == "local_sector_universe" for p in competitors) else "provider peers",
+        "partial": not bool(competitors),
         "nodes": nodes,
         "links": links
     }

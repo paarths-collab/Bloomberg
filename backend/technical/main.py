@@ -6,8 +6,6 @@ from pydantic import BaseModel, ConfigDict, Field
 
 # Internal services
 from .fundamentals_service import get_fundamentals_summary
-from .peer_service import fetch_peer_comparison
-from .peers_legacy_service import fetch_stock_peers
 
 # Unified services
 from backend.services.market_data import market_service
@@ -202,19 +200,3 @@ def get_fundamental_summary(symbol: str):
     if not data or not data.get("name"):
         raise HTTPException(status_code=404, detail="Not found")
     return data
-
-# --- Peers (Legacy /api/peers) ---
-
-@router.get("/peers/compare/{symbol}")
-def get_peer_comparison_route(symbol: str, limit: int = Query(12)):
-    try:
-        data = fetch_peer_comparison(symbol, limit=limit)
-        return make_json_safe(data)
-    except Exception:
-        logger.exception("Peer comparison failed for %s", symbol)
-        return make_json_safe({"symbol": symbol, "error": "Peer comparison failed", "rows": []})
-
-@router.get("/peers/{symbol}")
-def get_peers_route(symbol: str):
-    peers = fetch_stock_peers(symbol)
-    return {"symbol": symbol.upper(), "peers": peers, "count": len(peers)}

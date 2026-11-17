@@ -1,15 +1,29 @@
 from typing import Dict, Any, List, Optional, Callable
 import logging
+import math
 import pandas as pd
 from backend.core.safe_yfinance import (
     safe_fetch_history, 
     safe_fetch_info, 
     safe_get_price,
+    safe_get_price_quote,
+    candles_from_frame,
     safe_fetch_multiple_quotes,
     safe_fetch_candles
 )
 
 logger = logging.getLogger(__name__)
+
+def _period_change(current: float, previous: Optional[float]) -> "tuple[Optional[float], Optional[float]]":
+    """(change, change_pct) vs a genuine previous value; (None, None) when there is none or it is 0."""
+    try:
+        if previous is None or not math.isfinite(previous) or previous == 0 or not math.isfinite(current):
+            return None, None
+        change = current - previous
+        return float(change), float(change / previous * 100)
+    except (TypeError, ValueError):
+        return None, None
+
 
 class MarketDataService:
     """
@@ -70,6 +84,11 @@ class MarketDataService:
         """Get the most recent price for a ticker."""
         return safe_get_price(ticker) or 0.0
 
+    def get_price_quote(self, ticker: str) -> Dict[str, Any]:
+        """Current price plus its source: {"price", "source" ("live" | "previous_close" |
+        "last_close_5d" | None), "as_of"}. `get_current_price` keeps returning the bare number."""
+        return safe_get_price_quote(ticker)
+
     def fetch_ohlcv(
         self, 
         ticker: str, 
@@ -106,17 +125,7 @@ class MarketDataService:
             df = self.get_history(ticker, interval=interval, start=start, end=end)
             if df is None or df.empty:
                 return []
-            candles: List[Dict[str, Any]] = []
-            for idx, row in df.iterrows():
-                candles.append({
-                    "date": idx.strftime('%Y-%m-%d') if hasattr(idx, 'strftime') else str(idx),
-                    "open": float(row.get('Open', 0)),
-                    "high": float(row.get('High', 0)),
-                    "low": float(row.get('Low', 0)),
-                    "close": float(row.get('Close', 0)),
-                    "volume": int(row.get('Volume', 0)),
-                })
-            return candles
+            return candles_from_frame(df)
 
         return safe_fetch_candles(symbol, interval=interval, period=period, market=market)
 
@@ -168,14 +177,12 @@ class MarketDataService:
                 # Fetch price change
                 current = info.get("currentPrice") or info.get("regularMarketPrice")
                 prev = info.get("previousClose")
-                change_pct = 0
-                if current and prev:
-                    change_pct = ((current - prev) / prev) * 100
-                
+                _, change_pct = _period_change(float(current), float(prev)) if current and prev else (None, None)
+
                 return {
                     "symbol": symbol,
                     "marketCap": mkt_cap,
-                    "changePercent": round(float(change_pct), 2),
+                    "changePercent": round(change_pct, 2) if change_pct is not None else None,
                     "sector": sector
                 }
             except Exception:
@@ -226,13 +233,15 @@ class MarketDataService:
                         clean = series.dropna()
                         if not clean.empty:
                             current = float(clean.iloc[-1])
-                            previous = float(clean.iloc[-2]) if len(clean) > 1 else current
-                            change_pct = ((current - previous) / previous * 100) if previous else 0.0
-                            
+                            change, change_pct = _period_change(
+                                current, float(clean.iloc[-2]) if len(clean) > 1 else None
+                            )
+
                             overview[series_id] = {
                                 "name": name,
                                 "price": current,
-                                "change_pct": float(change_pct),
+                                "change": change,
+                                "change_pct": change_pct,
                                 "source": "fred",
                                 "date": clean.index[-1].date().isoformat() if hasattr(clean.index[-1], "date") else str(clean.index[-1])
                             }
@@ -240,6 +249,14 @@ class MarketDataService:
                     continue
         except Exception as e:
             logger.warning(f"FRED fetch failed in MarketDataService: {e}")
+
+        alternatives = {"SP500": ("^GSPC", "S&P 500"), "DJIA": ("^DJI", "Dow Jones"),
+                        "NASDAQ100": ("^NDX", "NASDAQ 100"), "VIXCLS": ("^VIX", "VIX")}
+        fallback_ids = {}
+        for series_id, (symbol, name) in alternatives.items():
+            if series_id not in overview:
+                yf_map[symbol] = name
+                fallback_ids[symbol] = series_id
 
         # 2. Add yfinance indices in parallel
         from concurrent.futures import ThreadPoolExecutor
@@ -252,13 +269,15 @@ class MarketDataService:
                 hist = res["data"]
                 if hist is None or hist.empty: return None
                 current = float(hist['Close'].iloc[-1])
-                previous = float(hist['Close'].iloc[-2]) if len(hist) > 1 else current
-                change_pct = ((current - previous) / previous * 100) if previous else 0
-                
+                change, change_pct = _period_change(
+                    current, float(hist['Close'].iloc[-2]) if len(hist) > 1 else None
+                )
+
                 return symbol, {
                     "name": name,
                     "price": current,
-                    "change_pct": float(change_pct),
+                    "change": change,
+                    "change_pct": change_pct,
                     "source": "yfinance",
                     "date": hist.index[-1].date().isoformat() if len(hist.index) else None,
                 }
@@ -271,7 +290,7 @@ class MarketDataService:
                 result = future.result()
                 if result:
                     symbol, data = result
-                    overview[symbol] = data
+                    overview[fallback_ids.get(symbol, symbol)] = data
 
         return overview
 

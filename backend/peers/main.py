@@ -65,7 +65,8 @@ def get_peers(symbol: str):
             "symbol": symbol.upper(),
             "peers": peers,
             "count": len(peers),
-            "source": "Financial Modeling Prep",
+            "source": peers[0].get("source", "unknown") if peers else "unavailable",
+            "comparison_basis": "sector comparables" if any(p.get("source") == "local_sector_universe" for p in peers) else "provider peers",
         }
 
     except Exception:

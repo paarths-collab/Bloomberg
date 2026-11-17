@@ -1,4 +1,6 @@
 import inspect
+import html
+import re
 import logging
 import math
 import pandas as pd
@@ -14,7 +16,7 @@ logger = logging.getLogger(__name__)
 INTERNAL_ERROR_MESSAGE = "Backtest failed due to an internal error."
 
 # Bump when the execution semantics or the result schema change (reported as assumptions.engineVersion).
-ENGINE_VERSION = "2.1.0"
+ENGINE_VERSION = "2.2.0"
 
 
 class BacktestInputError(ValueError):
@@ -77,7 +79,6 @@ _DAILY_OR_SLOWER = {"1d", "1wk", "1mo"}
 STATEFUL_STRATEGIES = {
     "momentum",
     "mean_reversion",
-    "rsi_reversal",
     "rsi_momentum",
 }
 
@@ -567,7 +568,17 @@ def run_spec(df: pd.DataFrame, spec: Dict[str, Any], *, full: bool = True) -> Sp
         raise ValueError("No price data to backtest")
 
     initial_capital = s["initial_capital"]
-    res_df = strategy.generate_signals(df.copy()).reset_index(drop=True)
+    try:
+        res_df = strategy.generate_signals(df.copy()).reset_index(drop=True)
+    except ValueError as e:
+        if not s["params"]:
+            raise
+        # e.g. a negative window/span: pandas rejects it only when the signals are computed. That is a
+        # problem with the requested params (400), not an internal error; the pandas text is not shown.
+        logger.info("Rejected params for %s: %s", name, e)
+        raise BacktestInputError(
+            f"Invalid parameters for strategy '{name}': window/period values must be positive integers"
+        ) from e
     long_only = bool(getattr(strategy, "long_only", False))
     target = _target_positions(res_df["signal"], name in STATEFUL_STRATEGIES, long_only)
 
@@ -638,6 +649,7 @@ def normalize_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
         return default if spec.get(key) is None else spec[key]
 
     interval = str(opt("interval", "1d")).strip().lower()
+    interval = "1h" if interval == "60m" else interval
     get_periods_per_year(interval)
     return {
         "strategy": strategy.lower().strip(),
@@ -760,8 +772,9 @@ def _compute_advanced_trade_metrics(trades: List[Dict[str, Any]]) -> Dict[str, A
     wins = [p for p in pnls if p > 0]
     losses = [p for p in pnls if p < 0]
 
-    gross_profit = sum(wins) if wins else 0
-    gross_loss = abs(sum(losses)) if losses else 0
+    cash_pnls = [t.get("pnl", 0) or 0 for t in trades]
+    gross_profit = sum(p for p in cash_pnls if p > 0)
+    gross_loss = -sum(p for p in cash_pnls if p < 0)
     profit_factor = _safe_number(gross_profit / gross_loss) if gross_loss > 0 else None
 
     avg_win = _safe_number(np.mean(wins)) if wins else 0
@@ -834,9 +847,8 @@ def _run_monte_carlo(
 
         # Full equity curve for this simulation
         equity = np.cumprod(1 + sample)
-        peak = np.maximum.accumulate(equity)
-        # peak is 0 only on a path that lost everything on its first draw; treat that as no drawdown
-        dd = np.divide(equity - peak, peak, out=np.zeros_like(equity), where=peak > 0).min() * 100
+        peak = np.maximum.accumulate(np.r_[1.0, equity])[1:]
+        dd = ((equity - peak) / peak).min() * 100
         sim_max_drawdowns.append(dd)
 
         # Downsample the equity curve
@@ -1272,6 +1284,70 @@ def run_multi_strategy_backtest(
     }
 
 
+REPORT_FORMATS = ("html", "csv")
+REPORT_FILENAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,120}$")
+REPORT_MAX_AGE_SECONDS = 24 * 60 * 60
+REPORT_MAX_FILES = 200
+_REPORT_SUFFIXES = {".html", ".csv", ".pdf"}
+
+
+def safe_filename_symbol(symbol: Any) -> str:
+    """Symbol reduced to [A-Za-z0-9_-] (max 40 chars) for use inside generated report file names."""
+    return re.sub(r"[^A-Za-z0-9_-]", "_", str(symbol))[:40] or "UNKNOWN"
+
+
+def resolve_report_file(reports_dir, filename: Any):
+    """The path of an existing report file inside reports_dir, or None (never raises).
+
+    Only plain names matching REPORT_FILENAME_RE (no leading dot, no '..') are accepted, and the resolved
+    path must be a regular file directly inside the reports directory."""
+    from pathlib import Path
+
+    if not isinstance(filename, str) or not REPORT_FILENAME_RE.match(filename):
+        return None
+    if filename.startswith(".") or ".." in filename:
+        return None
+    try:
+        base = Path(reports_dir).resolve()
+        path = (base / filename).resolve()
+        if path.parent != base or not path.is_file():
+            return None
+    except (OSError, ValueError):
+        return None
+    return path
+
+
+def sweep_reports(reports_dir, max_age_seconds: float = REPORT_MAX_AGE_SECONDS, max_files: int = REPORT_MAX_FILES) -> int:
+    """Delete generated report files older than max_age_seconds, then the oldest beyond max_files.
+    Only *.html / *.csv / *.pdf regular files are touched. Never raises; returns the number deleted."""
+    import time
+    from pathlib import Path
+
+    removed = 0
+    try:
+        entries = []
+        for entry in Path(reports_dir).iterdir():
+            try:
+                if entry.suffix.lower() in _REPORT_SUFFIXES and entry.is_file() and not entry.is_symlink():
+                    entries.append((entry.stat().st_mtime, entry))
+            except OSError:
+                continue
+        now = time.time()
+        keep = []
+        for mtime, entry in sorted(entries, key=lambda item: item[0], reverse=True):  # newest first
+            if now - mtime > max_age_seconds or len(keep) >= max_files:
+                try:
+                    entry.unlink()
+                    removed += 1
+                except OSError:
+                    logger.warning("Could not delete old report %s", entry.name)
+            else:
+                keep.append(entry)
+    except OSError:
+        logger.warning("Report sweep failed for %s", reports_dir)
+    return removed
+
+
 def generate_backtest_report(
     symbol: str,
     strategies: List[str],
@@ -1279,45 +1355,64 @@ def generate_backtest_report(
     report_format: str = "html"
 ) -> Dict[str, Any]:
     """
-    Generates a downloadable backtest report.
-    Returns HTML or CSV content.
+    Generates a downloadable backtest report (HTML or CSV).
+    Raises BacktestInputError for an unsupported format.
     """
     from datetime import datetime
     from pathlib import Path
-    
+
+    fmt = report_format.strip().lower() if isinstance(report_format, str) else None
+    if fmt not in REPORT_FORMATS:
+        raise BacktestInputError(f"Unsupported report format. Supported: {', '.join(REPORT_FORMATS)}")
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    reports_dir = Path(__file__).parent.parent / "reports"
+    reports_dir = Path(__file__).parent / "reports"
     reports_dir.mkdir(exist_ok=True)
-    
-    if report_format == "csv":
-        return generate_csv_report(symbol, strategies, results, reports_dir, timestamp)
-    if report_format == "pdf":
-        html_result = generate_html_report(symbol, strategies, results, reports_dir, timestamp)
-        if html_result.get("error"):
-            return html_result
 
-        html_filename = html_result.get("filename")
-        if not html_filename:
-            return {"error": "HTML report generation failed."}
+    if fmt == "csv":
+        report = generate_csv_report(symbol, strategies, results, reports_dir, timestamp)
+    else:
+        report = generate_html_report(symbol, strategies, results, reports_dir, timestamp)
+    sweep_reports(reports_dir)
+    return report
 
-        html_path = reports_dir / html_filename
-        pdf_filename = html_filename.replace(".html", ".pdf")
-        pdf_path = reports_dir / pdf_filename
 
-        from backend.utils.pdf_generator import convert_html_to_pdf
+def csv_safe(value: Any) -> Any:
+    """Neutralise spreadsheet formula injection in a text cell (leading = + - @ tab or CR gets an apostrophe)."""
+    if isinstance(value, str) and value[:1] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + value
+    return value
 
-        conversion = convert_html_to_pdf(str(html_path), str(pdf_path))
-        if not conversion.get("success"):
-            logger.error("PDF conversion failed: %s", conversion.get("error"))
-            return {"error": "PDF conversion failed."}
 
-        return {
-            "success": True,
-            "filename": pdf_filename,
-            "downloadUrl": f"/api/backtest/report/download/{pdf_filename}"
-        }
+NOT_AVAILABLE = "N/A"
 
-    return generate_html_report(symbol, strategies, results, reports_dir, timestamp)
+
+def _num(metrics: Any, *keys: str) -> Optional[float]:
+    """First present, non-null numeric value among keys, else None (a missing metric is never shown as 0)."""
+    if isinstance(metrics, dict):
+        for key in keys:
+            value = metrics.get(key)
+            if value is not None:
+                return value
+    return None
+
+
+def _html_num(value: Optional[float], spec: str = "", prefix: str = "", suffix: str = "") -> str:
+    """Format a metric for the HTML report; None renders as N/A."""
+    if value is None:
+        return NOT_AVAILABLE
+    return f"{prefix}{value:{spec}}{suffix}"
+
+
+def _csv_num(value: Optional[float], suffix: str = "") -> Any:
+    """CSV cell for a metric; None renders as an empty cell."""
+    return "" if value is None else f"{value}{suffix}" if suffix else value
+
+
+def _ret_class(value: Optional[float]) -> str:
+    if value is None:
+        return "na"
+    return "positive" if value >= 0 else "negative"
 
 
 def generate_csv_report(
@@ -1331,7 +1426,8 @@ def generate_csv_report(
     import csv
     import io
     
-    filename = f"backtest_{symbol}_{timestamp}.csv"
+    safe_symbol = safe_filename_symbol(symbol)
+    filename = f"backtest_{safe_symbol}_{timestamp}.csv"
     filepath = reports_dir / filename
     
     try:
@@ -1340,9 +1436,9 @@ def generate_csv_report(
             
             # Header
             writer.writerow(['Backtest Report'])
-            writer.writerow(['Symbol', symbol])
+            writer.writerow(['Symbol', csv_safe(str(symbol))])
             writer.writerow(['Generated', timestamp])
-            writer.writerow(['Strategies', ', '.join(strategies)])
+            writer.writerow(['Strategies', csv_safe(', '.join(str(x) for x in strategies))])
             writer.writerow([])
             
             # Check if multi-strategy or single
@@ -1355,29 +1451,29 @@ def generate_csv_report(
                     if strat_data.get('metrics'):
                         m = strat_data['metrics']
                         writer.writerow([
-                            strat_id,
-                            m.get('totalReturn', 0),
-                            m.get('maxDrawdown', 0),
-                            m.get('sharpeRatio', 0),
-                            m.get('totalTrades', 0),
-                            m.get('finalEquity', 0)
+                            csv_safe(str(strat_id)),
+                            _csv_num(_num(m, 'totalReturn')),
+                            _csv_num(_num(m, 'maxDrawdown')),
+                            _csv_num(_num(m, 'sharpeRatio')),
+                            _csv_num(_num(m, 'totalTrades')),
+                            _csv_num(_num(m, 'finalEquity', 'finalValue'))
                         ])
                 
                 # Ranking
                 writer.writerow([])
                 writer.writerow(['Ranking'])
                 for i, rank in enumerate(results.get('ranking', []), 1):
-                    writer.writerow([f"#{i}", rank['strategy'], f"{rank['return']}%"])
+                    writer.writerow([f"#{i}", csv_safe(str(rank['strategy'])), f"{rank['return']}%"])
             else:
                 # Single strategy
                 metrics = results.get('metrics', {})
                 writer.writerow(['Metrics'])
-                writer.writerow(['Total Return', f"{metrics.get('totalReturn', 0)}%"])
-                writer.writerow(['Sharpe Ratio', metrics.get('sharpeRatio', 0)])
-                writer.writerow(['Max Drawdown', f"{metrics.get('maxDrawdown', 0)}%"])
-                writer.writerow(['Win Rate', f"{metrics.get('winRate', 0)}%"])
-                writer.writerow(['Total Trades', metrics.get('totalTrades', 0)])
-                writer.writerow(['Final Equity', metrics.get('finalEquity', 0)])
+                writer.writerow(['Total Return', _csv_num(_num(metrics, 'totalReturn'), '%')])
+                writer.writerow(['Sharpe Ratio', _csv_num(_num(metrics, 'sharpeRatio'))])
+                writer.writerow(['Max Drawdown', _csv_num(_num(metrics, 'maxDrawdown'), '%')])
+                writer.writerow(['Win Rate', _csv_num(_num(metrics, 'winRate'), '%')])
+                writer.writerow(['Total Trades', _csv_num(_num(metrics, 'totalTrades'))])
+                writer.writerow(['Final Equity', _csv_num(_num(metrics, 'finalEquity', 'finalValue'))])
         
         return {
             "success": True,
@@ -1399,9 +1495,20 @@ def generate_html_report(
     """Generate HTML format backtest report."""
     from datetime import datetime
     
-    filename = f"backtest_{symbol}_{timestamp}.html"
+    safe_symbol = safe_filename_symbol(symbol)
+    filename = f"backtest_{safe_symbol}_{timestamp}.html"
     filepath = reports_dir / filename
     
+    def escape_values(value):
+        if isinstance(value, str):
+            return html.escape(value)
+        if isinstance(value, dict):
+            return {html.escape(str(k)): escape_values(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [escape_values(v) for v in value]
+        return value
+
+    symbol, strategies, results = escape_values(symbol), escape_values(strategies), escape_values(results)
     try:
         is_multi = results.get('mode') == 'multi_strategy'
         
@@ -1411,15 +1518,16 @@ def generate_html_report(
             for strat_id, strat_data in results.get('strategies', {}).items():
                 if strat_data.get('metrics'):
                     m = strat_data['metrics']
-                    ret_class = 'positive' if m.get('totalReturn', 0) >= 0 else 'negative'
+                    total_return = _num(m, 'totalReturn')
+                    ret_class = _ret_class(total_return)
                     metrics_html += f"""
                     <tr>
                         <td><strong>{strat_id}</strong></td>
-                        <td class="{ret_class}">{m.get('totalReturn', 0):+.2f}%</td>
-                        <td class="negative">{m.get('maxDrawdown', 0):.2f}%</td>
-                        <td>{m.get('sharpeRatio', 0):.2f}</td>
-                        <td>{m.get('totalTrades', 0)}</td>
-                        <td>${m.get('finalEquity', 0):,.2f}</td>
+                        <td class="{ret_class}">{_html_num(total_return, '+.2f', suffix='%')}</td>
+                        <td class="negative">{_html_num(_num(m, 'maxDrawdown'), '.2f', suffix='%')}</td>
+                        <td>{_html_num(_num(m, 'sharpeRatio'), '.2f')}</td>
+                        <td>{_html_num(_num(m, 'totalTrades'))}</td>
+                        <td>{_html_num(_num(m, 'finalEquity', 'finalValue'), ',.2f', prefix='$')}</td>
                     </tr>
                     """
             metrics_html += "</table>"
@@ -1432,16 +1540,16 @@ def generate_html_report(
             ranking_html += "</ol>"
         else:
             metrics = results.get('metrics', {})
-            ret_class = 'positive' if float(metrics.get('totalReturn', 0)) >= 0 else 'negative'
+            ret_class = _ret_class(_num(metrics, 'totalReturn'))
             metrics_html = f"""
             <h2>Performance Metrics</h2>
             <div class="metrics-grid">
-                <div class="metric"><span class="label">Total Return</span><span class="value {ret_class}">{metrics.get('totalReturn', 0)}%</span></div>
-                <div class="metric"><span class="label">Sharpe Ratio</span><span class="value">{metrics.get('sharpeRatio', 0)}</span></div>
-                <div class="metric"><span class="label">Max Drawdown</span><span class="value negative">{metrics.get('maxDrawdown', 0)}%</span></div>
-                <div class="metric"><span class="label">Win Rate</span><span class="value">{metrics.get('winRate', 0)}%</span></div>
-                <div class="metric"><span class="label">Total Trades</span><span class="value">{metrics.get('totalTrades', 0)}</span></div>
-                <div class="metric"><span class="label">Final Value</span><span class="value">${metrics.get('finalEquity', metrics.get('finalValue', 0)):,.2f}</span></div>
+                <div class="metric"><span class="label">Total Return</span><span class="value {ret_class}">{_html_num(_num(metrics, 'totalReturn'), suffix='%')}</span></div>
+                <div class="metric"><span class="label">Sharpe Ratio</span><span class="value">{_html_num(_num(metrics, 'sharpeRatio'))}</span></div>
+                <div class="metric"><span class="label">Max Drawdown</span><span class="value negative">{_html_num(_num(metrics, 'maxDrawdown'), suffix='%')}</span></div>
+                <div class="metric"><span class="label">Win Rate</span><span class="value">{_html_num(_num(metrics, 'winRate'), suffix='%')}</span></div>
+                <div class="metric"><span class="label">Total Trades</span><span class="value">{_html_num(_num(metrics, 'totalTrades'))}</span></div>
+                <div class="metric"><span class="label">Final Value</span><span class="value">{_html_num(_num(metrics, 'finalEquity', 'finalValue'), ',.2f', prefix='$')}</span></div>
             </div>
             """
             ranking_html = ""
@@ -1476,6 +1584,7 @@ def generate_html_report(
         tr:hover {{ background: #18181b; }}
         .positive {{ color: #22c55e; }}
         .negative {{ color: #ef4444; }}
+        .na {{ color: #71717a; }}
         .metrics-grid {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }}
         .metric {{ padding: 20px; background: #18181b; border-radius: 12px; border: 1px solid #27272a; }}
         .metric .label {{ display: block; font-size: 12px; color: #71717a; margin-bottom: 8px; text-transform: uppercase; }}
@@ -1505,7 +1614,7 @@ def generate_html_report(
             </div>
             <div class="meta-item">
                 <span class="meta-label">Initial Capital</span>
-                <span class="meta-value">${results.get('initialCapital', 100000):,.2f}</span>
+                <span class="meta-value">{_html_num(_num(results, 'initialCapital'), ',.2f', prefix='$')}</span>
             </div>
         </div>
         

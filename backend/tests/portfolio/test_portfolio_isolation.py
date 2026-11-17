@@ -71,14 +71,14 @@ async def test_matching_user_id_is_accepted_and_legacy_default_is_rejected(clien
     assert (await client.get(prefix + "/load", params={"user_id": "default"}, headers=a_hdr)).status_code == 403
 
 
-async def test_both_prefixes_share_one_store(client, new_user):
+async def test_profile_and_trades_share_one_store(client, new_user):
     _, hdr = await new_user()
     await client.post("/api/profile/save", json=PROFILE, headers=hdr)
     await client.post(
-        "/api/portfolio/api/investor-profile/trade",
+        "/api/profile/trade",
         json={"symbol": "msft", "side": "buy", "quantity": 2}, headers=hdr,
     )
-    for p in ("/api/profile", "/api/portfolio/api/investor-profile"):
+    for p in ("/api/profile",):
         assert (await client.get(p + "/load", headers=hdr)).json()["profile"]["name"] == "Alice"
         assert (await client.get(p + "/portfolio", headers=hdr)).json()["holdings"][0]["symbol"] == "MSFT"
 
@@ -145,7 +145,7 @@ async def test_blank_holdings_keep_stored_holdings(client, new_user, prefix):
 
 
 def test_every_profile_route_requires_auth_dependency():
-    """Reflective guard: no route under either prefix may be added without require_user."""
+    """Reflective guard: no route under the canonical prefix may be added without require_user."""
     from backend.auth.security import require_user
     from backend.main import app
 
@@ -153,7 +153,7 @@ def test_every_profile_route_requires_auth_dependency():
         return any(d.call is target or depends_on(d, target) for d in dependant.dependencies)
 
     expected = {"/save", "/load", "/trade", "/portfolio", "/portfolio/risk"}
-    for prefix in ("/api/portfolio/api/investor-profile", "/api/profile"):
+    for prefix in ("/api/profile",):
         routes = [r for r in app.routes if getattr(r, "path", "").startswith(prefix + "/")]
         assert {r.path[len(prefix):] for r in routes} == expected, prefix
         for r in routes:

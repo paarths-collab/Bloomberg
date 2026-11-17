@@ -14,6 +14,7 @@ Environment:
 from __future__ import annotations
 
 import hashlib
+import math
 import logging
 import os
 import secrets
@@ -29,6 +30,7 @@ logger = logging.getLogger(__name__)
 
 ALGORITHM = "HS256"  # pinned: tokens signed with any other algorithm (incl. "none") are rejected
 GUEST_TOKEN_TYPE = "guest"
+REFRESH_TOKEN_TYPE = "guest_refresh"
 DEFAULT_TTL_HOURS = 720.0
 MIN_SECRET_LENGTH = 32
 MAX_SUBJECT_LENGTH = 128
@@ -95,6 +97,7 @@ def create_access_token(user_id: str, *, ttl: Optional[timedelta] = None) -> Tup
         "iat": int(now.timestamp()),
         "exp": int(expires_at.timestamp()),
         "typ": GUEST_TOKEN_TYPE,
+        "ver": 2,
     }
     return jwt.encode(claims, get_secret(), algorithm=ALGORITHM), expires_at
 
@@ -119,6 +122,38 @@ def user_from_token(token: Optional[str]) -> Optional[str]:
     if not isinstance(sub, str) or not sub or len(sub) > MAX_SUBJECT_LENGTH:
         return None
     return sub
+
+
+def create_refresh_token(user_id: str) -> str:
+    """Durable guest recovery capability; usable only to renew access, never as API auth.
+
+    Keep this as private as the access token. It survives inactivity and access expiry,
+    but rotating AUTH_SECRET_KEY revokes it along with all other signed guest credentials.
+    """
+    return jwt.encode({"sub": user_id, "iat": int(datetime.now(timezone.utc).timestamp()),
+                       "typ": REFRESH_TOKEN_TYPE}, get_secret(), algorithm=ALGORITHM)
+
+
+def user_from_refresh_token(token: str) -> Optional[str]:
+    try:
+        claims = jwt.decode(token, get_secret(), algorithms=[ALGORITHM],
+                            leeway=CLOCK_SKEW_LEEWAY_SECONDS,
+                            options={"require": ["iat", "sub"], "verify_exp": False})
+        if claims.get("typ") == GUEST_TOKEN_TYPE:
+            # Preserve all pre-renewal identities, even after a long absence.
+            # Current access tokens have a bounded fallback if a client loses its
+            # durable refresh credential; old tokens did not have that option.
+            exp = claims.get("exp")
+            if isinstance(exp, bool) or not isinstance(exp, (int, float)) or not math.isfinite(exp):
+                return None
+            if claims.get("ver") == 2 and exp < datetime.now(timezone.utc).timestamp() - 30 * 86400:
+                return None
+        elif claims.get("typ") != REFRESH_TOKEN_TYPE:
+            return None
+        sub = claims.get("sub")
+        return sub if isinstance(sub, str) and 0 < len(sub) <= MAX_SUBJECT_LENGTH else None
+    except (jwt.PyJWTError, TypeError, ValueError):
+        return None
 
 
 def _unauthorized(detail: str) -> HTTPException:

@@ -1,8 +1,9 @@
 import pandas as pd
 import numpy as np
-import time
+import copy
 from typing import Dict, Any, List, Optional
 import logging
+from backend.common.ttl_cache import TTLCache
 from .market_data import market_service
 
 logger = logging.getLogger(__name__)
@@ -14,11 +15,20 @@ class TechnicalAnalysisService:
     """
 
     def __init__(self):
-        self._indicator_cache: Dict[str, Dict[str, Any]] = {}
+        # Keys embed user-controlled values, so the cache is bounded (LRU + TTL).
         self._indicator_cache_ttl = 180
+        self._indicator_cache = TTLCache(maxsize=512, ttl=self._indicator_cache_ttl)
+
+    @staticmethod
+    def _normalize_market(market: Optional[str]) -> str:
+        """Only India changes ticker handling; every other value behaves as the US market."""
+        return "india" if (market or "").strip().lower() == "india" else "us"
 
     def _cache_key(self, ticker: str, range_period: str, interval: str, market: str) -> str:
-        return f"{ticker.upper()}:{range_period}:{interval}:{market.lower()}"
+        return (
+            f"{(ticker or '').strip().upper()}:{(range_period or '').strip().lower()}:"
+            f"{(interval or '').strip().lower()}:{self._normalize_market(market)}"
+        )
 
     def _select_history_period(self, range_period: str) -> str:
         period_map = {
@@ -44,8 +54,8 @@ class TechnicalAnalysisService:
         try:
             cache_key = self._cache_key(ticker, range_period, interval, market)
             cached = self._indicator_cache.get(cache_key)
-            if cached and (time.time() - cached.get("cached_at", 0) < self._indicator_cache_ttl):
-                return cached.get("data", {})
+            if cached is not None:
+                return copy.deepcopy(cached)
 
             # 1. Ticker Normalization
             ticker = market_service.normalize_ticker(ticker, market)
@@ -54,9 +64,12 @@ class TechnicalAnalysisService:
             # (e.g., 200 EMA needs 200+ data points)
             history_period = self._select_history_period(range_period)
             df = market_service.get_history(ticker, period=history_period, interval=interval)
-            
-            if df.empty:
+
+            if df is None or df.empty:
                 return {}
+            # Work on a private copy: the history may be shared (cache), and indicator columns are
+            # added below.
+            df = df.copy()
 
             # --- Technical Indicators ---
             
@@ -124,7 +137,7 @@ class TechnicalAnalysisService:
                 "atr": result_df['atr'].tolist(),
                 "vwap": result_df['vwap'].tolist()
             }
-            self._indicator_cache[cache_key] = {"data": result, "cached_at": time.time()}
+            self._indicator_cache.set(cache_key, copy.deepcopy(result))
             return result
                 
         except Exception as e:

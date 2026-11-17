@@ -1,6 +1,8 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.exceptions import RequestValidationError
+import asyncio
 import os
 import json
 import logging
@@ -37,12 +39,19 @@ from backend.news.main import router as news_app
 from backend.screener.main import router as screener_app
 from backend.profile.main import router as profile_app
 from backend.auth.routes import router as auth_app
-from backend.technical.fundamentals_service import get_fundamentals_summary
 
 # FRED routes registered at /api level so /api/fred/* matches frontend api.ts
 from backend.markets.fred_routes import router as fred_router
 
 from backend.chat.core.pipeline import InvestmentPipeline
+from backend.common.abuse_protection import (
+    AbuseProtectionMiddleware,
+    ws_check_message,
+    ws_disconnect,
+    ws_max_message_bytes,
+    ws_try_connect,
+)
+from backend.common.validation_errors import validation_exception_handler
 
 # Suppress noise
 warnings.filterwarnings("ignore", category=FutureWarning, module=r"yfinance\..*")
@@ -68,6 +77,10 @@ async def global_exception_handler(request: Request, exc: Exception):
     )
 
 
+
+# 422 without the echoed `input`: a NaN/Infinity sent into a wrongly typed field would otherwise make
+# FastAPI's own error body unserialisable (500).
+app.add_exception_handler(RequestValidationError, validation_exception_handler)
 
 # CORS Configuration
 default_origins = [
@@ -101,6 +114,8 @@ def parse_cors_origins(raw, defaults=None):
 
 
 cors_origins = parse_cors_origins(os.getenv("CORS_ORIGINS"))
+# Added BEFORE CORS so CORS stays outermost and 413/429/503 rejections still carry CORS headers.
+app.add_middleware(AbuseProtectionMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=cors_origins,
@@ -129,14 +144,6 @@ app.include_router(experiments_router)  # carries its own /api/experiments prefi
 # FRED at top-level /api so frontend /api/fred/* calls resolve correctly
 app.include_router(fred_router,   prefix="/api",            tags=["FRED Data"])
 
-
-@app.get("/api/fundamentals/summary/{symbol}")
-def fundamentals_summary_compat(symbol: str):
-    """Compatibility alias for legacy frontend bundles expecting /api/fundamentals/* routes."""
-    data = get_fundamentals_summary(symbol)
-    if not data or not data.get("name"):
-        raise HTTPException(status_code=404, detail="Not found")
-    return data
 
 # Database Initialization
 from backend.database.connection import init_db, run_init_sql, get_database_status, redact_db_secrets
@@ -173,21 +180,45 @@ def root():
 @app.websocket("/ws/live")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
+    if not ws_try_connect():
+        await websocket.send_json({"status": "error", "message": "Too many live connections; try again later"})
+        await websocket.close(code=1013)  # try again later
+        return
     try:
         while True:
             data = await websocket.receive_text()
+            if len(data) > ws_max_message_bytes():
+                await websocket.send_json({"status": "error", "message": "Message too large"})
+                await websocket.close(code=1009)  # message too big
+                return
+            retry = ws_check_message(websocket)
+            if retry is not None:
+                await websocket.send_json({
+                    "status": "error",
+                    "message": "Too many requests. Please try again later.",
+                    "retry_after": retry,
+                })
+                await websocket.close(code=1008)  # policy violation
+                return
             try:
                 msg = json.loads(data)
             except json.JSONDecodeError:
                 await websocket.send_json({"status": "error", "message": "Invalid JSON payload"})
                 continue
+            if not isinstance(msg, dict):
+                await websocket.send_json({"status": "error", "message": "Invalid JSON payload"})
+                continue
 
-            result = await _get_pipeline().run(
-                query=msg.get("query"), 
-                ticker=msg.get("ticker"), 
-                market=msg.get("market", "us")
+            pipeline = await asyncio.to_thread(_get_pipeline)
+            result = await pipeline.run(
+                query=msg.get("query"),
+                ticker=msg.get("ticker"),
+                market=msg.get("market", "us"),
             )
-            await websocket.send_json(result)
+            if str(result.get("report", "")).lower().startswith("error"):
+                await websocket.send_json({"status": "error", "message": "AI analysis unavailable; check provider configuration"})
+            else:
+                await websocket.send_json(result)
     except WebSocketDisconnect:
         logger.info("Live websocket disconnected")
     except Exception as e:
@@ -196,3 +227,5 @@ async def websocket_endpoint(websocket: WebSocket):
             await websocket.close()
         except Exception as close_error:
             logger.debug("Websocket close failed after error: %s", close_error)
+    finally:
+        ws_disconnect()

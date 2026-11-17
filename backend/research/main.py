@@ -1,4 +1,6 @@
 import logging
+import re
+import time
 from fastapi import APIRouter, HTTPException, Body
 from fastapi.responses import FileResponse
 from .service import generate_research_report
@@ -14,6 +16,60 @@ REPORTS_DIR = Path(__file__).parent / "reports"
 REPORTS_DIR.mkdir(exist_ok=True)
 
 router = APIRouter(prefix="", tags=["Research Agent"])
+
+REPORT_FILENAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,120}$")
+REPORT_MAX_AGE_SECONDS = 24 * 60 * 60
+REPORT_MAX_FILES = 200
+_REPORT_SUFFIXES = {".html", ".pdf"}
+
+
+def _safe_filename_symbol(symbol: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_-]", "_", str(symbol))[:40] or "UNKNOWN"
+
+
+def _title_symbol(symbol: str) -> str:
+    """Symbol for display in report titles: only characters that are inert in HTML."""
+    return re.sub(r"[^A-Za-z0-9_.^=-]", "_", str(symbol))[:40] or "UNKNOWN"
+
+
+def _resolve_report_file(filename: str):
+    """Path of an existing report directly inside REPORTS_DIR for a plain filename, else None."""
+    if not isinstance(filename, str) or not REPORT_FILENAME_RE.match(filename):
+        return None
+    if filename.startswith(".") or ".." in filename:
+        return None
+    try:
+        base = REPORTS_DIR.resolve()
+        path = (base / filename).resolve()
+        if path.parent != base or not path.is_file():
+            return None
+    except (OSError, ValueError):
+        return None
+    return path
+
+
+def _sweep_reports() -> None:
+    """Delete report files older than 24h, then the oldest beyond 200. Never raises."""
+    try:
+        entries = []
+        for entry in REPORTS_DIR.iterdir():
+            try:
+                if entry.suffix.lower() in _REPORT_SUFFIXES and entry.is_file() and not entry.is_symlink():
+                    entries.append((entry.stat().st_mtime, entry))
+            except OSError:
+                continue
+        now = time.time()
+        kept = 0
+        for mtime, entry in sorted(entries, key=lambda item: item[0], reverse=True):
+            if now - mtime > REPORT_MAX_AGE_SECONDS or kept >= REPORT_MAX_FILES:
+                try:
+                    entry.unlink()
+                except OSError:
+                    logger.warning("Could not delete old report %s", entry.name)
+            else:
+                kept += 1
+    except OSError:
+        logger.warning("Report sweep failed")
 
 @router.post("/analyze")
 def analyze_stock(
@@ -31,6 +87,9 @@ def analyze_stock(
         report = generate_research_report(symbol)
         if "error" in report:
              raise HTTPException(status_code=400, detail=report["error"])
+        text = str(report.get("report", "")).lower()
+        if text.startswith(("ai report generation failed", "ai generation failed", "finverse llm manager not initialized")):
+            raise HTTPException(status_code=503, detail="AI research unavailable; check provider configuration")
         return report
     except HTTPException:
         raise
@@ -48,11 +107,20 @@ def generate_research_report_file(payload: Dict[str, Any] = Body(...)):
     benchmark = payload.get("benchmark")
     if not symbol:
         raise HTTPException(status_code=400, detail="Symbol is required")
+    if not isinstance(symbol, str) or not symbol.strip():
+        raise HTTPException(status_code=400, detail="symbol must be a non-empty string")
+    symbol = symbol.strip()
+    if market is not None and not isinstance(market, str):
+        raise HTTPException(status_code=400, detail="market must be a string")
+    if benchmark is not None and not isinstance(benchmark, str):
+        raise HTTPException(status_code=400, detail="benchmark must be a string")
+    if not isinstance(range_period, str):
+        raise HTTPException(status_code=400, detail="range must be a string")
 
     if market and market.lower() == "india" and ".NS" not in symbol.upper() and ".BO" not in symbol.upper():
         symbol = f"{symbol}.NS"
 
-    safe_symbol = symbol.replace(".", "_")
+    safe_symbol = _safe_filename_symbol(symbol)
 
     if report_format != "quantstats":
         raise HTTPException(status_code=400, detail="Only 'quantstats' report format is supported.")
@@ -99,9 +167,10 @@ def generate_research_report_file(payload: Dict[str, Any] = Body(...)):
             returns,
             benchmark=benchmark_returns,
             output=str(filepath),
-            title=f"QuantStats Research Report - {symbol}",
+            title=f"QuantStats Research Report - {_title_symbol(symbol)}",
             download_filename=filename,
         )
+        _sweep_reports()
 
         return {
             "success": True,
@@ -237,11 +306,19 @@ def interpret_research_image(payload: Dict[str, Any] = Body(...)):
 
 @router.get("/report/download/{filename}")
 def download_research_report(filename: str):
-    file_path = REPORTS_DIR / filename
-    if not file_path.exists():
+    file_path = _resolve_report_file(filename)
+    if file_path is None:
         raise HTTPException(status_code=404, detail="Report not found")
     if filename.endswith(".html"):
         media_type = "text/html"
     else:
         media_type = "application/pdf"
-    return FileResponse(path=str(file_path), filename=filename, media_type=media_type)
+    return FileResponse(
+        path=str(file_path),
+        filename=filename,
+        media_type=media_type,
+        headers={
+            "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; img-src data:",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )

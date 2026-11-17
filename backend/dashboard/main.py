@@ -66,7 +66,7 @@ def analyze_crowd_signal(request: CrowdInsightRequest):
 def get_dashboard_sector_news(
     market: str = Query("US"),
     sector: Optional[str] = Query(None),
-    limit: int = Query(20),
+    limit: int = Query(20, ge=1, le=100),
     db=Depends(get_db),
 ):
     """
@@ -86,7 +86,8 @@ def get_dashboard_sector_news(
         for row in rows:
             r = dict(row)
             sec = r.get("sector", "Unknown")
-            if r.get("published_at"): r["published_at"] = r["published_at"].isoformat()
+            if r.get("published_at") and hasattr(r["published_at"], "isoformat"):
+                r["published_at"] = r["published_at"].isoformat()
             if sec not in grouped: grouped[sec] = []
             grouped[sec].append(r)
 

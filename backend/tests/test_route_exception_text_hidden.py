@@ -113,7 +113,7 @@ def test_dashboard_signal_components_hide_exception_text(monkeypatch):
     insider = service._build_insider_component("AAPL", True, "key", {})
     assert insider.label == "error" and SECRET not in repr(insider)
 
-    monkeypatch.setattr(service, "NewsFetcher", lambda: types.SimpleNamespace(get_stock_news=_boom))
+    monkeypatch.setattr(service, "NewsService", lambda: types.SimpleNamespace(search_news=_boom))
     news = service._build_news_component("AAPL", True)
     assert news.label == "error" and SECRET not in repr(news)
 
@@ -221,19 +221,24 @@ def test_fred_routes_hide_exception_text(boom_fred, path):
 
 
 def test_fred_sync_hides_exception_text(boom_fred):
-    r = boom_fred.post("/api/fred/sync/all")
+    from backend.auth import create_access_token
+
+    headers = {"Authorization": "Bearer " + create_access_token("fred-boom-user")[0]}
+    r = boom_fred.post("/api/fred/sync/all", headers=headers)
     _assert_hidden(r, 500, {"detail": "FRED data request failed"})
 
 
 def test_fred_service_unconfigured_message_is_fixed(client, monkeypatch):
+    """A live-provider request without credentials maps to a fixed 503 (no provider text)."""
     from backend.markets import fred_routes
+    from backend.markets.fred_service import FredDataService, FredUnavailable
 
-    def missing_key():
-        raise ValueError(f"FRED_API_KEY is {SECRET}")
+    def missing_key(self, *a, **kw):
+        raise FredUnavailable(f"FRED_API_KEY is {SECRET}")
 
-    monkeypatch.setattr(fred_routes, "FredDataService", lambda *a, **kw: missing_key())
-    r = client.get("/api/fred/dashboard")
-    _assert_hidden(r, 500, {"detail": "FRED service is not configured"})
+    monkeypatch.setattr(FredDataService, "fetch_series", missing_key)
+    r = client.get("/api/fred/latest-live?series_ids=GDP")
+    _assert_hidden(r, 503, {"detail": "FRED service is not configured"})
 
 
 def test_eia_error_does_not_return_url_or_api_key(monkeypatch):
@@ -322,20 +327,6 @@ def test_super_agent_hides_exception_text(client, monkeypatch):
     monkeypatch.setattr(super_agent, "_get_pipeline", lambda: types.SimpleNamespace(run=_aboom))
     r = client.post("/api/chat/super-agent", json={"query": "analyse AAPL"})
     _assert_hidden(r, 500, {"detail": "Super agent request failed"})
-
-
-def test_legacy_research_routes_hide_exception_text(client, monkeypatch):
-    from backend.chat import research_legacy
-
-    monkeypatch.setattr(research_legacy, "generate_research_report", _boom)
-    r = client.post("/api/chat/api/research/analyze", json={"symbol": "AAPL"})
-    _assert_hidden(r, 500, {"detail": "Research request failed"})
-
-    # The legacy service stores raw exception text in report["error"]; it must not be forwarded.
-    monkeypatch.setattr(research_legacy, "generate_research_report",
-                        lambda symbol: {"ticker": symbol, "error": SECRET, "status": "error"})
-    r = client.post("/api/chat/api/research/analyze", json={"symbol": "AAPL"})
-    _assert_hidden(r, 400, {"detail": "Research report unavailable"})
 
 
 # --------------------------------------------------------------------------- core

@@ -13,6 +13,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import and_, func
 
+try:
+    from groq import Groq
+except ImportError:
+    Groq = None
+
 from backend.database.models import SectorNewsItem, SectorSnapshot, SectorScore
 
 # Unified services
@@ -179,33 +184,11 @@ def _normalize_news_item(item: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _fetch_ddg_news(query: str, max_results: int) -> List[Dict[str, Any]]:
-    if not DDGS:
+    """Use the maintained news provider chain rather than an undefined DDGS client."""
+    if max_results <= 0:
         return []
-    if not max_results or max_results <= 0:
-        return []
-    results: List[Dict[str, Any]] = []
-
-    ddg_args = {}
-    if SECTOR_INTEL_HTTP_TIMEOUT_SECONDS and SECTOR_INTEL_HTTP_TIMEOUT_SECONDS > 0:
-        ddg_args["timeout"] = SECTOR_INTEL_HTTP_TIMEOUT_SECONDS
-    try:
-        try:
-            ddg = DDGS(**ddg_args)
-        except TypeError:
-            ddg = DDGS()
-        with ddg as client:
-            results = list(client.news(keywords=query, max_results=max_results))
-    except Exception:
-        try:
-            try:
-                ddg = DDGS(**ddg_args)
-            except TypeError:
-                ddg = DDGS()
-            with ddg as client:
-                results = list(client.text(keywords=query, max_results=max_results))
-        except Exception:
-            results = []
-    return [_normalize_news_item(result) for result in results if isinstance(result, dict)]
+    from backend.news.service import NewsService
+    return [_normalize_news_item(item) for item in NewsService().search_news(query)[:max_results]]
 
 
 def _safe_json_loads(content: str) -> Any:
@@ -247,8 +230,8 @@ def _fetch_yf_price_metrics(symbols: List[str], period: str) -> Dict[str, Dict[s
             "current_price": quote.get("price"),
             "return_percent": quote.get("change_percent"), # Compatibility
             "change_percent": quote.get("change_percent"),
-            "momentum_1m_pct": quote.get("change_percent"), # Fallback since we don't have 1m in quotes yet
-            "volatility_annualized_pct": 20.0 # Default fallback
+            "momentum_1m_pct": None, # Daily quotes do not establish monthly momentum.
+            "volatility_annualized_pct": None # Requires historical returns.
         }
     
     return metrics
@@ -295,6 +278,29 @@ def get_markets() -> List[str]:
     raw = SECTOR_INTEL_MARKETS
     markets = [m.strip().upper() for m in raw.split(",") if m.strip()]
     return markets or ["US", "IN"]
+
+
+_MARKET_ALIASES = {"USA": "US", "INDIA": "IN"}
+
+
+def normalize_market(market: Any) -> Optional[str]:
+    """Canonical (upper-case, alias-resolved) market code, or None if not a supported market."""
+    if not isinstance(market, str):
+        return None
+    code = market.strip().upper()
+    code = _MARKET_ALIASES.get(code, code)
+    return code if code in get_markets() else None
+
+
+def resolve_sector(market: str, sector: Any) -> Optional[str]:
+    """Canonical sector name (case-insensitive match against the market's sector list), else None."""
+    if not isinstance(sector, str) or not sector.strip():
+        return None
+    wanted = sector.strip().lower()
+    for name in get_sector_list(market):
+        if name.lower() == wanted:
+            return name
+    return None
 
 
 def get_sector_list(market: str) -> List[str]:
@@ -351,7 +357,7 @@ def analyze_sector_with_llm(
 
     if not SECTOR_INTEL_LLM_ENABLED:
         return {}
-    if Groq is None:
+    if Groq is None or not os.getenv("GROQ_API_KEY"):
         return {}
     now_monotonic = time.monotonic()
     if _llm_disabled_until_monotonic and now_monotonic < _llm_disabled_until_monotonic:
@@ -488,27 +494,11 @@ def _build_stock_payload(market: str, sector: str) -> List[Dict[str, Any]]:
 
 
 def _default_sector_analysis(sector: str, stock_payload: List[Dict[str, Any]]) -> Dict[str, Any]:
-    top_stocks = []
-    for stock_item in stock_payload[:5]:
-        top_stocks.append({
-            "symbol": stock_item.get("symbol"),
-            "name": stock_item.get("name"),
-            "signal": "neutral",
-            "reason": "Limited news data; using baseline metrics."
-        })
     return {
-        "sector_summary": f"{sector} sector snapshot based on limited signals.",
-        "momentum": "neutral",
-        "risk_notes": "Insufficient data for detailed risk assessment.",
-        "who_should_invest": "Investors with appropriate risk tolerance for sector-specific volatility.",
-        "suitable_profiles": {
-            "risk": ["moderate"],
-            "horizon_years_min": 3,
-            "horizon_years_max": 10,
-            "goals": ["growth"]
-        },
-        "top_stocks": top_stocks,
-        "score": 50
+        "sector_summary": f"{sector}: source data collected; AI analysis unavailable.",
+        "momentum": "unavailable", "risk_notes": "Risk analysis unavailable.",
+        "who_should_invest": None, "suitable_profiles": {},
+        "top_stocks": stock_payload[:5], "score": None,
     }
 
 
@@ -585,7 +575,8 @@ def refresh_sector(
 
     stock_payload = _build_stock_payload(market, sector)
     analysis = analyze_sector_with_llm(sector, market, news_items, stock_payload)
-    if not analysis:
+    used_fallback = not bool(analysis)
+    if used_fallback:
         analysis = _default_sector_analysis(sector, stock_payload)
 
     suitable_profiles = analysis.get("suitable_profiles") or {}
@@ -605,7 +596,7 @@ def refresh_sector(
         suitable_profiles=suitable_profiles,
         top_stocks=analysis.get("top_stocks"),
         score=score,
-        llm_model=SECTOR_INTEL_LLM_MODEL,
+        llm_model="unavailable" if used_fallback else SECTOR_INTEL_LLM_MODEL,
     )
     db.add(snapshot)
 
@@ -623,6 +614,7 @@ def refresh_sector(
         "market": market,
         "status": "refreshed",
         "news_count": len(news_items),
+        "analysis_status": "unavailable" if used_fallback else "model",
         "snapshot_as_of": snapshot.as_of.isoformat(),
     }
 
@@ -672,6 +664,8 @@ def refresh_all_sectors(
 
 def list_latest_snapshots(db, market: Optional[str] = None) -> List[SectorSnapshot]:
     if market:
+        # Stored rows use canonical upper-case codes; match case-insensitively on input.
+        market = normalize_market(market) or str(market).strip().upper()
         subq = (
             db.query(
                 SectorSnapshot.sector,
@@ -719,7 +713,7 @@ def recommend_sectors_for_user(
         risk_tolerance = _risk_label_from_score(risk_score)
 
     def _score_snapshot(snapshot: SectorSnapshot) -> Tuple[float, Dict[str, Any]]:
-        base = float(snapshot.score or 50.0)
+        base = float(snapshot.score)
         suitability = snapshot.suitable_profiles or {}
         bonus = 0.0
 
@@ -751,5 +745,5 @@ def recommend_sectors_for_user(
             "as_of": snapshot.as_of.isoformat() if snapshot.as_of else None,
         }
 
-    ranked = sorted([_score_snapshot(snapshot_item) for snapshot_item in snapshots], key=lambda x: x[0], reverse=True)
+    ranked = sorted([_score_snapshot(snapshot_item) for snapshot_item in snapshots if _is_valid_number(snapshot_item.score)], key=lambda x: x[0], reverse=True)
     return [row[1] for row in ranked[:limit]]
