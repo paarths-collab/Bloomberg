@@ -6,7 +6,7 @@ import {
   Terminal, Send, Loader2, GripVertical,
   TrendingUp, BarChart3, AlertTriangle, Activity, Globe
 } from 'lucide-react'
-import { getWsUrl, stockAdvisorAPI, superAgentAPI, API_BASE, backtestAPI, extractErrorMessage, type SuperAgentResponse } from '@/lib/api'
+import { getWsUrl, stockAdvisorAPI, superAgentAPI, backtestAPI, extractErrorMessage, type SuperAgentResponse } from '@/lib/api'
 import { MessageBubble, AnalysisRack, type Message, type RackSnapshot, type ChartPoint } from '@/components/ChatComponents'
 
 const WS_URL = getWsUrl('/ws/live')
@@ -130,17 +130,17 @@ const buildFinalVerdict = (bull?: Record<string, unknown>, bear?: Record<string,
   ]
     .map(item => {
       const verdict = typeof item.payload?.verdict === 'string' ? item.payload.verdict.toUpperCase() : 'HOLD'
-      const confidence = typeof item.payload?.confidence === 'number' ? item.payload.confidence : 0.5
+      const confidence = typeof item.payload?.confidence === 'number' ? item.payload.confidence : null
       const provider = typeof item.payload?.provider === 'string' ? item.payload.provider : 'N/A'
       return { ...item, verdict, confidence, provider }
     })
 
   const ranked = options
     .filter(item => item.verdict === 'BUY' || item.verdict === 'SELL')
-    .sort((a, b) => b.confidence - a.confidence)
+    .sort((a, b) => (b.confidence ?? -1) - (a.confidence ?? -1))
 
   const winner = ranked[0] || options.find(item => item.label === 'Neutral') || options[0]
-  const confidencePct = `${(winner.confidence * 100).toFixed(0)}%`
+  const confidencePct = winner.confidence === null ? 'confidence unavailable' : `${(winner.confidence * 100).toFixed(0)}%`
 
   return `## Final Verdict\n\n${winner.verdict} (${confidencePct}) based on the ${winner.label.toLowerCase()} signal from ${winner.provider}.`
 }
@@ -544,18 +544,14 @@ export default function ChatPage() {
 
     if (shouldUseBacktest) {
       try {
-        const response = await fetch(`${API_BASE}/backtest/run`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            symbol: btTicker!,
-            market: getMarketFromTicker(btTicker!),
-            strategies,
-            interval: '1d',
-            lookback_days: 365,
-          }),
-        }).then(r => r.json())
-        const content = formatBacktestContent(response, btTicker!, strategies)
+        const response = await backtestAPI.run({
+          symbol: btTicker!,
+          market: getMarketFromTicker(btTicker!),
+          strategies,
+          interval: '1d',
+          range: '1y',
+        })
+        const content = formatBacktestContent(response as Record<string, unknown>, btTicker!, strategies)
         setMessages(prev => {
           const filtered = prev.filter(m => !m.isStreaming)
           return [...filtered, { id: uid(), role: 'assistant', content, timestamp: new Date() }]

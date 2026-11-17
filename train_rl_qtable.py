@@ -20,9 +20,8 @@ A properly trained Q-table looks like this:
     "Bear_mean_reversion":       0.9   <- learned: good in bear
     "Choppy_rsi_reversal":       1.1   <- learned: good in choppy
 
-Run:
-    cd C:\\Users\\PaarthGala\\Bloomberg
-    .\\backend\\.venv\\Scripts\\python.exe train_rl_qtable.py
+Run from the repository root (the directory containing this file):
+    python train_rl_qtable.py
 """
 
 from __future__ import annotations
@@ -66,7 +65,7 @@ try:
     from backend.services.strategies.strategy_adapter import STRATEGY_REGISTRY
 except Exception as exc:
     print(f"Backend import failed: {exc}")
-    print("Run from project root: cd C:\\Users\\PaarthGala\\Bloomberg")
+    print(f"Run from the repository root: cd {Path(__file__).resolve().parent}")
     raise SystemExit(1)
 
 print("Backend modules loaded.\n")

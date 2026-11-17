@@ -3,6 +3,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from .service import NewsService
 from .live_service import live_news_service
+from .public_fetch import UnsafeArticleURL
 
 logger = logging.getLogger(__name__)
 
@@ -13,16 +14,16 @@ _NEWS_SERVICE = NewsService()
 @router.get("/latest")
 def get_latest_news(
     query: str = Query("stock market news"),
-    limit: int = 10
+    limit: int = Query(10, ge=1, le=50),
 ):
     """
     Fetches latest news from GNews/DDG/Tavily.
     """
     try:
         return _NEWS_SERVICE.search_news(query=query)[:limit]
-    except Exception as e:
+    except Exception:
         logger.exception("News fetch failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="News request failed")
 
 @router.get("/live")
 def get_live_news(
@@ -37,7 +38,7 @@ def get_live_news(
         if cached_only:
             return live_news_service.get_cached_news(query=query, limit=limit)
         return live_news_service.get_news(query=query, limit=limit)
-    except Exception as e:
+    except Exception:
         logger.exception("Live news failed; returning cached fallback")
         try:
             return live_news_service.get_cached_news(query=query, limit=limit)
@@ -50,7 +51,7 @@ def get_live_news(
                 "stale": True,
                 "articles": [],
                 "source_count": 0,
-                "message": f"Live news temporarily unavailable: {str(e)}",
+                "message": "Live news temporarily unavailable",
             }
 
 @router.get("/article-summary")
@@ -61,6 +62,8 @@ def get_article_summary(url: str = Query(...)):
     try:
         result = live_news_service.summarize_article(url=url)
         return result
-    except Exception as e:
+    except UnsafeArticleURL:
+        raise HTTPException(status_code=400, detail="Article URL must identify a public HTTP(S) server on port 80 or 443")
+    except Exception:
         logger.exception("Article summary failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Article summary request failed")

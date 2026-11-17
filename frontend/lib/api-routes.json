@@ -1,0 +1,38 @@
+{
+  "auth.refresh": { "method": "POST", "path": "/api/auth/refresh" },
+  "auth.guest": { "method": "POST", "path": "/api/auth/guest" },
+
+  "chat.superAgent": { "method": "POST", "path": "/api/chat/super-agent" },
+  "chat.stockAdvisorMultiPov": { "method": "POST", "path": "/api/chat/stock-advisor/multi-pov" },
+  "chat.sentimentAnalyze": { "method": "GET", "path": "/api/chat/sentiment/analyze/{symbol}" },
+
+  "research.report": { "method": "POST", "path": "/api/research/report" },
+  "research.reportDownload": { "method": "GET", "path": "/api/research/report/download/{filename}" },
+  "research.interpretImage": { "method": "POST", "path": "/api/research/interpret-image" },
+
+  "backtest.run": { "method": "POST", "path": "/api/backtest/run" },
+  "backtest.interpret": { "method": "POST", "path": "/api/backtest/interpret" },
+  "backtest.interpretImage": { "method": "POST", "path": "/api/backtest/interpret-image" },
+  "backtest.quantstatsReport": { "method": "POST", "path": "/api/backtest/quantstats-report" },
+  "backtest.reportDownload": { "method": "GET", "path": "/api/backtest/report/download/{filename}" },
+
+  "markets.overview": { "method": "GET", "path": "/api/markets/overview" },
+  "markets.candles": { "method": "GET", "path": "/api/markets/candles/{symbol}" },
+
+  "fred.latestLive": { "method": "GET", "path": "/api/fred/latest-live" },
+  "fred.latestCached": { "method": "GET", "path": "/api/fred/latest-cached" },
+
+  "sectors.treemapIndices": { "method": "GET", "path": "/api/sectors/treemap/indices" },
+  "sectors.treemapIndicesLive": { "method": "GET", "path": "/api/sectors/treemap/indices/live" },
+  "sectors.treemapIndex": { "method": "GET", "path": "/api/sectors/treemap/index/{index_id}" },
+  "sectors.treemapStock": { "method": "GET", "path": "/api/sectors/treemap/stock/{symbol}" },
+
+  "peers.compare": { "method": "GET", "path": "/api/peers/compare/{symbol}" },
+  "fundamentals.summary": { "method": "GET", "path": "/api/technical/fundamentals/summary/{symbol}" },
+  "news.live": { "method": "GET", "path": "/api/news/live" },
+
+  "investorProfile.portfolio": { "method": "GET", "path": "/api/profile/portfolio" },
+  "investorProfile.risk": { "method": "GET", "path": "/api/profile/portfolio/risk" },
+
+  "ws.live": { "method": "WS", "path": "/ws/live" }
+}

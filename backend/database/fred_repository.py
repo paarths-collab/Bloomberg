@@ -130,6 +130,15 @@ class FredRepository:
     # QUERY OPERATIONS
     # ===============================
 
+    def get_series(self, series_id: str, start_date: Optional[date] = None,
+                   end_date: Optional[date] = None) -> List[FredData]:
+        query = self.db.query(FredData).filter(FredData.series_id == series_id)
+        if start_date is not None:
+            query = query.filter(FredData.date >= start_date)
+        if end_date is not None:
+            query = query.filter(FredData.date <= end_date)
+        return query.order_by(FredData.date.asc()).all()
+
     def get_latest(self, series_id: str) -> Optional[FredData]:
         return (
             self.db.query(FredData)

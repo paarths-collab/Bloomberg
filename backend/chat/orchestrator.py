@@ -5,6 +5,7 @@ Manages conversation flow, intent clarification, and pipeline execution.
 import os
 import asyncio
 import json
+import logging
 from typing import Dict, List, Any, Optional, Callable, AsyncGenerator, Tuple
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -12,6 +13,8 @@ from enum import Enum
 
 # AutoGen configuration
 USE_AUTOGEN = True  # Enable AutoGen features
+
+logger = logging.getLogger(__name__)
 
 # Import AutoGen via centralized setup
 try:
@@ -141,13 +144,26 @@ class ChatOrchestrator:
         session_id: str,
         user_id: str = "default"
     ) -> ConversationContext:
-        """Get existing or create new conversation context"""
-        if session_id not in self.conversations:
-            self.conversations[session_id] = ConversationContext(
-                session_id=session_id,
-                user_id=user_id
-            )
+        """Get existing or create new conversation context.
+
+        A session belongs to the identity that created it; asking for it as a
+        different identity raises PermissionError (callers map this to 403).
+        """
+        existing = self.conversations.get(session_id)
+        if existing is not None:
+            if existing.user_id != user_id:
+                raise PermissionError("Session belongs to another user")
+            return existing
+        self.conversations[session_id] = ConversationContext(
+            session_id=session_id,
+            user_id=user_id
+        )
         return self.conversations[session_id]
+
+    def session_accessible(self, session_id: str, user_id: str) -> bool:
+        """True if the session does not exist yet or is owned by ``user_id``."""
+        existing = self.conversations.get(session_id)
+        return existing is None or existing.user_id == user_id
     
     async def process_message(
         self,
@@ -187,11 +203,12 @@ class ChatOrchestrator:
                 }
                 ctx.state = ConversationState.IDLE
                 
-        except Exception as e:
+        except Exception:
+            logger.exception("Chat orchestrator failed")
             yield {
                 "type": "error",
-                "content": f"Sorry, I encountered an error: {str(e)}",
-                "metadata": {"error": str(e)}
+                "content": "Sorry, I encountered an error. Please try again.",
+                "metadata": {"error": "Chat request failed"}
             }
             ctx.state = ConversationState.IDLE
     
@@ -557,9 +574,11 @@ class ChatOrchestrator:
             return True
         return False
 
-    def get_conversation_history(self, session_id: str) -> List[Dict]:
-        """Get conversation history for a session"""
+    def get_conversation_history(self, session_id: str, user_id: Optional[str] = None) -> List[Dict]:
+        """Get conversation history for a session (only if owned by ``user_id`` when given)"""
         if session_id not in self.conversations:
+            return []
+        if user_id is not None and self.conversations[session_id].user_id != user_id:
             return []
         return [
             {
@@ -570,9 +589,10 @@ class ChatOrchestrator:
             for m in self.conversations[session_id].messages
         ]
     
-    def clear_conversation(self, session_id: str):
-        """Clear a conversation"""
-        if session_id in self.conversations:
+    def clear_conversation(self, session_id: str, user_id: Optional[str] = None):
+        """Clear a conversation (only if owned by ``user_id`` when given)"""
+        ctx = self.conversations.get(session_id)
+        if ctx is not None and (user_id is None or ctx.user_id == user_id):
             del self.conversations[session_id]
 
     async def _llm_detect_ticker(self, message: str) -> Tuple[Optional[str], Optional[str]]:

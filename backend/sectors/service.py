@@ -3,12 +3,25 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Optional, Tuple
 
 # Import from unified service layer
 from backend.services.market_data import market_service
 
 logger = logging.getLogger(__name__)
+
+# Treemap markets with a bundled index file. Cache keys are restricted to these.
+SUPPORTED_TREEMAP_MARKETS = ("india", "us")
+_TREEMAP_MARKET_ALIASES = {"in": "india", "usa": "us"}
+
+
+def normalize_treemap_market(market: Any) -> Optional[str]:
+    """Canonical lower-case treemap market, or None if unsupported."""
+    if not isinstance(market, str):
+        return None
+    key = market.strip().lower()
+    key = _TREEMAP_MARKET_ALIASES.get(key, key)
+    return key if key in SUPPORTED_TREEMAP_MARKETS else None
 
 class SectorsService:
     """
@@ -168,7 +181,9 @@ class SectorsService:
         }
 
     def _get_market_indices(self, market: str) -> List[Dict[str, Any]]:
-        market = market.lower()
+        market = normalize_treemap_market(market)
+        if market is None:
+            return []  # unsupported market: never create a cache entry for it
         cached = self._market_indices_cache.get(market)
         if cached and (time.time() - cached.get("cached_at", 0) < self._cache_ttl):
             return cached.get("data", [])
@@ -215,17 +230,13 @@ class SectorsService:
 
     def get_indices_live(self, market: str = "india") -> List[Dict[str, Any]]:
         """[OPTIMIZED] Get all indices with real-time performance."""
-        market_key = (market or "india").lower()
+        market_key = normalize_treemap_market(market or "india")
+        if market_key is None:
+            return []
+        market = market_key
         cached = self._live_indices_cache.get(market_key)
         if cached and (time.time() - cached.get("cached_at", 0) < self._live_cache_ttl):
             return cached.get("data", [])
-
-        previous_snapshot = cached.get("data", []) if cached else []
-        previous_by_id = {
-            item.get("id"): item
-            for item in previous_snapshot
-            if isinstance(item, dict) and item.get("id")
-        }
 
         indices = self._get_market_indices(market)
 
@@ -255,81 +266,18 @@ class SectorsService:
             retry_quotes = market_service.fetch_multiple_quotes(list(set(unresolved_index_symbols)), max_workers=4)
             index_quotes.update(retry_quotes)
 
-        # Stage 2: for unresolved indices, fetch only one constituent each as fallback.
-        unresolved_index_ids = []
-        for idx in indices:
-            sym = idx.get("symbol")
-            if not sym:
-                unresolved_index_ids.append(idx.get("id"))
-                continue
-            q = self._lookup_quote_from_prefetched(sym, market, index_quotes)
-            if q.get("price") is None and self._extract_change_percent(q) is None:
-                unresolved_index_ids.append(idx.get("id"))
-
-        fallback_symbol_by_index_id: Dict[str, str] = {}
-        fallback_symbols = set()
-        unresolved_set = {idx_id for idx_id in unresolved_index_ids if idx_id}
-        for idx in indices:
-            idx_id = idx.get("id")
-            if idx_id not in unresolved_set:
-                continue
-            sampled = self._sample_constituent_symbols(idx, market, sample_size=1)
-            if sampled:
-                fallback_symbol_by_index_id[idx_id] = sampled[0]
-                fallback_symbols.add(sampled[0])
-
-        fallback_quotes = market_service.fetch_multiple_quotes(list(fallback_symbols), max_workers=8) if fallback_symbols else {}
-
-        tracked_symbols = index_symbol_list + list(fallback_symbols)
-        merged_quotes = {**index_quotes, **fallback_quotes}
-        _, missing_symbols = self._get_quote_coverage(tracked_symbols, merged_quotes)
-        if missing_symbols:
-            logger.info(
-                "[sectors.live] market=%s missing_quotes=%d symbols=%s",
-                market,
-                len(missing_symbols),
-                missing_symbols[:20],
-            )
-
-        valid_quotes = {
-            k: v
-            for k, v in merged_quotes.items()
-            if isinstance(v, dict) and (v.get("price") is not None or self._extract_change_percent(v) is not None)
-        }
-
+        # An individual constituent is not a substitute for its index's price or return.
         results = []
         for idx in indices:
-            sym = idx.get("symbol")
-            q = {}
-            cp = None
-            price = None
-            if sym:
-                q = self._lookup_quote_from_prefetched(sym, market, valid_quotes)
-                cp = self._extract_change_percent(q)
-                price = q.get("price")
-
-                if (cp is None or price is None) and idx.get("id") in fallback_symbol_by_index_id:
-                    fq = valid_quotes.get(fallback_symbol_by_index_id[idx.get("id")], {})
-                    if cp is None:
-                        cp = self._extract_change_percent(fq)
-                    if price is None:
-                        price = fq.get("price")
-            else:
-                if idx.get("id") in fallback_symbol_by_index_id:
-                    fq = valid_quotes.get(fallback_symbol_by_index_id[idx.get("id")], {})
-                    cp = self._extract_change_percent(fq)
-                    price = fq.get("price")
-
-            prev = previous_by_id.get(idx.get("id"), {})
-            if price is None and prev.get("price") is not None:
-                price = prev.get("price")
-            if cp is None and prev.get("change_percent") is not None:
-                cp = prev.get("change_percent")
-
+            symbol = idx.get("symbol")
+            quote = self._lookup_quote_from_prefetched(symbol, market, index_quotes) if symbol else {}
+            price = quote.get("price")
             results.append({
                 **idx,
-                "change_percent": cp,
-                "price": price
+                "price": price,
+                "change_percent": self._extract_change_percent(quote),
+                "price_status": "available" if price is not None else "unavailable",
+                "quote_timestamp": quote.get("timestamp"),
             })
 
         self._live_indices_cache[market_key] = {"data": results, "cached_at": time.time()}
@@ -337,6 +285,7 @@ class SectorsService:
 
     def get_index_constituents(self, index_id: str, market: str = "india", include_prices: bool = True) -> Dict[str, Any]:
         """Get listed stocks for a sector index with latest pricing."""
+        market = normalize_treemap_market(market) or market
         indices = self._get_market_indices(market)
         idx_data = next((i for i in indices if i.get("id") == index_id), None)
         if not idx_data: return {"error": "Sector not found"}

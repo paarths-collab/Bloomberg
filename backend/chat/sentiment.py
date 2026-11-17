@@ -2,6 +2,7 @@
 Sentiment Analysis API Routes
 Endpoints for stock sentiment analysis with AI
 """
+import logging
 import math
 from fastapi import APIRouter, HTTPException, Query
 from typing import List, Optional
@@ -11,6 +12,8 @@ from .core.stock_sentiment_service import (
     analyze_stock_sentiment,
     analyze_multiple_stocks,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/sentiment", tags=["Sentiment Analysis"])
 
@@ -34,8 +37,10 @@ class BatchSentimentRequest(BaseModel):
     symbols: List[str]
 
 
+# These handlers do blocking market-data / LLM I/O and contain no awaits, so they are plain `def`:
+# FastAPI runs them in its threadpool instead of stalling the event loop.
 @router.get("/analyze/{symbol}")
-async def get_sentiment_analysis(
+def get_sentiment_analysis(
     symbol: str,
     market: Optional[str] = Query(None, description="Market: 'india' or 'us'")
 ):
@@ -58,15 +63,13 @@ async def get_sentiment_analysis(
         return _sanitize_floats(result)
     except HTTPException:
         raise
-    except Exception as e:
-        import traceback
-        print(f"Error analyzing sentiment for {symbol}: {e}")
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Sentiment analysis failed: {str(e)}")
+    except Exception:
+        logger.exception("Error analyzing sentiment for %s", symbol)
+        raise HTTPException(status_code=500, detail="Sentiment analysis failed")
 
 
 @router.post("/analyze")
-async def post_sentiment_analysis(request: SentimentRequest):
+def post_sentiment_analysis(request: SentimentRequest):
     """
     POST endpoint for sentiment analysis
     """
@@ -79,15 +82,13 @@ async def post_sentiment_analysis(request: SentimentRequest):
         return _sanitize_floats(result)
     except HTTPException:
         raise
-    except Exception as e:
-        import traceback
-        print(f"Error in POST sentiment analysis for {request.symbol}: {e}")
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Sentiment analysis failed: {str(e)}")
+    except Exception:
+        logger.exception("Error in POST sentiment analysis for %s", request.symbol)
+        raise HTTPException(status_code=500, detail="Sentiment analysis failed")
 
 
 @router.post("/batch")
-async def batch_sentiment_analysis(request: BatchSentimentRequest):
+def batch_sentiment_analysis(request: BatchSentimentRequest):
     """
     Analyze multiple stocks at once (max 10)
     """
@@ -100,15 +101,13 @@ async def batch_sentiment_analysis(request: BatchSentimentRequest):
             "count": len(results),
             "results": results,
         })
-    except Exception as e:
-        import traceback
-        print(f"Error in batch sentiment analysis: {e}")
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Batch analysis failed: {str(e)}")
+    except Exception:
+        logger.exception("Error in batch sentiment analysis")
+        raise HTTPException(status_code=500, detail="Batch analysis failed")
 
 
 @router.get("/quick/{symbol}")
-async def get_quick_sentiment(
+def get_quick_sentiment(
     symbol: str,
     market: Optional[str] = Query(None, description="Market: 'india' or 'us'")
 ):
@@ -135,11 +134,11 @@ async def get_quick_sentiment(
             "sentiment": result.get("sentiment"),
             "recommendation": result.get("recommendation"),
             "targetPrice": result.get("targetPrice"),
+            "analysis_source": result.get("analysis_source", "unknown"),
+            "analysis_status": result.get("analysis_status", "unavailable"),
         })
     except HTTPException:
         raise
-    except Exception as e:
-        import traceback
-        print(f"Error in quick sentiment analysis for {symbol}: {e}")
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Quick analysis failed: {str(e)}")
+    except Exception:
+        logger.exception("Error in quick sentiment analysis for %s", symbol)
+        raise HTTPException(status_code=500, detail="Quick analysis failed")

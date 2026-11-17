@@ -11,6 +11,7 @@ downloads/
 eggs/
 .eggs/
 lib/
+!frontend/lib/
 lib64/
 parts/
 sdist/
@@ -181,6 +182,10 @@ debug_output.txt
 # Generated Reports
 backend/reports/
 backend/backtest/reports/
+backend/research/reports/
+
+# Generated KPI / Q-table output (scripts/bloomberg_kpi_test.py, train_rl_qtable.py)
+/outputs/
 
 # Data Files
 backend/data/*.parquet

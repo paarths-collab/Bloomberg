@@ -50,8 +50,8 @@ class GroqAgent:
             return result["choices"][0]["message"]["content"]
             
         except Exception as e:
-            logger.error(f"Groq API call failed: {e}")
-            return f"Error calling Groq API: {str(e)}"
+            logger.exception("Groq API call failed")
+            return "Error calling Groq API"
 
     def run(self, prompt: str, model_name: str = "llama-3.3-70b-versatile") -> str:
         """
@@ -96,5 +96,5 @@ class GroqAgent:
             result = response.json()
             return result["choices"][0]["message"]["content"]
         except Exception as e:
-            logger.error(f"Groq vision API call failed: {e}")
-            return f"Error calling Groq vision API: {str(e)}"
+            logger.exception("Groq vision API call failed")
+            return "Error calling Groq vision API"

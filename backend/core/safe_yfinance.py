@@ -16,6 +16,9 @@ Usage:
     df = res["data"]
     price = float(df["Close"].iloc[-1])
 """
+import copy
+import math
+from datetime import datetime, timezone
 import time
 import logging
 import pandas as pd
@@ -24,14 +27,24 @@ import yfinance as yf
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional, Dict, Any, List, Callable
 
+from backend.common.ttl_cache import TTLCache
+
 # ─── Suppress YFinance Warnings ──────────────────────────────────────────────
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 
 logger = logging.getLogger(__name__)
 
 # ─── In-memory cache ────────────────────────────────────────────────────────
-_cache: Dict[str, Dict[str, Any]] = {}
+# Keys embed user-controlled values (symbol, range, start/end), so the cache is bounded (LRU + TTL).
 _CACHE_TTL_SECONDS = 300  # 5 minutes
+_CACHE_MAX_ENTRIES = 512
+_cache = TTLCache(maxsize=_CACHE_MAX_ENTRIES, ttl=_CACHE_TTL_SECONDS)
+
+# Values yfinance accepts; routes use these to reject bad input with 400 before it reaches the provider.
+VALID_PERIODS = frozenset({"1d", "5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "ytd", "max"})
+VALID_INTERVALS = frozenset(
+    {"1m", "2m", "5m", "15m", "30m", "60m", "90m", "1h", "1d", "5d", "1wk", "1mo", "3mo"}
+)
 
 # ─── Rate-limit delay between batch requests ─────────────────────────────────
 _RATE_LIMIT_DELAY = 0.15  # seconds
@@ -41,8 +54,17 @@ def _cache_key(symbol: str, period: str, interval: str = "") -> str:
     return f"{symbol.upper()}:{period}:{interval}"
 
 
-def _is_fresh(entry: Dict[str, Any]) -> bool:
-    return time.time() - entry.get("cached_at", 0) < _CACHE_TTL_SECONDS
+def _copy_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
+    """Result dict safe to hand out: the cached DataFrame / info dict is never shared by reference."""
+    out = dict(entry)
+    data = out.get("data")
+    if isinstance(data, pd.DataFrame):
+        out["data"] = data.copy()
+    elif isinstance(data, dict):
+        out["data"] = copy.deepcopy(data)
+    if isinstance(out.get("quote_data"), dict):
+        out["quote_data"] = dict(out["quote_data"])
+    return out
 
 
 def safe_fetch_history(
@@ -63,8 +85,9 @@ def safe_fetch_history(
     else:
         key = _cache_key(symbol, period, interval)
         
-    if key in _cache and _is_fresh(_cache[key]):
-        return _cache[key]
+    cached = _cache.get(key)
+    if cached is not None:
+        return _copy_entry(cached)
 
     if rate_limit:
         time.sleep(_RATE_LIMIT_DELAY)
@@ -81,13 +104,14 @@ def safe_fetch_history(
             result = {"status": "no_data", "data": None}
         else:
             result = {"status": "ok", "data": df, "cached_at": time.time()}
-            _cache[key] = result
+            _cache.set(key, result)
+            result = _copy_entry(result)  # the caller must not share the cached frame
 
         return result
 
-    except Exception as e:
-        logger.warning(f"[safe_yfinance] fetch_history({symbol}) failed: {e}")
-        return {"status": "error", "error": str(e), "data": None}
+    except Exception:
+        logger.exception("[safe_yfinance] fetch_history(%s) failed", symbol)
+        return {"status": "error", "error": "Market data request failed", "data": None}
 
 
 def safe_fetch_info(symbol: str) -> Dict[str, Any]:
@@ -97,8 +121,9 @@ def safe_fetch_info(symbol: str) -> Dict[str, Any]:
     symbol = symbol.upper().strip()
     key = f"INFO:{symbol}"
     
-    if key in _cache and _is_fresh(_cache[key]):
-        return _cache[key]
+    cached = _cache.get(key)
+    if cached is not None:
+        return _copy_entry(cached)
 
     try:
         ticker = yf.Ticker(symbol)
@@ -107,33 +132,108 @@ def safe_fetch_info(symbol: str) -> Dict[str, Any]:
             return {"status": "no_data", "data": {}}
 
         result = {"status": "ok", "data": info, "cached_at": time.time()}
-        _cache[key] = result
-        return result
+        _cache.set(key, result)
+        return _copy_entry(result)
 
-    except Exception as e:
-        logger.warning(f"[safe_yfinance] fetch_info({symbol}) failed: {e}")
-        return {"status": "error", "error": str(e), "data": {}}
+    except Exception:
+        logger.exception("[safe_yfinance] fetch_info(%s) failed", symbol)
+        return {"status": "error", "error": "Market data request failed", "data": {}}
 
 
-def safe_get_price(symbol: str) -> Optional[float]:
+def _positive_finite(value: Any) -> Optional[float]:
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) and v > 0 else None
+
+
+def _epoch_to_iso(value: Any) -> Optional[str]:
+    """ISO-8601 UTC for an epoch-seconds value (e.g. yfinance regularMarketTime), else None."""
+    try:
+        seconds = float(value)
+        if not math.isfinite(seconds) or seconds <= 0:
+            return None
+        return datetime.fromtimestamp(seconds, tz=timezone.utc).isoformat()
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+
+
+def safe_get_price_quote(symbol: str) -> Dict[str, Any]:
     """
-    Safely get the current price for a symbol.
+    Current price together with where it came from.
+
+    Returns ``{"price": float | None, "source": str | None, "as_of": str | None}``:
+      * ``source == "live"``           currentPrice / regularMarketPrice from the provider's quote
+                                       (``as_of`` = regularMarketTime when the provider gives it)
+      * ``source == "previous_close"`` the provider's previousClose (no quote time; ``as_of`` None)
+      * ``source == "last_close_5d"``  last close of the 5-day history (``as_of`` = that bar's date)
+      * ``price is None`` (source None) when nothing usable was found.
     """
-    # 1. Check info first (fast)
     info_res = safe_fetch_info(symbol)
     if info_res["status"] == "ok":
-        info = info_res["data"]
-        price = info.get('currentPrice') or info.get('regularMarketPrice') or info.get('previousClose')
-        if price: return float(price)
+        info = info_res["data"] or {}
+        for field, source in (
+            ("currentPrice", "live"),
+            ("regularMarketPrice", "live"),
+            ("previousClose", "previous_close"),
+        ):
+            price = _positive_finite(info.get(field))
+            if price is not None:
+                as_of = _epoch_to_iso(info.get("regularMarketTime")) if source == "live" else None
+                return {"price": price, "source": source, "as_of": as_of}
 
-    # 2. Fallback to short history
     hist_res = safe_fetch_history(symbol, period="5d")
     if hist_res["status"] == "ok":
         df = hist_res["data"]
         if df is not None and not df.empty:
-            return float(df["Close"].iloc[-1])
-            
-    return None
+            price = _positive_finite(df["Close"].iloc[-1])
+            if price is not None:
+                last = df.index[-1]
+                as_of = last.isoformat() if hasattr(last, "isoformat") else str(last)
+                return {"price": price, "source": "last_close_5d", "as_of": as_of}
+
+    return {"price": None, "source": None, "as_of": None}
+
+
+def safe_get_price(symbol: str) -> Optional[float]:
+    """
+    Safely get the current price for a symbol (bare number; see safe_get_price_quote for the source).
+    """
+    return safe_get_price_quote(symbol)["price"]
+
+
+def candles_from_frame(df: pd.DataFrame, ndigits: Optional[int] = None) -> List[Dict[str, Any]]:
+    """
+    OHLCV DataFrame -> candle dicts, JSON-safe and without invented values.
+
+    A row whose open/high/low/close is missing or non-finite is dropped. Volume that is missing or
+    non-finite is reported as None (JSON null), never as 0. ``ndigits`` rounds prices when given.
+    """
+    def num(row, name):
+        try:
+            raw = row.get(name)
+            return float(raw) if raw is not None else float("nan")
+        except (TypeError, ValueError):
+            return float("nan")
+
+    candles: List[Dict[str, Any]] = []
+    for idx, row in df.iterrows():
+        o, h, l, c = (num(row, n) for n in ("Open", "High", "Low", "Close"))
+        if not all(math.isfinite(v) for v in (o, h, l, c)):
+            continue
+        vol = num(row, "Volume")
+        if ndigits is not None:
+            o, h, l, c = (round(v, ndigits) for v in (o, h, l, c))
+        candles.append({
+            "date": idx.strftime('%Y-%m-%d') if hasattr(idx, 'strftime') else str(idx),
+            "open": o,
+            "high": h,
+            "low": l,
+            "close": c,
+            "volume": int(vol) if math.isfinite(vol) else None,
+        })
+    return candles
 
 
 def safe_fetch_candles(
@@ -158,19 +258,8 @@ def safe_fetch_candles(
     if res["status"] != "ok" or res["data"] is None:
         return []
 
-    df = res["data"]
     try:
-        candles = []
-        for idx, row in df.iterrows():
-            candles.append({
-                "date": idx.strftime('%Y-%m-%d') if hasattr(idx, 'strftime') else str(idx),
-                "open": round(float(row.get('Open', 0)), 2),
-                "high": round(float(row.get('High', 0)), 2),
-                "low": round(float(row.get('Low', 0)), 2),
-                "close": round(float(row.get('Close', 0)), 2),
-                "volume": int(row.get('Volume', 0))
-            })
-        return candles
+        return candles_from_frame(res["data"], ndigits=2)
     except Exception as e:
         logger.error(f"[safe_yfinance] Candle processing failed for {symbol}: {e}")
         return []
@@ -262,8 +351,9 @@ def safe_fetch_multiple_quotes(
     
     for symbol in symbols:
         key = _cache_key(symbol, "7d")
-        if key in _cache and _is_fresh(_cache[key]):
-            results[symbol] = _cache[key].get("quote_data", {})
+        cached = _cache.get(key)
+        if cached is not None and "quote_data" in cached:
+            results[symbol] = dict(cached.get("quote_data", {}))
         else:
             symbols_to_fetch.append(symbol)
             
@@ -290,30 +380,37 @@ def safe_fetch_multiple_quotes(
             for symbol in batch_symbols:
                 ticker_key = symbol.upper()
                 try:
-                    df = data[symbol] if len(batch_symbols) > 1 else data
+                    df = data
+                    if isinstance(df.columns, pd.MultiIndex):
+                        # yfinance can retain a ticker level even for a one-symbol batch.
+                        level = next((i for i in range(df.columns.nlevels) if symbol in df.columns.get_level_values(i)), None)
+                        if level is None:
+                            raise ValueError("Ticker missing from quote batch")
+                        df = df.xs(symbol, axis=1, level=level)
                     df = df.dropna(subset=['Close'])
                     if df.empty:
                         res = {"symbol": ticker_key, "price": None, "change": None, "change_percent": None}
                     else:
                         closes = df['Close'].tolist()
                         price = closes[-1]
-                        prev_close = closes[-2] if len(closes) >= 2 else price
-                        change = price - prev_close
-                        change_percent = (change / prev_close) * 100 if prev_close else 0
+                        prev_close = closes[-2] if len(closes) >= 2 else None
+                        change = price - prev_close if prev_close is not None else None
+                        change_percent = (change / prev_close) * 100 if prev_close else None
                         
                         res = {
                             "symbol": ticker_key,
                             "price": round(float(price), 2),
-                            "change": round(float(change), 2),
-                            "change_percent": round(float(change_percent), 2),
+                            "change": round(float(change), 2) if change is not None else None,
+                            "change_percent": round(float(change_percent), 2) if change_percent is not None else None,
                             "timestamp": now
                         }
                     batch_results[symbol] = res
                 except Exception:
                     batch_results[symbol] = {"symbol": ticker_key, "price": None, "change": None, "change_percent": None}
             return batch_results
-        except Exception as e:
-            return {s: {"symbol": s.upper(), "error": str(e)} for s in batch_symbols}
+        except Exception:
+            logger.exception("[safe_yfinance] batch quote fetch failed")
+            return {s: {"symbol": s.upper(), "error": "Market data request failed"} for s in batch_symbols}
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_batch = {executor.submit(fetch_batch, b): b for b in batches}
@@ -324,7 +421,7 @@ def safe_fetch_multiple_quotes(
                     results[s] = r
                     if r.get("price") is not None:
                         cache_key = _cache_key(s, "7d")
-                        _cache[cache_key] = {"status": "ok", "quote_data": r, "cached_at": now}
+                        _cache.set(cache_key, {"status": "ok", "quote_data": dict(r), "cached_at": now})
             except Exception as exc:
                 logger.debug("Quote batch future failed: %s", exc)
 

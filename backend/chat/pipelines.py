@@ -74,7 +74,7 @@ try:
     format_ticker = market_service.normalize_ticker
     get_comprehensive_stock_data = market_service.get_fundamentals # Wait, check if this is correct
     
-    from backend.services.backtest_service import run_backtest_service
+    from backend.backtest.service import run_backtest_service
     from backend.services.emotion_data_scraper import EmotionDataScraper
     from backend.services.company_resolver import resolve_company_identity
     from backend.tools.duckduckgo_mcp import DuckDuckGoMCPTool
@@ -87,7 +87,7 @@ except ImportError:
     format_ticker = ms.normalize_ticker
     get_comprehensive_stock_data = ms.get_fundamentals
     
-    from services.backtest_service import run_backtest_service
+    from backend.backtest.service import run_backtest_service
     from services.emotion_data_scraper import EmotionDataScraper
     from services.company_resolver import resolve_company_identity
     from tools.duckduckgo_mcp import DuckDuckGoMCPTool
@@ -102,6 +102,51 @@ except ImportError:
         WEALTH_AVAILABLE = True
     except ImportError:
         WEALTH_AVAILABLE = False
+
+
+def _num(value: Any) -> Optional[float]:
+    """Finite float or None (bools/NaN/inf/junk -> None); missing data is never coerced to 0."""
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return out if out == out and out not in (float("inf"), float("-inf")) else None
+
+
+def _money(currency: str, value: Any, signed: bool = False) -> str:
+    n = _num(value)
+    if n is None:
+        return "N/A"
+    return f"{currency}{n:+,.2f}" if signed else f"{currency}{n:,.2f}"
+
+
+def _pct(value: Any) -> str:
+    n = _num(value)
+    return "N/A" if n is None else f"{n:+.2f}%"
+
+
+def _dec(value: Any, digits: int = 2) -> str:
+    """Plain decimal (ratios, multiples); N/A when missing."""
+    n = _num(value)
+    return "N/A" if n is None else f"{n:.{digits}f}"
+
+
+def _billions(currency: str, value: Any) -> str:
+    n = _num(value)
+    return "N/A" if n is None else f"{currency}{n / 1e9:.2f}B"
+
+
+def _pct_of_ratio(value: Any, digits: int = 1) -> str:
+    """Format a 0..1 ratio as a percentage (no sign); N/A when missing."""
+    n = _num(value)
+    return "N/A" if n is None else f"{n * 100:.{digits}f}%"
+
+
+def _count(value: Any) -> str:
+    n = _num(value)
+    return "N/A" if n is None else f"{int(n):,}"
 
 
 @dataclass
@@ -228,12 +273,13 @@ class PipelineManager:
                 execution_time=(datetime.now() - start_time).total_seconds()
             )
             
-        except Exception as e:
+        except Exception:
+            logger.exception("Emotion pipeline failed")
             return PipelineResult(
                 pipeline="emotion",
                 success=False,
-                data={"error": str(e)},
-                summary=f"❌ Emotion analysis failed: {str(e)}",
+                data={"error": "Emotion analysis failed"},
+                summary="❌ Emotion analysis failed",
                 timestamp=datetime.now().isoformat(),
                 execution_time=(datetime.now() - start_time).total_seconds()
             )
@@ -284,14 +330,20 @@ class PipelineManager:
 
             # Backtest pipeline (single strategy baseline)
             if include_backtest:
-                backtest = await asyncio.to_thread(
-                    run_backtest_service,
-                    symbol=ticker,
-                    strategy_name="momentum",
-                    range_period="1y",
-                    interval="1d",
-                    initial_capital=100000
-                )
+                try:
+                    backtest = await asyncio.to_thread(
+                        run_backtest_service,
+                        symbol=ticker,
+                        strategy_name="momentum",
+                        range_period="1y",
+                        interval="1d",
+                        initial_capital=100000
+                    )
+                except Exception:
+                    # The backtest service raises (MarketDataError) when the data provider fails;
+                    # that must not take down the rest of the stock info pipeline.
+                    logger.exception("Baseline backtest failed for %s", ticker)
+                    backtest = {"error": "Backtest unavailable"}
                 stock_data["backtest"] = {
                     "strategy": "momentum",
                     "metrics": backtest.get("metrics"),
@@ -316,12 +368,13 @@ class PipelineManager:
                 execution_time=(datetime.now() - start_time).total_seconds()
             )
             
-        except Exception as e:
+        except Exception:
+            logger.exception("Stock info pipeline failed")
             return PipelineResult(
                 pipeline="stock_info",
                 success=False,
-                data={"error": str(e)},
-                summary=f"❌ Stock analysis failed: {str(e)}",
+                data={"error": "Stock analysis failed"},
+                summary="❌ Stock analysis failed",
                 timestamp=datetime.now().isoformat(),
                 execution_time=(datetime.now() - start_time).total_seconds()
             )
@@ -363,12 +416,13 @@ class PipelineManager:
                 execution_time=(datetime.now() - start_time).total_seconds()
             )
             
-        except Exception as e:
+        except Exception:
+            logger.exception("Wealth pipeline failed")
             return PipelineResult(
                 pipeline="wealth",
                 success=False,
-                data={"error": str(e)},
-                summary=f"❌ Wealth analysis failed: {str(e)}",
+                data={"error": "Wealth analysis failed"},
+                summary="❌ Wealth analysis failed",
                 timestamp=datetime.now().isoformat(),
                 execution_time=(datetime.now() - start_time).total_seconds()
             )
@@ -529,8 +583,9 @@ class PipelineManager:
             
             return summary
             
-        except Exception as e:
-            return f"Emotion analysis completed. Error formatting: {str(e)}"
+        except Exception:
+            logger.exception("Emotion summary formatting failed")
+            return "Emotion analysis completed. Error formatting the summary."
     
     async def _create_emotion_summary_professional(self, result: Dict) -> str:
         """Create professional emotion analysis summary without emojis"""
@@ -646,8 +701,9 @@ Recommendation: {recommendation}
             
             return summary
             
-        except Exception as e:
-            return f"Emotion analysis completed. Error formatting: {str(e)}"
+        except Exception:
+            logger.exception("Emotion summary formatting failed")
+            return "Emotion analysis completed. Error formatting the summary."
     
     def _create_stock_summary(self, data: Dict) -> str:
         """Create comprehensive human-readable stock info summary"""
@@ -656,31 +712,34 @@ Recommendation: {recommendation}
             company = data.get("company_name", ticker)
             
             # Price Data
-            current_price = data.get("current_price", 0)
-            daily_change = data.get("daily_change", 0)
-            daily_change_pct = data.get("daily_change_pct", 0)
+            current_price = _num(data.get("current_price"))
+            daily_change = _num(data.get("daily_change"))
+            daily_change_pct = _num(data.get("daily_change_pct"))
             
             # Currency symbol
             currency = data.get("currency", "$")
             
             # Price direction emoji
-            change_emoji = "📈" if daily_change_pct > 0 else "📉" if daily_change_pct < 0 else "➡️"
+            change_emoji = (
+                "" if daily_change_pct is None
+                else "📈" if daily_change_pct > 0 else "📉" if daily_change_pct < 0 else "➡️"
+            )
             
             summary = f"""# 📊 {company} ({ticker})
 
 ## 💰 Price Data
 | Metric | Value |
 |--------|-------|
-| **Current Price** | {currency}{current_price:,.2f} |
-| **Daily Change** | {change_emoji} {currency}{daily_change:+,.2f} ({daily_change_pct:+.2f}%) |
-| **Previous Close** | {currency}{data.get('previous_close', 0):,.2f} |
-| **Open** | {currency}{data.get('open', 0):,.2f} |
-| **Day High** | {currency}{data.get('day_high', 0):,.2f} |
-| **Day Low** | {currency}{data.get('day_low', 0):,.2f} |
-| **52-Week High** | {currency}{data.get('week_52_high', 0):,.2f} |
-| **52-Week Low** | {currency}{data.get('week_52_low', 0):,.2f} |
-| **Volume** | {data.get('volume', 0):,} |
-| **Avg Volume** | {data.get('avg_volume', 0):,} |
+| **Current Price** | {_money(currency, current_price)} |
+| **Daily Change** | {change_emoji} {_money(currency, daily_change, signed=True)} ({_pct(daily_change_pct)}) |
+| **Previous Close** | {_money(currency, data.get('previous_close'))} |
+| **Open** | {_money(currency, data.get('open'))} |
+| **Day High** | {_money(currency, data.get('day_high'))} |
+| **Day Low** | {_money(currency, data.get('day_low'))} |
+| **52-Week High** | {_money(currency, data.get('week_52_high'))} |
+| **52-Week Low** | {_money(currency, data.get('week_52_low'))} |
+| **Volume** | {_count(data.get('volume'))} |
+| **Avg Volume** | {_count(data.get('avg_volume'))} |
 
 ## 📈 Returns
 """
@@ -688,6 +747,9 @@ Recommendation: {recommendation}
             returns = data.get("returns", {})
             if returns:
                 for period, value in returns.items():
+                    value = _num(value)
+                    if value is None:
+                        continue
                     period_name = period.replace("_", " ").title()
                     ret_emoji = "🟢" if value > 0 else "🔴" if value < 0 else "⚪"
                     summary += f"- {ret_emoji} **{period_name}:** {value:+.2f}%\n"
@@ -697,72 +759,72 @@ Recommendation: {recommendation}
 - **Sector:** {data.get('sector', 'N/A')}
 - **Industry:** {data.get('industry', 'N/A')}
 - **Exchange:** {data.get('exchange', 'N/A')}
-- **Employees:** {data.get('employees', 0):,}
+- **Employees:** {_count(data.get('employees'))}
 - **Country:** {data.get('country', 'N/A')}
 
 ## 📊 Valuation
 | Metric | Value |
 |--------|-------|
-| **Market Cap** | {currency}{data.get('market_cap', 0) / 1e9:.2f}B |
-| **P/E (Trailing)** | {data.get('trailing_pe', 0):.2f} |
-| **P/E (Forward)** | {data.get('forward_pe', 0):.2f} |
-| **PEG Ratio** | {data.get('peg_ratio', 0):.2f} |
-| **Price/Book** | {data.get('price_to_book', 0):.2f} |
-| **Price/Sales** | {data.get('price_to_sales', 0):.2f} |
-| **EV/Revenue** | {data.get('ev_to_revenue', 0):.2f} |
-| **EV/EBITDA** | {data.get('ev_to_ebitda', 0):.2f} |
+| **Market Cap** | {_billions(currency, data.get('market_cap'))} |
+| **P/E (Trailing)** | {_dec(data.get('trailing_pe'))} |
+| **P/E (Forward)** | {_dec(data.get('forward_pe'))} |
+| **PEG Ratio** | {_dec(data.get('peg_ratio'))} |
+| **Price/Book** | {_dec(data.get('price_to_book'))} |
+| **Price/Sales** | {_dec(data.get('price_to_sales'))} |
+| **EV/Revenue** | {_dec(data.get('ev_to_revenue'))} |
+| **EV/EBITDA** | {_dec(data.get('ev_to_ebitda'))} |
 
 ## 💵 Profitability & Growth
 | Metric | Value |
 |--------|-------|
-| **Profit Margin** | {data.get('profit_margin', 0) * 100:.1f}% |
-| **Operating Margin** | {data.get('operating_margin', 0) * 100:.1f}% |
-| **ROE** | {data.get('return_on_equity', 0) * 100:.1f}% |
-| **ROA** | {data.get('return_on_assets', 0) * 100:.1f}% |
-| **Revenue Growth** | {data.get('revenue_growth', 0) * 100:.1f}% |
-| **Earnings Growth** | {data.get('earnings_growth', 0) * 100:.1f}% |
+| **Profit Margin** | {_pct_of_ratio(data.get('profit_margin'))} |
+| **Operating Margin** | {_pct_of_ratio(data.get('operating_margin'))} |
+| **ROE** | {_pct_of_ratio(data.get('return_on_equity'))} |
+| **ROA** | {_pct_of_ratio(data.get('return_on_assets'))} |
+| **Revenue Growth** | {_pct_of_ratio(data.get('revenue_growth'))} |
+| **Earnings Growth** | {_pct_of_ratio(data.get('earnings_growth'))} |
 
 ## 💳 Financial Health
 | Metric | Value |
 |--------|-------|
-| **Total Cash** | {currency}{data.get('total_cash', 0) / 1e9:.2f}B |
-| **Total Debt** | {currency}{data.get('total_debt', 0) / 1e9:.2f}B |
-| **Debt/Equity** | {data.get('debt_to_equity', 0):.2f} |
-| **Current Ratio** | {data.get('current_ratio', 0):.2f} |
-| **Free Cash Flow** | {currency}{data.get('free_cash_flow', 0) / 1e9:.2f}B |
+| **Total Cash** | {_billions(currency, data.get('total_cash'))} |
+| **Total Debt** | {_billions(currency, data.get('total_debt'))} |
+| **Debt/Equity** | {_dec(data.get('debt_to_equity'))} |
+| **Current Ratio** | {_dec(data.get('current_ratio'))} |
+| **Free Cash Flow** | {_billions(currency, data.get('free_cash_flow'))} |
 
 ## 📈 Per Share Data
 | Metric | Value |
 |--------|-------|
-| **EPS (Trailing)** | {currency}{data.get('eps_trailing', 0):.2f} |
-| **EPS (Forward)** | {currency}{data.get('eps_forward', 0):.2f} |
-| **Book Value** | {currency}{data.get('book_value', 0):.2f} |
+| **EPS (Trailing)** | {_money(currency, data.get('eps_trailing'))} |
+| **EPS (Forward)** | {_money(currency, data.get('eps_forward'))} |
+| **Book Value** | {_money(currency, data.get('book_value'))} |
 
 ## 💸 Dividends
 | Metric | Value |
 |--------|-------|
-| **Dividend Rate** | {currency}{data.get('dividend_rate', 0):.2f} |
-| **Dividend Yield** | {data.get('dividend_yield', 0) * 100 if data.get('dividend_yield') else 0:.2f}% |
-| **Payout Ratio** | {data.get('payout_ratio', 0) * 100 if data.get('payout_ratio') else 0:.1f}% |
+| **Dividend Rate** | {_money(currency, data.get('dividend_rate'))} |
+| **Dividend Yield** | {_pct_of_ratio(data.get('dividend_yield'), 2)} |
+| **Payout Ratio** | {_pct_of_ratio(data.get('payout_ratio'))} |
 
 ## 🎯 Analyst Ratings
 | Metric | Value |
 |--------|-------|
-| **Rating** | {data.get('analyst_rating', 'N/A').upper()} |
-| **Rating Score** | {data.get('analyst_rating_score', 0):.1f}/5 |
-| **Target High** | {currency}{data.get('target_high', 0):,.2f} |
-| **Target Mean** | {currency}{data.get('target_mean', 0):,.2f} |
-| **Target Low** | {currency}{data.get('target_low', 0):,.2f} |
-| **# of Analysts** | {data.get('num_analysts', 0)} |
+| **Rating** | {str(data.get('analyst_rating') or 'N/A').upper()} |
+| **Rating Score** | {(_dec(data.get('analyst_rating_score'), 1) + '/5') if _num(data.get('analyst_rating_score')) is not None else 'N/A'} |
+| **Target High** | {_money(currency, data.get('target_high'))} |
+| **Target Mean** | {_money(currency, data.get('target_mean'))} |
+| **Target Low** | {_money(currency, data.get('target_low'))} |
+| **# of Analysts** | {_count(data.get('num_analysts'))} |
 
 ## ⚠️ Risk Metrics
 | Metric | Value |
 |--------|-------|
-| **Beta** | {data.get('beta', 0):.2f} |
-| **Short Ratio** | {data.get('short_ratio', 0):.2f} |
-| **Short % of Float** | {data.get('short_pct_of_float', 0) * 100 if data.get('short_pct_of_float') else 0:.2f}% |
-| **Institutional Ownership** | {data.get('institution_ownership', 0) * 100 if data.get('institution_ownership') else 0:.1f}% |
-| **Insider Ownership** | {data.get('insider_ownership', 0) * 100 if data.get('insider_ownership') else 0:.1f}% |
+| **Beta** | {_dec(data.get('beta'))} |
+| **Short Ratio** | {_dec(data.get('short_ratio'))} |
+| **Short % of Float** | {_pct_of_ratio(data.get('short_pct_of_float'), 2)} |
+| **Institutional Ownership** | {_pct_of_ratio(data.get('institution_ownership'))} |
+| **Insider Ownership** | {_pct_of_ratio(data.get('insider_ownership'))} |
 
 """
             # Add news section
@@ -785,8 +847,9 @@ Recommendation: {recommendation}
             
             return summary
             
-        except Exception as e:
-            return f"Stock analysis completed. Error formatting: {str(e)}. Check data for details."
+        except Exception:
+            logger.exception("Stock summary formatting failed")
+            return "Stock analysis completed. Error formatting the summary. Check data for details."
     
     def _create_wealth_summary(self, result: Dict) -> str:
         """Create human-readable wealth advice summary"""
@@ -1037,8 +1100,9 @@ Format as clean markdown. Be thorough but scannable."""
                 "total_filtered": len(filtered),
                 "note": "No high-confidence stock-specific news found" if not filtered else "",
             }
-        except Exception as e:
-            return {"available": False, "error": str(e)}
+        except Exception:
+            logger.exception("News relevance filtering failed")
+            return {"available": False, "error": "News unavailable"}
     
     async def _calculate_technicals(self, ticker: str, market: str) -> Dict[str, Any]:
         """Calculate technical indicators for the stock"""
@@ -1120,8 +1184,9 @@ Format as clean markdown. Be thorough but scannable."""
                     "support": float(recent_low)
                 }
             }
-        except Exception as e:
-            return {"available": False, "error": str(e)}
+        except Exception:
+            logger.exception("Technical indicator calculation failed")
+            return {"available": False, "error": "Technical indicators unavailable"}
 
     async def _calculate_sharpe_ratio(self, ticker: str, market: str) -> Optional[float]:
         """Compute annualized Sharpe ratio from daily returns."""
@@ -1194,8 +1259,9 @@ Format as clean markdown. Be thorough but scannable."""
             try:
                 text = await asyncio.to_thread(self.ddg_tool.search, q, 6)
                 results.append({"query": q, "results": text})
-            except Exception as e:
-                results.append({"query": q, "error": str(e)})
+            except Exception:
+                logger.exception("DDG research query failed")
+                results.append({"query": q, "error": "Search failed"})
         return results
     
     async def _normalize_text(self, text: str) -> str:
@@ -1243,18 +1309,18 @@ Output only the cleaned text, nothing else.'''
         try:
             ticker = data.get("symbol", data.get("ticker", "Unknown"))
             company = data.get("company_name", ticker)
-            current_price = data.get("current_price", 0)
-            daily_change_pct = data.get("daily_change_pct", 0)
+            current_price = _num(data.get("current_price"))
+            daily_change_pct = _num(data.get("daily_change_pct"))
             currency = data.get("currency", "$")
             
             # Start with basic info
             summary = f"""COMPREHENSIVE STOCK ANALYSIS: {company} ({ticker})
 
 PRICE INFORMATION
-Current Price: {currency}{current_price:,.2f}
-Daily Change: {daily_change_pct:+.2f}%
-Previous Close: {currency}{data.get('previous_close', 0):,.2f}
-52-Week Range: {currency}{data.get('week_52_low', 0):,.2f} - {currency}{data.get('week_52_high', 0):,.2f}
+Current Price: {_money(currency, current_price)}
+Daily Change: {_pct(daily_change_pct)}
+Previous Close: {_money(currency, data.get('previous_close'))}
+52-Week Range: {_money(currency, data.get('week_52_low'))} - {_money(currency, data.get('week_52_high'))}
 
 """
             
@@ -1278,9 +1344,9 @@ Previous Close: {currency}{data.get('previous_close', 0):,.2f}
                 
                 ma = technicals.get("moving_averages", {})
                 if ma.get("sma_200"):
-                    summary += f"Moving Averages: SMA20={currency}{ma.get('sma_20', 0):.2f}, "
-                    summary += f"SMA50={currency}{ma.get('sma_50', 0):.2f}, "
-                    summary += f"SMA200={currency}{ma.get('sma_200', 0):.2f}\n"
+                    summary += f"Moving Averages: SMA20={_money(currency, ma.get('sma_20'))}, "
+                    summary += f"SMA50={_money(currency, ma.get('sma_50'))}, "
+                    summary += f"SMA200={_money(currency, ma.get('sma_200'))}\n"
                 
                 sr = technicals.get("support_resistance", {})
                 if sr.get("support"):
@@ -1366,8 +1432,9 @@ Previous Close: {currency}{data.get('previous_close', 0):,.2f}
             
             return summary
             
-        except Exception as e:
-            return f"Stock analysis completed. Error formatting: {str(e)}"
+        except Exception:
+            logger.exception("Stock summary formatting failed")
+            return "Stock analysis completed. Error formatting the summary."
 
 
 # Singleton instance

@@ -2,7 +2,10 @@
 Isolated position_sizing_service for chat/core.
 Provides Kelly Criterion and fixed-fraction position sizing.
 """
+import logging
 from typing import Dict, Any, Optional
+
+logger = logging.getLogger(__name__)
 
 
 class PositionSizingService:
@@ -36,8 +39,9 @@ class PositionSizingService:
                 "capital": capital,
                 "win_rate": win_rate,
             }
-        except Exception as e:
-            return {"error": str(e)}
+        except Exception:
+            logger.exception("Kelly criterion position sizing failed")
+            return {"error": "Position sizing failed"}
 
     def fixed_fraction(
         self,
@@ -56,8 +60,9 @@ class PositionSizingService:
                 "position_size": round(position_size, 2),
                 "capital": capital,
             }
-        except Exception as e:
-            return {"error": str(e)}
+        except Exception:
+            logger.exception("Fixed-fraction position sizing failed")
+            return {"error": "Position sizing failed"}
 
     def calculate(self, method: str = "kelly", **kwargs) -> Dict[str, Any]:
         if method == "kelly":

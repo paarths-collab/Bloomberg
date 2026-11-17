@@ -2,8 +2,11 @@
 Isolated fundamentals_service for research/core.
 Self-contained fundamental data fetching using unified MarketDataService.
 """
+import logging
 from typing import Dict, Any, Optional
 from backend.services.market_data import market_service
+
+logger = logging.getLogger(__name__)
 
 def get_fundamentals_summary(ticker: str) -> Dict[str, Any]:
     """
@@ -100,6 +103,6 @@ def get_fundamentals_summary(ticker: str) -> Dict[str, Any]:
             },
             "status": "success",
         }
-    except Exception as e:
-        print(f"[fundamentals_service] get_fundamentals_summary({ticker}) failed: {e}")
-        return {"ticker": ticker, "error": str(e), "status": "error"}
+    except Exception:
+        logger.exception("get_fundamentals_summary(%s) failed", ticker)
+        return {"ticker": ticker, "error": "Fundamentals request failed", "status": "error"}

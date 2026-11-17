@@ -171,26 +171,34 @@ class InvestmentPipeline:
                 report = await asyncio.to_thread(self._agent.run, prompt)
         except Exception as e:
             print(f"[InvestmentPipeline] AI analysis failed: {e}")
-            report = f"Analysis for {yf_ticker or query}: Unable to generate AI report at this time."
+            report = "Error: AI analysis unavailable."
+
+        if not report:
+            report = "Error: AI analysis unavailable."
 
         # Trade context if ticker provided
         trade_levels = {}
         sizing = {}
         if yf_ticker:
             try:
-                trade_levels = self.trade_levels.get_levels(yf_ticker)
+                trade_levels = await asyncio.to_thread(self.trade_levels.get_levels, yf_ticker)
                 capital = 100000.0
                 if portfolio and isinstance(portfolio, dict) and "cash" in portfolio:
                     capital = float(portfolio["cash"])
-                entry = trade_levels.get("current_price", 0) or 0
-                stop = trade_levels.get("stop_loss", 0) or 0
-                if entry and stop:
+                entry = trade_levels.get("current_price")
+                stop = trade_levels.get("stop_loss")
+                # Size only from genuine, positive entry and stop levels; missing -> skip.
+                if (
+                    isinstance(entry, (int, float)) and not isinstance(entry, bool) and entry > 0
+                    and isinstance(stop, (int, float)) and not isinstance(stop, bool) and stop > 0
+                ):
                     sizing = self.sizing.fixed_fraction(capital=capital)
             except Exception as exc:
                 logger.debug("Trade level/sizing computation failed for %s: %s", yf_ticker, exc)
 
         # Store in memory
-        self.memory.add(
+        await asyncio.to_thread(
+            self.memory.add,
             id=f"{session_id}_{uuid.uuid4()}",
             text=f"Query: {query}\nTicker: {yf_ticker or ''}\nReport: {report}",
             metadata={"type": "report", "session_id": session_id},
@@ -200,15 +208,15 @@ class InvestmentPipeline:
             "report": report,
             "ticker": yf_ticker,
             "market": resolved_market,
-            "emotion": {"label": "neutral", "score": 0.5, "penalty": 0},
-            "financial": {"score": 50, "summary": ""},
-            "web": {"score": 50, "summary": ""},
-            "sector": {"score": 50, "summary": ""},
+            "emotion": {"label": "unavailable", "score": None, "penalty": None},
+            "financial": {"score": None, "summary": "", "status": "unavailable"},
+            "web": {"score": None, "summary": "", "status": "unavailable"},
+            "sector": {"score": None, "summary": "", "status": "unavailable"},
             "macro": {},
             "insider": {},
             "risk": {},
             "divergence": False,
-            "confidence": 0.5,
+            "confidence": None,
             "strategy": {
                 "trade_levels": trade_levels,
                 "position_sizing": sizing,

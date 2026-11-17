@@ -101,10 +101,11 @@ class StockSelectionAgent:
                 "messages": [f"Γ£ô Selected Stock: {best_ticker} ({inv_mode})"]
             }
             
-        except Exception as e:
+        except Exception:
+            logger.exception("Stock selection failed")
             return {
                 **state,
-                "errors": [f"Stock selection failed: {str(e)}"]
+                "errors": ["Stock selection failed"]
             }
 
     def _determine_investment_mode(self, ticker, user_profile):

@@ -36,9 +36,9 @@ def analyze_dashboard_sentiment(request: SentimentRequest):
     try:
         # This uses the isolated logic in service.py (Migrated from market_pulse.py)
         return get_market_sentiment(request.message, request.tickers, request.market)
-    except Exception as e:
+    except Exception:
         logger.exception("Dashboard sentiment failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Dashboard sentiment request failed")
 
 @router.post("/crowd-insight")
 def analyze_crowd_signal(request: CrowdInsightRequest):
@@ -58,15 +58,15 @@ def analyze_crowd_signal(request: CrowdInsightRequest):
                 "hosts": RAPIDAPI_HOSTS,
             },
         )
-    except Exception as e:
+    except Exception:
         logger.exception("Crowd insight failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Crowd insight request failed")
 
 @router.get("/sector-news")
 def get_dashboard_sector_news(
     market: str = Query("US"),
     sector: Optional[str] = Query(None),
-    limit: int = Query(20),
+    limit: int = Query(20, ge=1, le=100),
     db=Depends(get_db),
 ):
     """
@@ -86,12 +86,13 @@ def get_dashboard_sector_news(
         for row in rows:
             r = dict(row)
             sec = r.get("sector", "Unknown")
-            if r.get("published_at"): r["published_at"] = r["published_at"].isoformat()
+            if r.get("published_at") and hasattr(r["published_at"], "isoformat"):
+                r["published_at"] = r["published_at"].isoformat()
             if sec not in grouped: grouped[sec] = []
             grouped[sec].append(r)
 
         return {"market": market.upper(), "total_items": len(rows), "sectors": grouped}
-    except Exception as e:
+    except Exception:
         logger.exception("Sector news query failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Sector news request failed")
 

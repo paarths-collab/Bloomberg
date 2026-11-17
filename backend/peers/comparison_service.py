@@ -10,8 +10,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 FMP_API_KEY = os.getenv("FMP_API_KEY", "")
 FMP_BASE_URL = os.getenv("FMP_BASE_URL", "https://financialmodelingprep.com/api/v4")
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")
-PEERS_PREMIUM = False
 logger = logging.getLogger(__name__)
+
+
+def peers_premium_enabled() -> bool:
+    """Whether premium peer discovery is enabled (env PEERS_PREMIUM=true; read at call time)."""
+    return os.getenv("PEERS_PREMIUM", "false").strip().lower() == "true"
+
 
 try:
     import finnhub
@@ -281,9 +286,9 @@ def _yf_basic_metrics(symbol: str, name: Optional[str] = None) -> Optional[Dict[
 
         market_cap = _safe_float(fast.get("market_cap") or info.get("marketCap"))
         pe = _safe_float(info.get("trailingPE"))
-        div_yield = _safe_float(info.get("dividendYield"))
-        if div_yield is not None:
-            div_yield = div_yield * 100
+        dividend_rate = _safe_float(info.get("trailingAnnualDividendRate"))
+        # Derive percentage from cash dividends and price; vendor yield units vary.
+        div_yield = dividend_rate / price * 100 if dividend_rate is not None and price and price > 0 else None
 
         roce = _safe_float(info.get("returnOnCapitalEmployed"))
         if roce is not None and roce <= 1:
@@ -357,7 +362,7 @@ def _finnhub_peers(symbol: str) -> List[str]:
 def fetch_peer_comparison(symbol: str, limit: int = 12, debug: bool = False) -> Dict[str, Any]:
     sym = _normalize_symbol(symbol)
     fh_sym = _finnhub_symbol(sym)
-    premium_enabled = PEERS_PREMIUM
+    premium_enabled = peers_premium_enabled()
 
     if premium_enabled and not FINNHUB_API_KEY and not FMP_API_KEY:
         raise RuntimeError("FINNHUB_API_KEY or FMP_API_KEY must be configured")
@@ -469,6 +474,12 @@ def fetch_peer_comparison(symbol: str, limit: int = 12, debug: bool = False) -> 
                 symbols.append(p)
          india_fallback = fallback_peers
 
+    local_comparables = []
+    if not any(p != sym for p in symbols):
+        from .service import local_sector_peers
+        local_comparables = local_sector_peers(sym, limit=max(1, limit - 1))
+        symbols.extend(p["symbol"] for p in local_comparables if p["symbol"] not in symbols)
+
     # Ensure the original symbol is first
     if sym not in symbols:
         symbols.insert(0, sym)
@@ -508,6 +519,8 @@ def fetch_peer_comparison(symbol: str, limit: int = 12, debug: bool = False) -> 
         "symbol": sym,
         "count": len(rows),
         "rows": rows,
+        "comparison_basis": "local sector comparables" if local_comparables else "provider or curated peers",
+        "partial": not any(r.get("symbol") != sym for r in rows),
     }
     
     # If we got no data and it's an India stock, ensure at least name fallback

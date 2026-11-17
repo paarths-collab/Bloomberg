@@ -2,20 +2,23 @@ import math
 import logging
 from typing import Optional, List, Dict, Any
 from fastapi import APIRouter, HTTPException, Query, Body, Depends
+from backend.auth import require_user
 from backend.database.connection import get_db
 
 # Unified services
-from .service import sectors_service
+from .service import sectors_service, normalize_treemap_market, SUPPORTED_TREEMAP_MARKETS
 from backend.services.technical_analysis import technical_service
+from backend.services.market_data import market_service
 
 # Sector Intel services
 from .intel_service import (
     refresh_sector,
-    refresh_all_sectors,
     list_latest_snapshots,
     recommend_sectors_for_user,
     get_sector_constituents,
-    get_markets
+    get_markets,
+    normalize_market,
+    resolve_sector,
 )
 
 # Localized services (To be retired)
@@ -61,46 +64,80 @@ def _snapshot_to_dict(snapshot):
         "llm_model": snapshot.llm_model,
     }
 
-# --- Legacy /api/treemap routes ---
+# --- Treemap routes (/api/sectors/treemap/*) ---
+
+def _treemap_market_or_400(market: str) -> str:
+    key = normalize_treemap_market(market)
+    if key is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported market. Supported markets: {', '.join(SUPPORTED_TREEMAP_MARKETS)}",
+        )
+    return key
+
+
+def _intel_market_or_400(market: Any) -> str:
+    code = normalize_market(market)
+    if code is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported market. Supported markets: {', '.join(get_markets())}",
+        )
+    return code
+
+
+def _int_field_or_400(payload: Dict[str, Any], name: str, default: Optional[int], lo: int, hi: int) -> Optional[int]:
+    value = payload.get(name, default)
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise HTTPException(status_code=400, detail=f"'{name}' must be an integer")
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    if isinstance(value, str) and value.strip().lstrip("-").isdigit() and len(value.strip()) <= 9:
+        value = int(value.strip())
+    if not isinstance(value, int):
+        raise HTTPException(status_code=400, detail=f"'{name}' must be an integer")
+    if not lo <= value <= hi:
+        raise HTTPException(status_code=400, detail=f"'{name}' must be between {lo} and {hi}")
+    return value
+
+
+# Plain `def` routes below: FastAPI runs them in its threadpool, so blocking provider/DB work
+# does not stall the event loop.
 
 @router.get("/treemap/indices")
-async def get_indices(market: str = Query("india")):
+def get_indices(market: str = Query("india")):
+    market_key = _treemap_market_or_400(market)
     try:
-        indices = sectors_service._get_market_indices(market) # Use the fast list
-        return _sanitize_for_json({"market": market, "count": len(indices), "indices": indices})
-    except Exception as e:
-        logger.error(f"Treemap indices error for market={market}: {e}")
-        return {"market": market, "count": 0, "indices": [], "error": "indices_unavailable"}
+        indices = sectors_service._get_market_indices(market_key) # Use the fast list
+        return _sanitize_for_json({"market": market_key, "count": len(indices), "indices": indices})
+    except Exception:
+        logger.exception("Treemap indices error for market=%s", market_key)
+        return {"market": market_key, "count": 0, "indices": [], "error": "indices_unavailable"}
 
 @router.get("/treemap/indices/live")
-async def get_indices_live(market: str = Query("india")):
+def get_indices_live(market: str = Query("india")):
+    market_key = _treemap_market_or_400(market)
     try:
-        indices = sectors_service.get_indices_live(market)
-        return _sanitize_for_json({"market": market, "count": len(indices), "indices": indices})
-    except Exception as e:
-        logger.error(f"Treemap live error: {e}")
-        return {"market": market, "count": 0, "indices": [], "error": str(e)}
+        indices = sectors_service.get_indices_live(market_key)
+        return _sanitize_for_json({"market": market_key, "count": len(indices), "indices": indices})
+    except Exception:
+        logger.exception("Treemap live error for market=%s", market_key)
+        return {"market": market_key, "count": 0, "indices": [], "error": "indices_unavailable"}
 
 @router.get("/treemap/index/{index_id}")
-async def get_index_stocks(
+def get_index_stocks(
     index_id: str, 
     market: str = Query("india"), 
     include_prices: bool = Query(True)
 ):
-    data = sectors_service.get_index_constituents(index_id, market, include_prices)
+    market_key = _treemap_market_or_400(market)
+    data = sectors_service.get_index_constituents(index_id, market_key, include_prices)
     if "error" in data:
         raise HTTPException(status_code=404, detail=data["error"])
     return _sanitize_for_json(data)
     
-@router.get("/{index_id}")
-async def get_index_stocks_alias(
-    index_id: str, 
-    market: str = Query("india"), 
-    include_prices: bool = Query(True)
-):
-    """Compatibility alias for /api/sectors/{index_id}"""
-    return await get_index_stocks(index_id, market, include_prices)
-
 @router.get("/treemap/stock/{symbol}")
 def get_treemap_stock(symbol: str, market: str = Query("india")):
     from backend.services.market_data import market_service
@@ -122,8 +159,8 @@ def get_treemap_stock(symbol: str, market: str = Query("india")):
         "industry": info.get("industry"),
         "price": {
             "current": q.get("price") or info.get("currentPrice") or info.get("regularMarketPrice"),
-            "change": q.get("change") or 0.0,
-            "change_percent": q.get("change_percent") or 0.0,
+            "change": q.get("change"),
+            "change_percent": q.get("change_percent"),
             "open": info.get("open"),
             "day_high": info.get("dayHigh"),
             "day_low": info.get("dayLow"),
@@ -180,54 +217,65 @@ def get_sector_performance():
 # --- Legacy /api/sector-intel routes ---
 
 @router.get("/intel/latest")
-def get_intel_latest(market: str = Query(None), sector: str = Query(None), db=Depends(get_db)):
+def get_intel_latest(market: Optional[str] = Query(None), sector: Optional[str] = Query(None), db=Depends(get_db)):
+    market_code = _intel_market_or_400(market) if market else None
     if sector:
-        snapshots = [s for s in list_latest_snapshots(db, market) if s.sector.lower() == sector.lower()]
+        snapshots = [s for s in list_latest_snapshots(db, market_code) if s.sector.lower() == sector.lower()]
         if not snapshots: raise HTTPException(status_code=404, detail="Not found")
         return _snapshot_to_dict(snapshots[0])
-    snapshots = list_latest_snapshots(db, market)
+    snapshots = list_latest_snapshots(db, market_code)
     return [_snapshot_to_dict(s) for s in snapshots]
 
 @router.post("/intel/refresh")
-def refresh_intel(payload: dict = Body(...), db=Depends(get_db)):
-    market = (payload.get("market") or "").upper() or None
-    sector = payload.get("sector")
-    force = bool(payload.get("force", False))
-    if sector and market:
-        res = refresh_sector(db, sector, market, force=force)
-        db.commit()
-        return res
-    res = refresh_all_sectors(db, markets=[market] if market else None, force=force)
+def refresh_intel(payload: dict = Body(...), db=Depends(get_db), _user: str = Depends(require_user)):
+    """Refresh ONE sector snapshot (authenticated). Refresh-all is not available over HTTP:
+    it sleeps between sectors and would hold a worker and DB session for many minutes."""
+    market = _intel_market_or_400(payload.get("market"))
+    raw_sector = payload.get("sector")
+    if not isinstance(raw_sector, str) or not raw_sector.strip():
+        raise HTTPException(status_code=400, detail="'sector' is required (one sector per request)")
+    sector = resolve_sector(market, raw_sector)
+    if sector is None:
+        raise HTTPException(status_code=400, detail=f"Unknown sector for market {market}")
+    force = payload.get("force", False)
+    if not isinstance(force, bool):
+        raise HTTPException(status_code=400, detail="'force' must be a boolean")
+    res = refresh_sector(db, sector, market, force=force)
     db.commit()
     return res
 
 @router.post("/intel/recommend")
 def recommend_intel(payload: dict = Body(...), db=Depends(get_db)):
+    market = _intel_market_or_400(payload.get("market", "US"))
+    risk_score = _int_field_or_400(payload, "risk_score", None, 0, 100)
+    limit = _int_field_or_400(payload, "limit", 5, 1, 50)
     return recommend_sectors_for_user(
-        db, 
-        market=payload.get("market", "US").upper(),
-        risk_score=payload.get("risk_score"),
-        limit=int(payload.get("limit", 5))
+        db,
+        market=market,
+        risk_score=risk_score,
+        limit=limit,
     )
 
 @router.get("/intel/stocks/{sector}")
 def sector_intel_stocks(
     sector: str,
     market: str = Query("US"),
-    limit: int = Query(10),
+    limit: int = Query(10, ge=1, le=50),
     include_fundamentals: bool = Query(True),
     include_technicals: bool = Query(True),
 ):
-    market_code = market.upper()
+    market_code = _intel_market_or_400(market)
     stocks = get_sector_constituents(market_code, sector, limit=limit)
     enriched = []
     for stock in stocks:
         sym = stock["symbol"]
         item = {**stock, "market": market_code}
+        if include_fundamentals:
+            item["fundamentals"] = market_service.get_fundamentals(sym)
         if include_technicals: 
              # Use the NEW unified TechnicalAnalysisService
              indicators = technical_service.calculate_indicators(sym, range_period="6mo", interval="1d", market=market_code)
              rsi_list = indicators.get("rsi")
              item["technicals"] = {"rsi": rsi_list[-1] if rsi_list else None}
         enriched.append(item)
-    return {"sector": sector, "market": market_code, "stocks": enriched}
+    return _sanitize_for_json({"sector": sector, "market": market_code, "stocks": enriched})

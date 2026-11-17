@@ -27,9 +27,9 @@ def run_momentum_screener(
             "market": "NSE",
             "as_of": results[0]["as_of"] if results else None
         }
-    except Exception as e:
+    except Exception:
         logger.exception("Screener failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Screener request failed")
 
 @router.get("/watchlist")
 def get_watchlist():

@@ -1,7 +1,11 @@
+import asyncio
+import logging
 from fastapi import APIRouter, HTTPException
 from .core.pipeline import InvestmentPipeline
 from typing import Optional, Dict
 from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 _pipeline: Optional[InvestmentPipeline] = None
@@ -27,7 +31,9 @@ class SuperAgentRequest(BaseModel):
 async def run_super_agent(payload: SuperAgentRequest):
     try:
         # Execute through Unified Pipeline
-        result = await _get_pipeline().run(
+        # First call builds the pipeline (agent/client setup can block): keep it off the event loop.
+        pipeline = await asyncio.to_thread(_get_pipeline)
+        result = await pipeline.run(
             query=payload.query,
             ticker=payload.ticker,
             market=payload.market,
@@ -36,7 +42,12 @@ async def run_super_agent(payload: SuperAgentRequest):
             approved_plan=payload.approved_plan
         )
         
+        if str(result.get("report", "")).lower().startswith("error"):
+            raise HTTPException(status_code=503, detail="AI analysis unavailable; check provider configuration")
         return result
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Super agent request failed")
+        raise HTTPException(status_code=500, detail="Super agent request failed")

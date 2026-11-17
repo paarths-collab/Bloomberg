@@ -3,8 +3,8 @@ Stock Advisor API — Auto-recommend & Multi-POV Analysis.
 Uses LangGraph for the 3-agent POV workflow.
 
 Routes:
-  POST /api/stock-advisor/recommend  — profile-driven stock recommendation
-    POST /api/stock-advisor/multi-pov  — 3 agents (Groq/Groq/Groq) analyze a stock
+  POST /api/chat/stock-advisor/recommend  — profile-driven stock recommendation
+  POST /api/chat/stock-advisor/multi-pov  — 3 agents (Groq/Groq/Groq) analyze a stock
 """
 from __future__ import annotations
 
@@ -15,8 +15,10 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 from sqlalchemy import text
 
+from backend.auth.security import optional_user
 from backend.database.connection import get_db
 
 logger = logging.getLogger(__name__)
@@ -30,7 +32,8 @@ router = APIRouter(prefix="/stock-advisor", tags=["Stock Advisor"])
 
 class RecommendRequest(BaseModel):
     user_input: str = Field(..., description="User's investment query")
-    user_id: str = Field(default="default")
+    # Deprecated and ignored: whose profile is read comes only from the bearer token.
+    user_id: Optional[str] = Field(default=None)
     market: str = Field(default="US")
 
 
@@ -44,7 +47,9 @@ class AgentPov(BaseModel):
     agent: str
     provider: str
     verdict: str
-    confidence: float
+    confidence: Optional[float] = None
+    # "ok" | "confidence_missing" | "confidence_unparseable"
+    confidence_status: str = "ok"
     reasoning: str
     key_factors: List[str]
 
@@ -72,8 +77,8 @@ def _call_gemini(prompt: str) -> str:
         response = model.generate_content(prompt)
         return response.text
     except Exception as e:
-        logger.warning(f"Gemini call failed: {e}")
-        return f"[Gemini error: {e}]"
+        logger.exception("Gemini call failed")
+        return "[Gemini error: AI analysis unavailable]"
 
 
 def _call_groq(prompt: str) -> str:
@@ -92,8 +97,8 @@ def _call_groq(prompt: str) -> str:
         )
         return resp.choices[0].message.content
     except Exception as e:
-        logger.warning(f"Groq call failed: {e}")
-        return f"[Groq error: {e}]"
+        logger.exception("Groq call failed")
+        return "[Groq error: AI analysis unavailable]"
 
 
 # ---------------------------------------------------------------------------
@@ -146,7 +151,8 @@ def _parse_pov_response(raw: str, agent_name: str, provider: str) -> AgentPov:
     """Parse a structured POV response into an AgentPov model."""
     lines = raw.strip().split("\n")
     verdict = "HOLD"
-    confidence = 0.5
+    confidence: Optional[float] = None
+    confidence_status = "confidence_missing"
     reasoning = ""
     key_factors: List[str] = []
     in_factors = False
@@ -159,10 +165,14 @@ def _parse_pov_response(raw: str, agent_name: str, provider: str) -> AgentPov:
                 verdict = "HOLD"
         elif stripped.upper().startswith("CONFIDENCE:"):
             try:
-                confidence = float(stripped.split(":", 1)[1].strip())
-                confidence = max(0.0, min(1.0, confidence))
+                parsed = float(stripped.split(":", 1)[1].strip())
+                if parsed != parsed or parsed in (float("inf"), float("-inf")):
+                    raise ValueError("non-finite confidence")
+                confidence = max(0.0, min(1.0, parsed))
+                confidence_status = "ok"
             except ValueError:
-                confidence = 0.5
+                confidence = None
+                confidence_status = "confidence_unparseable"
         elif stripped.upper().startswith("REASONING:"):
             reasoning = stripped.split(":", 1)[1].strip()
         elif stripped.upper().startswith("KEY_FACTORS:"):
@@ -184,6 +194,7 @@ def _parse_pov_response(raw: str, agent_name: str, provider: str) -> AgentPov:
         provider=provider,
         verdict=verdict,
         confidence=confidence,
+        confidence_status=confidence_status,
         reasoning=reasoning,
         key_factors=key_factors[:6],
     )
@@ -272,48 +283,66 @@ def _run_multi_pov_langgraph(symbol: str, market: str, context: str = "") -> Dic
 # Routes
 # ---------------------------------------------------------------------------
 
+def _load_profile_context(db, auth_user: Optional[str]) -> str:
+    """Natural-language summary of the caller's saved profile ("" when anonymous or none saved)."""
+    if not auth_user:
+        return ""
+    row = db.execute(
+        text("SELECT * FROM user_profiles WHERE user_id = :uid"),
+        {"uid": auth_user},
+    ).mappings().first()
+    if not row:
+        return ""
+    p = dict(row)
+    parts = []
+    if p.get("age"):
+        parts.append(f"I am {p['age']} years old")
+    if p.get("monthly_income"):
+        parts.append(f"earning ${p['monthly_income']}/month")
+    if p.get("monthly_savings"):
+        parts.append(f"saving ${p['monthly_savings']}/month")
+    if p.get("risk_tolerance"):
+        parts.append(f"with {p['risk_tolerance']} risk tolerance")
+    if p.get("horizon_years"):
+        parts.append(f"for a {p['horizon_years']}-year horizon")
+    if p.get("primary_goal"):
+        parts.append(f"goal: {p['primary_goal']}")
+    if p.get("existing_investments"):
+        parts.append(f"existing: {p['existing_investments']}")
+    return ", ".join(parts) + ". "
+
+
 @router.post("/recommend")
-async def recommend(request: RecommendRequest, db=Depends(get_db)):
+async def recommend(
+    request: RecommendRequest,
+    auth_user: Optional[str] = Depends(optional_user),
+    db=Depends(get_db),
+):
     """
-    Auto-recommend stocks: reads saved profile, combines with user input,
-    and runs through WealthOrchestrator.
+    Auto-recommend stocks: reads the caller's saved profile (identified only by the
+    bearer token; anonymous callers get no personalisation), combines it with user
+    input, and runs through WealthOrchestrator.
     """
     try:
-        # 1. Load user profile from DB
-        row = db.execute(
-            text("SELECT * FROM user_profiles WHERE user_id = :uid"),
-            {"uid": request.user_id},
-        ).mappings().first()
-
-        profile_context = ""
-        if row:
-            p = dict(row)
-            parts = []
-            if p.get("age"):
-                parts.append(f"I am {p['age']} years old")
-            if p.get("monthly_income"):
-                parts.append(f"earning ${p['monthly_income']}/month")
-            if p.get("monthly_savings"):
-                parts.append(f"saving ${p['monthly_savings']}/month")
-            if p.get("risk_tolerance"):
-                parts.append(f"with {p['risk_tolerance']} risk tolerance")
-            if p.get("horizon_years"):
-                parts.append(f"for a {p['horizon_years']}-year horizon")
-            if p.get("primary_goal"):
-                parts.append(f"goal: {p['primary_goal']}")
-            if p.get("existing_investments"):
-                parts.append(f"existing: {p['existing_investments']}")
-            profile_context = ", ".join(parts) + ". "
+        # 1. Load the authenticated user's profile from DB (never a client-supplied user_id).
+        #    The session is synchronous, so run the query in the threadpool, not on the event loop.
+        profile_context = await run_in_threadpool(_load_profile_context, db, auth_user)
 
         # 2. Combine profile + user input
         combined_input = profile_context + request.user_input
 
         # 3. Run through WealthOrchestrator
-        from backend.finverse_integration.routes.wealth_routes import (
-            get_wealth_manager,
-            map_wealth_state_to_response,
-        )
-        manager = get_wealth_manager()
+        try:
+            from backend.finverse_integration.routes.wealth_routes import (
+                get_wealth_manager,
+                map_wealth_state_to_response,
+            )
+        except ModuleNotFoundError as exc:
+            if exc.name not in {"backend.finverse_integration", "backend.finverse_integration.routes",
+                                "backend.finverse_integration.routes.wealth_routes"}:
+                raise
+            raise HTTPException(status_code=503, detail="Personalized recommendations are currently unavailable")
+        manager = await run_in_threadpool(get_wealth_manager)
         timeout_sec = float(os.getenv("WEALTH_TIMEOUT_SEC", "240"))
         result = await asyncio.wait_for(
             manager.run_workflow(
@@ -324,11 +353,13 @@ async def recommend(request: RecommendRequest, db=Depends(get_db)):
         )
         return map_wealth_state_to_response(result)
 
+    except HTTPException:
+        raise
     except asyncio.TimeoutError:
         raise HTTPException(status_code=504, detail="Analysis timed out")
     except Exception as e:
         logger.exception("Recommend failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Stock advisor request failed")
 
 
 @router.post("/multi-pov")
@@ -344,12 +375,16 @@ def multi_pov_analysis(request: MultiPovRequest):
             market=request.market,
             context=request.context or "",
         )
+        if any(str(result.get(role, {}).get("reasoning", "")).lower().startswith(("[groq unavailable", "[groq error", "[gemini unavailable", "[gemini error")) for role in ("bull", "bear", "neutral")):
+            raise HTTPException(status_code=503, detail="AI perspectives unavailable; check provider configuration")
         return {
             "symbol": request.symbol,
             "bull": result.get("bull", {}),
             "bear": result.get("bear", {}),
             "neutral": result.get("neutral", {}),
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("Multi-POV analysis failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Stock advisor request failed")

@@ -1,5 +1,8 @@
+import logging
 from fastapi import APIRouter, HTTPException
 from .core.graph_service import get_network_graph
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="", tags=["Network Graph"])
 
@@ -11,5 +14,6 @@ def get_graph(symbol: str):
     try:
         data = get_network_graph(symbol)
         return data
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logger.exception("Network graph failed for %s", symbol)
+        raise HTTPException(status_code=500, detail="Network graph request failed")

@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useRef, useCallback, useEffect } from 'react'
+import { useState, useRef, useCallback, useEffect, useMemo } from 'react'
 import ReactMarkdown from 'react-markdown'
 import html2canvas from 'html2canvas'
 import { animate, motion, useMotionValue, useSpring } from 'framer-motion'
@@ -109,41 +109,37 @@ function StrategyCard({
 }
 
 function AnimatedMetricValue({ value }: { value: any }) {
-  const [display, setDisplay] = useState('—')
-
-  useEffect(() => {
-    if (value === null || value === undefined || value === '—') {
-      setDisplay('—')
-      return
-    }
-
+  // What the metric should read as: either a static string (nothing to animate) or a number to count up to.
+  const target = useMemo<{ text: string } | { text: null; n: number; prefix: string; suffix: string; decimals: number }>(() => {
+    if (value === null || value === undefined || value === '—') return { text: '—' }
     const raw = String(value)
     const match = raw.match(/-?\d+(?:\.\d+)?/)
-    if (!match || match.index === undefined) {
-      setDisplay(raw)
-      return
-    }
-
+    if (!match || match.index === undefined) return { text: raw }
     const n = Number(match[0])
-    if (!Number.isFinite(n)) {
-      setDisplay(raw)
-      return
+    if (!Number.isFinite(n)) return { text: raw }
+    return {
+      text: null,
+      n,
+      prefix: raw.slice(0, match.index),
+      suffix: raw.slice(match.index + match[0].length),
+      decimals: match[0].includes('.') ? 2 : 0,
     }
+  }, [value])
+  const [animated, setAnimated] = useState('—')
 
-    const prefix = raw.slice(0, match.index)
-    const suffix = raw.slice(match.index + match[0].length)
-    const decimals = match[0].includes('.') ? 2 : 0
-
+  useEffect(() => {
+    if (target.text !== null) return
+    const { n, prefix, suffix, decimals } = target
     const controls = animate(0, n, {
       duration: 1,
       ease: 'easeOut',
-      onUpdate: (latest) => setDisplay(`${prefix}${latest.toFixed(decimals)}${suffix}`),
+      onUpdate: (latest) => setAnimated(`${prefix}${latest.toFixed(decimals)}${suffix}`),
     })
 
     return () => controls.stop()
-  }, [value])
+  }, [target])
 
-  return <>{display}</>
+  return <>{target.text !== null ? target.text : animated}</>
 }
 
 // ─── Strategy Definitions ─────────────────────────────────────────────────────
@@ -261,7 +257,7 @@ function MonteCarloCanvas({ monteCarlo, market }: { monteCarlo: any; market: 'US
       const val = yMax - (i / 5) * (yMax - yMin)
       ctx.fillText(fmtD(val), pad.left - 4, pad.top + (i / 5) * plotH + 4)
     }
-  }, [monteCarlo, hoverIndex])
+  }, [monteCarlo, hoverIndex, currency])
 
   useEffect(() => {
     draw()
@@ -636,6 +632,7 @@ export default function BacktestPage() {
         params,
         start: startDate || undefined,
         end: endDate || undefined,
+        initial_capital: initialCapital,
       })
 
       if (data.mode === 'multi_strategy') {

@@ -1,17 +1,19 @@
+import logging
 import requests
 import os
 from typing import Dict, Any, Optional
+
+logger = logging.getLogger(__name__)
 
 class EIAService:
     """
     Service to interact with the U.S. Energy Information Administration (EIA) API v2.
     """
     BASE_URL = "https://api.eia.gov/v2"
-    # Using the key provided by the user. In production, this should be in os.environ
-    API_KEY = "jvRlsfoBFBGHMhkspheJBvQoyz1noatXLcUmndto"
 
     def __init__(self):
-        self.api_key = self.API_KEY
+        # The key is read from the environment; it must never be committed to source.
+        self.api_key = os.getenv("EIA_API_KEY", "")
 
     def _fetch_data(self, path: str, params: Dict[str, Any] = None) -> Dict[str, Any]:
         """
@@ -20,6 +22,10 @@ class EIAService:
         if params is None:
             params = {}
         
+        if not self.api_key:
+            logger.warning("EIA_API_KEY is not configured; skipping EIA request")
+            return {"error": "EIA data source is not configured"}
+
         params['api_key'] = self.api_key
         # Default to JSON format if not specified, though v2 usually defaults to it.
         # frequency, data, facets etc can be passed in params
@@ -27,7 +33,7 @@ class EIAService:
         url = f"{self.BASE_URL}/{path}"
         
         try:
-            response = requests.get(url, params=params)
+            response = requests.get(url, params=params, timeout=15)
             response.raise_for_status()
             json_response = response.json()
             
@@ -37,8 +43,10 @@ class EIAService:
                 
             return json_response
         except requests.exceptions.RequestException as e:
-            print(f"Error fetching data from EIA API: {e}")
-            return {"error": str(e)}
+            # Request exceptions embed the full URL, including the api_key query parameter,
+            # so only the exception type is logged and nothing is returned to the client.
+            logger.warning("Error fetching data from EIA API (%s)", type(e).__name__)
+            return {"error": "EIA data request failed"}
 
     def get_crude_oil_reserves(self) -> Dict[str, Any]:
         """

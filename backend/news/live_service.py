@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -11,6 +13,8 @@ from urllib.parse import urljoin, urlparse
 import xml.etree.ElementTree as ET
 
 import httpx
+from backend.common.ttl_cache import TTLCache
+from .public_fetch import fetch_public_html, validate_article_url
 try:
     from bs4 import BeautifulSoup  # type: ignore
 except Exception:
@@ -39,13 +43,23 @@ class LiveNewsService:
     """Live scraper for RSS and HTML news sources configured in backend/data/live_news_sources.json."""
 
     _CACHE_TTL_SECONDS = 900
+    _SUMMARY_TTL_SECONDS = 600
     _BASE_CACHE_KEY = "__all_sources_snapshot__"
+    _CACHE_MAX_ENTRIES = 256       # per-query result slices
+    _SUMMARY_CACHE_MAX_ENTRIES = 256
+    _MAX_QUERY_KEY_CHARS = 200
 
     def __init__(self) -> None:
         data_path = Path(__file__).parent.parent / "data" / "live_news_sources.json"
         self._sources: List[LiveNewsSource] = self._load_sources(data_path)
-        self._cache: Dict[str, Dict[str, Any]] = {}
-        self._summary_cache: Dict[str, Dict[str, Any]] = {}
+        # Keys come from user input (query text, article URL), so both caches are bounded (LRU + TTL).
+        # Expired entries stay readable (stale) until evicted or replaced.
+        self._cache = TTLCache(maxsize=self._CACHE_MAX_ENTRIES, ttl=self._CACHE_TTL_SECONDS)
+        self._summary_cache = TTLCache(maxsize=self._SUMMARY_CACHE_MAX_ENTRIES, ttl=self._SUMMARY_TTL_SECONDS)
+        # The query-agnostic snapshot is kept outside the LRU so per-query churn can never evict the
+        # stale copy that is served during an outage.
+        self._base_lock = threading.Lock()
+        self._base: Optional[Dict[str, Any]] = None
 
     def _load_sources(self, path: Path) -> List[LiveNewsSource]:
         if not path.exists():
@@ -263,36 +277,44 @@ class LiveNewsService:
         filtered = [i for s, i in ranked if s > 0]
         return filtered if filtered else items
 
+    def _query_key(self, normalized_query: str, limit: int) -> str:
+        return f"{normalized_query[: self._MAX_QUERY_KEY_CHARS]}|{limit}"
+
     def _cached_get(self, key: str, allow_stale: bool = False) -> Optional[List[Dict[str, Any]]]:
-        row = self._cache.get(key)
-        if not row:
-            return None
-        if time.time() > row["expires"]:
-            if allow_stale:
-                return row["items"]
-            self._cache.pop(key, None)
-            return None
-        return row["items"]
+        """Items cached under `key`; expired entries are returned only with allow_stale."""
+        if key == self._BASE_CACHE_KEY:
+            with self._base_lock:
+                row = self._base
+            if not row:
+                return None
+            if time.time() > row["expires"] and not allow_stale:
+                return None
+            return row["items"]
+        if allow_stale:
+            return self._cache.get_stale(key)
+        return self._cache.get(key)
 
     def _cached_set(self, key: str, items: List[Dict[str, Any]]) -> None:
-        self._cache[key] = {"items": items, "expires": time.time() + self._CACHE_TTL_SECONDS}
+        if key == self._BASE_CACHE_KEY:
+            with self._base_lock:
+                self._base = {"items": items, "expires": time.time() + self._CACHE_TTL_SECONDS}
+            return
+        self._cache.set(key, items)
+
+    @staticmethod
+    def _summary_key(url: str, max_chars: int) -> str:
+        return hashlib.sha256(f"{url}|{max_chars}".encode("utf-8")).hexdigest()
 
     def _summary_cached_get(self, key: str) -> Optional[Dict[str, Any]]:
-        row = self._summary_cache.get(key)
-        if not row:
-            return None
-        if time.time() > row["expires"]:
-            self._summary_cache.pop(key, None)
-            return None
-        return row["item"]
+        return self._summary_cache.get(key)
 
     def _summary_cached_set(self, key: str, item: Dict[str, Any]) -> None:
-        self._summary_cache[key] = {"item": item, "expires": time.time() + 600}
+        self._summary_cache.set(key, item)
 
     def get_cached_news(self, query: str = "stock market news", limit: int = 20) -> Dict[str, Any]:
         """Return cached/stale news only. Never triggers a live scrape."""
         normalized_query = (query or "stock market news").strip().lower()
-        cache_key = f"{normalized_query}|{limit}"
+        cache_key = self._query_key(normalized_query, limit)
 
         cached = self._cached_get(cache_key, allow_stale=True)
         if cached is not None:
@@ -332,22 +354,14 @@ class LiveNewsService:
 
     def summarize_article(self, url: str, max_chars: int = 1200) -> Dict[str, Any]:
         u = (url or "").strip()
-        parsed = urlparse(u)
-        if parsed.scheme not in {"http", "https"}:
-            return {"status": "error", "detail": "Invalid URL"}
+        parsed = validate_article_url(u)
 
-        cache_key = f"{u}|{max_chars}"
+        cache_key = self._summary_key(u, max_chars)
         cached = self._summary_cached_get(cache_key)
         if cached is not None:
             return cached
 
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        }
-
-        with httpx.Client(timeout=10.0, headers=headers) as client:
-            html = self._http_get(client, u)
+        html = fetch_public_html(u)
         if not html:
             return {"status": "error", "detail": "Unable to fetch article"}
 
@@ -420,7 +434,7 @@ class LiveNewsService:
 
     def get_news(self, query: str = "stock market news", limit: int = 20) -> Dict[str, Any]:
         normalized_query = (query or "stock market news").strip().lower()
-        cache_key = f"{normalized_query}|{limit}"
+        cache_key = self._query_key(normalized_query, limit)
         cached = self._cached_get(cache_key)
         if cached is not None:
             return {
@@ -500,24 +514,34 @@ class LiveNewsService:
             seen.add(key)
             uniq.append(item)
 
-        filtered = self._filter_by_query(uniq, normalized_query)
-        final_items = filtered[:limit]
-        self._cached_set(self._BASE_CACHE_KEY, uniq)
-        self._cached_set(cache_key, final_items)
+        if uniq:
+            filtered = self._filter_by_query(uniq, normalized_query)
+            final_items = filtered[:limit]
+            self._cached_set(self._BASE_CACHE_KEY, uniq)
+            self._cached_set(cache_key, final_items)
+            return {
+                "status": "success",
+                "query": query,
+                "cached": False,
+                "stale": False,
+                "articles": final_items,
+                "source_count": len({a.get('source_id') for a in final_items}),
+                "fetched_at": datetime.now(timezone.utc).isoformat(),
+            }
 
-        # If scrape yielded no rows (e.g., broad blocks), fall back to stale snapshot.
-        if not final_items:
-            stale = self._cached_get(self._BASE_CACHE_KEY, allow_stale=True)
-            if stale:
-                stale_filtered = self._filter_by_query(stale, normalized_query)
-                final_items = stale_filtered[:limit]
-
+        # The scrape produced nothing (outage, blocks). Never overwrite the good snapshot with an
+        # empty one and never cache the empty result: serve the stale copy, flagged as such.
+        stale_items = self._cached_get(cache_key, allow_stale=True)
+        if not stale_items:
+            stale_base = self._cached_get(self._BASE_CACHE_KEY, allow_stale=True)
+            stale_items = self._filter_by_query(stale_base, normalized_query)[:limit] if stale_base else []
         return {
             "status": "success",
             "query": query,
-            "cached": False if uniq else True,
-            "articles": final_items,
-            "source_count": len({a.get('source_id') for a in final_items}),
+            "cached": True,
+            "stale": bool(stale_items),
+            "articles": stale_items[:limit],
+            "source_count": len({a.get('source_id') for a in stale_items[:limit]}),
             "fetched_at": datetime.now(timezone.utc).isoformat(),
         }
 
